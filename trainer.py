@@ -4,7 +4,9 @@ import tools
 
 
 class OnlineTrainer:
-    def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
+
+    def __init__(self, config, replay_buffer, logger, logdir, train_envs,
+                 eval_envs):
         self.replay_buffer = replay_buffer
         self.logger = logger
         self.train_envs = train_envs
@@ -18,7 +20,8 @@ class OnlineTrainer:
         self.batch_length = int(config.batch_length)
         batch_steps = int(config.batch_size * config.batch_length)
         # train_ratio is based on data steps rather than environment steps.
-        self._updates_needed = tools.Every(batch_steps / config.train_ratio * config.action_repeat)
+        self._updates_needed = tools.Every(batch_steps / config.train_ratio *
+                                           config.action_repeat)
         self._should_pretrain = tools.Once()
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
@@ -36,9 +39,15 @@ class OnlineTrainer:
         agent.eval()
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
-        once_done = torch.zeros(envs.env_num, dtype=torch.bool, device=agent.device)
-        steps = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
-        returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
+        once_done = torch.zeros(envs.env_num,
+                                dtype=torch.bool,
+                                device=agent.device)
+        steps = torch.zeros(envs.env_num,
+                            dtype=torch.int32,
+                            device=agent.device)
+        returns = torch.zeros(envs.env_num,
+                              dtype=torch.float32,
+                              device=agent.device)
         log_metrics = {}
         # cache is only used for video logging / open-loop prediction.
         cache = []
@@ -76,10 +85,12 @@ class OnlineTrainer:
         # dict of (B, T, *)
         cache = torch.stack(cache, dim=1) if len(cache) else None
         self.logger.scalar("episode/eval_score", returns.mean())
-        self.logger.scalar("episode/eval_length", steps.to(torch.float32).mean())
+        self.logger.scalar("episode/eval_length",
+                           steps.to(torch.float32).mean())
         for key, value in log_metrics.items():
             if key == "log_success":
-                value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
+                value = torch.clip(
+                    value, max=1.0)  # make sure 1.0 for success episode
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
@@ -91,8 +102,7 @@ class OnlineTrainer:
                     agent.video_pred(
                         cache[:1],  # give only first batch
                         (initial["stoch"], initial["deter"]),
-                    )
-                ),
+                    )),
             )
         self.logger.write(train_step)
         agent.train()
@@ -110,8 +120,12 @@ class OnlineTrainer:
         update_count = 0
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
-        returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
-        lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
+        returns = torch.zeros(envs.env_num,
+                              dtype=torch.float32,
+                              device=agent.device)
+        lengths = torch.zeros(envs.env_num,
+                              dtype=torch.int32,
+                              device=agent.device)
         episode_ids = torch.arange(
             envs.env_num, dtype=torch.int32, device=agent.device
         )  # Increment this to prevent sampling across episode boundaries
@@ -129,13 +143,17 @@ class OnlineTrainer:
                     if d and lengths[i] > 0:
                         if i == 0 and len(video_cache) > 0:
                             video = torch.stack(video_cache, axis=0)
-                            self.logger.video("train_video", tools.to_np(video[None]))
+                            self.logger.video("train_video",
+                                              tools.to_np(video[None]))
                             video_cache = []
                         self.logger.scalar("episode/score", returns[i])
                         self.logger.scalar("episode/length", lengths[i])
-                        self.logger.write(step + i)  # to show all values on tensorboard
+                        self.logger.write(
+                            step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
-            step += int((~done).sum()) * self._action_repeat  # step is based on env side
+            step += int(
+                (~done
+                 ).sum()) * self._action_repeat  # step is based on env side
             lengths += ~done
 
             # Step environments on CPU to avoid GPU<->CPU sync in the worker processes.
@@ -154,7 +172,9 @@ class OnlineTrainer:
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.
             # (B, A)
-            act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
+            act, agent_state = agent.act(trans.clone(),
+                                         agent_state,
+                                         eval=False)
 
             # Store transition.
             # We keep the observation and the action that produced it together.
@@ -168,7 +188,8 @@ class OnlineTrainer:
             self.replay_buffer.add_transition(trans.detach())
             returns += trans["reward"][:, 0]
             # Update models after enough data has accumulated
-            if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
+            if step // (envs.env_num *
+                        self._action_repeat) > self.batch_length + 1:
                 if self._should_pretrain():
                     update_num = self.pretrain
                 else:
@@ -180,12 +201,15 @@ class OnlineTrainer:
                 # Log training metrics
                 if self._should_log(step):
                     for name, value in train_metrics.items():
-                        value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
+                        value = tools.to_np(value) if isinstance(
+                            value, torch.Tensor) else value
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
                     if self.video_pred_log:
                         data, _, initial = self.replay_buffer.sample()
-                        self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                        self.logger.video(
+                            "open_loop",
+                            tools.to_np(agent.video_pred(data, initial)))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))

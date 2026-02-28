@@ -48,7 +48,8 @@ def main(config):
         act_space,
     ).to(config.device)
 
-    policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
+    policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
+                                   logdir, train_envs, eval_envs)
     policy_trainer.begin(agent)
 
     items_to_save = {

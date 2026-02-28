@@ -104,8 +104,8 @@ class Atari(gym.Env):
 
         H, W = self.ale.getScreenDims()
         self._buffers = collections.deque(
-            [np.zeros((H, W, 3), np.uint8) for _ in range(self._pooling)], maxlen=self._pooling
-        )
+            [np.zeros((H, W, 3), np.uint8) for _ in range(self._pooling)],
+            maxlen=self._pooling)
 
         self._last_lives = None
         self._done = True
@@ -114,12 +114,16 @@ class Atari(gym.Env):
 
     @property
     def observation_space(self):
-        img_shape = self._size + ((1,) if self._gray else (3,))
+        img_shape = self._size + ((1, ) if self._gray else (3, ))
         return gym.spaces.Dict({
-            "image": gym.spaces.Box(0, 255, img_shape, np.uint8),
-            "is_first": gym.spaces.Box(0, 1, (), bool),
-            "is_last": gym.spaces.Box(0, 1, (), bool),
-            "is_terminal": gym.spaces.Box(0, 1, (), bool),
+            "image":
+            gym.spaces.Box(0, 255, img_shape, np.uint8),
+            "is_first":
+            gym.spaces.Box(0, 1, (), bool),
+            "is_last":
+            gym.spaces.Box(0, 1, (), bool),
+            "is_terminal":
+            gym.spaces.Box(0, 1, (), bool),
         })
 
     @property
@@ -148,7 +152,8 @@ class Atari(gym.Env):
                 break
             self._last_lives = current_lives
 
-        self._done = self.ale.game_over() or (self._length and self._step >= self._length)
+        self._done = self.ale.game_over() or (self._length
+                                              and self._step >= self._length)
 
         return self._obs(
             total_reward,
@@ -167,7 +172,8 @@ class Atari(gym.Env):
                     with self.LOCK:
                         self.ale.reset_game()
 
-        if self._autostart and self.ACTION_MEANING.index("FIRE") in self.actionset:
+        if self._autostart and self.ACTION_MEANING.index(
+                "FIRE") in self.actionset:
             self.ale.act(self.ACTION_MEANING.index("FIRE"))
             if self.ale.game_over():
                 with self.LOCK:
@@ -194,7 +200,9 @@ class Atari(gym.Env):
 
         if image.shape[:2] != self._size:
             if self._resize_fn == "opencv":
-                image = self._cv2.resize(image, self._size, interpolation=self._cv2.INTER_AREA)
+                image = self._cv2.resize(image,
+                                         self._size,
+                                         interpolation=self._cv2.INTER_AREA)
             if self._resize_fn == "pillow":
                 image = Image.fromarray(image)
                 image = image.resize(self._size, Image.BILINEAR)

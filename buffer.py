@@ -4,6 +4,7 @@ from torchrl.data.replay_buffers.samplers import SliceSampler
 
 
 class Buffer:
+
     def __init__(self, config):
         self.device = torch.device(config.device)
         self.storage_device = torch.device(config.storage_device)
@@ -11,12 +12,17 @@ class Buffer:
         self.batch_length = int(config.batch_length)
         self.num_eps = 0
         self._buffer = ReplayBuffer(
-            storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
-            sampler=SliceSampler(
-                num_slices=self.batch_size, end_key=None, traj_key="episode", truncated_key=None, strict_length=True
-            ),
+            storage=LazyTensorStorage(max_size=config.max_size,
+                                      device=self.storage_device,
+                                      ndim=2),
+            sampler=SliceSampler(num_slices=self.batch_size,
+                                 end_key=None,
+                                 traj_key="episode",
+                                 truncated_key=None,
+                                 strict_length=True),
             prefetch=0,
-            batch_size=self.batch_size * (self.batch_length + 1),  # +1 for context
+            batch_size=self.batch_size *
+            (self.batch_length + 1),  # +1 for context
         )
 
     def add_transition(self, data):
@@ -31,14 +37,18 @@ class Buffer:
         sample_td = sample_td.view(-1, self.batch_length + 1)
         src_dev = sample_td.device
         if src_dev.type == "cpu" and self.device.type == "cuda":
-            sample_td = sample_td.pin_memory().to(self.device, non_blocking=True)
+            sample_td = sample_td.pin_memory().to(self.device,
+                                                  non_blocking=True)
         elif src_dev != self.device:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
         data = sample_td[:, 1:]
-        data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
-        index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
+        data.set_("action",
+                  sample_td["action"][:, :-1])  # action is 1 step back
+        index = [
+            ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]
+        ]
         return data, index, initial
 
     def update(self, index, stoch, deter):

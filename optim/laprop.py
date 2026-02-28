@@ -28,7 +28,15 @@ from torch.optim import Optimizer
 
 
 class LaProp(Optimizer):
-    def __init__(self, params, lr=4e-4, betas=(0.9, 0.999), eps=1e-15, weight_decay=0, amsgrad=False, centered=False):
+
+    def __init__(self,
+                 params,
+                 lr=4e-4,
+                 betas=(0.9, 0.999),
+                 eps=1e-15,
+                 weight_decay=0,
+                 amsgrad=False,
+                 centered=False):
 
         self.steps_before_using_centered = 10
 
@@ -40,7 +48,12 @@ class LaProp(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad, centered=centered)
+        defaults = dict(lr=lr,
+                        betas=betas,
+                        eps=eps,
+                        weight_decay=weight_decay,
+                        amsgrad=amsgrad,
+                        centered=centered)
         super().__init__(params, defaults)
 
     def step(self):
@@ -52,7 +65,9 @@ class LaProp(Optimizer):
                     continue
                 grad = p.grad.data
                 if grad.is_sparse:
-                    raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
+                    raise RuntimeError(
+                        "Adam does not support sparse gradients, please consider SparseAdam instead"
+                    )
                 amsgrad = group["amsgrad"]
                 centered = group["centered"]
 
@@ -87,12 +102,14 @@ class LaProp(Optimizer):
                 # Decay the first and second moment running average coefficient
                 exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
 
-                state["exp_avg_lr_1"] = state["exp_avg_lr_1"] * beta1 + (1 - beta1) * group["lr"]
-                state["exp_avg_lr_2"] = state["exp_avg_lr_2"] * beta2 + (1 - beta2)
+                state["exp_avg_lr_1"] = state["exp_avg_lr_1"] * beta1 + (
+                    1 - beta1) * group["lr"]
+                state["exp_avg_lr_2"] = state["exp_avg_lr_2"] * beta2 + (1 -
+                                                                         beta2)
 
-                bias_correction1 = (
-                    state["exp_avg_lr_1"] / group["lr"] if group["lr"] != 0.0 else 1.0
-                )  # 1 - beta1 ** state['step']
+                bias_correction1 = (state["exp_avg_lr_1"] /
+                                    group["lr"] if group["lr"] != 0.0 else 1.0
+                                    )  # 1 - beta1 ** state['step']
                 step_size = 1 / bias_correction1
 
                 bias_correction2 = state["exp_avg_lr_2"]
@@ -103,7 +120,8 @@ class LaProp(Optimizer):
                         mean = exp_mean_avg_beta2**2
                         denom = denom - mean
 
-                if amsgrad and not (centered and state["step"] <= self.steps_before_using_centered):
+                if amsgrad and not (centered and state["step"]
+                                    <= self.steps_before_using_centered):
                     # Maintains the maximum of all (centered) 2nd moment running avg. till now
                     torch.max(max_exp_avg_sq, denom, out=max_exp_avg_sq)
                     # Use the max. for normalizing running avg. of gradient
@@ -111,7 +129,8 @@ class LaProp(Optimizer):
 
                 denom = denom.div(bias_correction2).sqrt_().add_(group["eps"])
                 step_of_this_grad = grad / denom
-                exp_avg.mul_(beta1).add_((1 - beta1) * group["lr"], step_of_this_grad)
+                exp_avg.mul_(beta1).add_((1 - beta1) * group["lr"],
+                                         step_of_this_grad)
 
                 p.data.add_(-step_size, exp_avg)
                 if group["weight_decay"] != 0:

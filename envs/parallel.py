@@ -15,8 +15,11 @@ import tools
 
 
 class ParallelEnv:
+
     def __init__(self, constructor, env_num, device):
-        self.envs = [Parallel(constructor(i), "process") for i in range(env_num)]
+        self.envs = [
+            Parallel(constructor(i), "process") for i in range(env_num)
+        ]
         self.device = device
 
     @property
@@ -46,7 +49,10 @@ class ParallelEnv:
         The returned TensorDict is pinned in CPU memory so that the caller can
         transfer it to GPU asynchronously (H2D with non_blocking=True).
         """
-        promise = [e.reset() if d else e.step(a) for e, a, d in zip(self.envs, tools.to_np(action), done)]
+        promise = [
+            e.reset() if d else e.step(a)
+            for e, a, d in zip(self.envs, tools.to_np(action), done)
+        ]
         new_o, new_r, new_d = [], [], []
         for p, d in zip(promise, done):
             if d:
@@ -58,22 +64,35 @@ class ParallelEnv:
                 new_o.append(o)
                 new_r.append(r)
                 new_d.append(d)
-        obs_stacked = {k: np.stack([o[k] for o in new_o]) for k in new_o[0].keys()}
+        obs_stacked = {
+            k: np.stack([o[k] for o in new_o])
+            for k in new_o[0].keys()
+        }
 
         # Build CPU tensors first to avoid implicit GPU syncs and enable async H2D in caller.
-        obs_tensors = {k: torch.as_tensor(v, device="cpu") for k, v in obs_stacked.items()}
+        obs_tensors = {
+            k: torch.as_tensor(v, device="cpu")
+            for k, v in obs_stacked.items()
+        }
         rew_stacked = torch.as_tensor(new_r, dtype=torch.float32, device="cpu")
 
         # Keep data on CPU; caller will .to(device, non_blocking=True) after pinning.
         # TensorDict batch size is (B,).
-        td = TensorDict({**obs_tensors, "reward": rew_stacked}, batch_size=(self.env_num,), device="cpu").pin_memory()
+        td = TensorDict({
+            **obs_tensors, "reward": rew_stacked
+        },
+                        batch_size=(self.env_num, ),
+                        device="cpu").pin_memory()
         done = torch.as_tensor(new_d, device="cpu")
         return self.lift_dim(td), done
 
 
 class Parallel:
+
     def __init__(self, constructor, strategy):
-        self.worker = Worker(bind(self._respond, constructor), strategy, state=True)
+        self.worker = Worker(bind(self._respond, constructor),
+                             strategy,
+                             state=True)
         self.callables = {}
 
     def __getattr__(self, name):
@@ -144,6 +163,7 @@ class Worker:
 
 
 class ProcessPipeWorker:
+
     def __init__(self, fn, initializers=(), daemon=False):
         import multiprocessing
 
@@ -153,7 +173,9 @@ class ProcessPipeWorker:
         self._pipe, pipe = self._context.Pipe()
         fn = cloudpickle.dumps(fn)
         initializers = cloudpickle.dumps(initializers)
-        self._process = self._context.Process(target=self._loop, args=(pipe, fn, initializers), daemon=daemon)
+        self._process = self._context.Process(target=self._loop,
+                                              args=(pipe, fn, initializers),
+                                              daemon=daemon)
         self._process.start()
         self._nextid = 0
         self._results = {}
@@ -247,6 +269,7 @@ class Message(enum.Enum):
 
 
 class Future:
+
     def __init__(self, receive, callid):
         self._receive = receive
         self._callid = callid

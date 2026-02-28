@@ -6,6 +6,7 @@ import tools
 
 
 class TimeLimit(gym.Wrapper):
+
     def __init__(self, env, duration):
         super().__init__(env)
         self._duration = duration
@@ -30,9 +31,11 @@ class TimeLimit(gym.Wrapper):
 
 
 class NormalizeActions(gym.Wrapper):
+
     def __init__(self, env):
         super().__init__(env)
-        self._mask = np.logical_and(np.isfinite(env.action_space.low), np.isfinite(env.action_space.high))
+        self._mask = np.logical_and(np.isfinite(env.action_space.low),
+                                    np.isfinite(env.action_space.high))
         self._low = np.where(self._mask, env.action_space.low, -1)
         self._high = np.where(self._mask, env.action_space.high, 1)
         low = np.where(self._mask, -np.ones_like(self._low), self._low)
@@ -46,11 +49,12 @@ class NormalizeActions(gym.Wrapper):
 
 
 class OneHotAction(gym.Wrapper):
+
     def __init__(self, env):
         assert isinstance(env.action_space, gym.spaces.Discrete)
         super().__init__(env)
         self._random = np.random.RandomState()
-        shape = (self.env.action_space.n,)
+        shape = (self.env.action_space.n, )
         space = gym.spaces.Box(low=0, high=1, shape=shape, dtype=np.float32)
         space.discrete = True
         self.action_space = space
@@ -75,11 +79,15 @@ class OneHotAction(gym.Wrapper):
 
 
 class MultiOneHotAction(gym.Wrapper):
+
     def __init__(self, env, device):
         assert isinstance(env.action_space, gym.spaces.MultiDiscrete)
         super().__init__(env)
         self.index_low = torch.tensor(self.action_space.low, device=device)
-        space = gym.spaces.Box(low=0, high=1, shape=self.env.action_space.nvec, dtype=np.float32)
+        space = gym.spaces.Box(low=0,
+                               high=1,
+                               shape=self.env.action_space.nvec,
+                               dtype=np.float32)
         space.multi_discrete = True
         self.action_space = space
 
@@ -92,18 +100,24 @@ class MultiOneHotAction(gym.Wrapper):
         now = 0
         indexes = []
         for dim in self.action_space.shape:
-            index = torch.argmax(action[:, now : now + dim], dim=-1, keepdim=True)
+            index = torch.argmax(action[:, now:now + dim],
+                                 dim=-1,
+                                 keepdim=True)
             indexes.append(index)
             now += dim
         return torch.cat(indexes, dim=-1) + self.index_low
 
 
 class RewardObs(gym.Wrapper):
+
     def __init__(self, env):
         super().__init__(env)
         spaces = self.env.observation_space.spaces
         if "obs_reward" not in spaces:
-            spaces["obs_reward"] = gym.spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32)
+            spaces["obs_reward"] = gym.spaces.Box(-np.inf,
+                                                  np.inf,
+                                                  shape=(1, ),
+                                                  dtype=np.float32)
         self.observation_space = gym.spaces.Dict(spaces)
 
     def step(self, action):
@@ -120,6 +134,7 @@ class RewardObs(gym.Wrapper):
 
 
 class Dtype(gym.Wrapper):
+
     def step(self, action):
         obs, rew, done, info = self.env.step(action)
         return tools.convert(obs), np.float32(rew), done, info

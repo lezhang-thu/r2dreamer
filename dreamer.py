@@ -18,6 +18,7 @@ from tools import to_f32
 
 
 class Dreamer(nn.Module):
+
     def __init__(self, config, obs_space, act_space):
         super().__init__()
         self.device = torch.device(config.device)
@@ -27,7 +28,8 @@ class Dreamer(nn.Module):
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
         self.return_ema = networks.ReturnEMA(device=self.device)
-        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
+        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
+            act_space.shape)
         self.rep_loss = str(config.rep_loss)
 
         # World model components
@@ -42,7 +44,8 @@ class Dreamer(nn.Module):
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
-        config.actor.shape = (act_space.n,) if hasattr(act_space, "n") else tuple(map(int, act_space.shape))
+        config.actor.shape = (act_space.n, ) if hasattr(
+            act_space, "n") else tuple(map(int, act_space.shape))
         self.act_discrete = False
         if hasattr(act_space, "multi_discrete"):
             config.actor.dist = config.actor.dist.multi_disc
@@ -105,7 +108,8 @@ class Dreamer(nn.Module):
             self.aug_same_across_time = bool(dpc.aug.same_across_time)
             self.aug_bilinear = bool(dpc.aug.bilinear)
 
-            self._prototypes = nn.Parameter(torch.randn(self.num_prototypes, self.proto_dim))
+            self._prototypes = nn.Parameter(
+                torch.randn(self.num_prototypes, self.proto_dim))
             self.obs_proj = nn.Linear(self.embed_size, self.proto_dim)
             self.feat_proj = nn.Linear(self.rssm.feat_size, self.proto_dim)
             self._ema_encoder = copy.deepcopy(self.encoder)
@@ -127,7 +131,9 @@ class Dreamer(nn.Module):
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
             else:
-                print(f"{sum(p.numel() for p in module.parameters()):>14,}: {key}")
+                print(
+                    f"{sum(p.numel() for p in module.parameters()):>14,}: {key}"
+                )
         self._named_params = OrderedDict()
         for name, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -135,10 +141,15 @@ class Dreamer(nn.Module):
             else:
                 for param_name, param in module.named_parameters():
                     self._named_params[f"{name}.{param_name}"] = param
-        print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
+        print(
+            f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters."
+        )
 
         def _agc(params):
-            clip_grad_agc_(params, float(config.agc), float(config.pmin), foreach=True)
+            clip_grad_agc_(params,
+                           float(config.agc),
+                           float(config.pmin),
+                           foreach=True)
 
         self._agc = _agc
         self._optimizer = LaProp(
@@ -160,14 +171,16 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         if config.compile:
             print("Compiling update function with torch.compile...")
-            self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
+            self._cal_grad = torch.compile(self._cal_grad,
+                                           mode="reduce-overhead")
 
     def _update_slow_target(self):
         """Update slow-moving value target network."""
         if self._slow_value_updates % self.slow_target_update == 0:
             with torch.no_grad():
                 mix = self.slow_target_fraction
-                for v, s in zip(self.value.parameters(), self._slow_value.parameters()):
+                for v, s in zip(self.value.parameters(),
+                                self._slow_value.parameters()):
                     s.data.copy_(mix * v.data + (1 - mix) * s.data)
         self._slow_value_updates += 1
 
@@ -182,56 +195,56 @@ class Dreamer(nn.Module):
         # not whether gradients flow through its operations
         self._frozen_encoder = copy.deepcopy(self.encoder)
         for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.encoder.named_parameters(), self._frozen_encoder.named_parameters()
-        ):
+                self.encoder.named_parameters(),
+                self._frozen_encoder.named_parameters()):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
         self._frozen_rssm = copy.deepcopy(self.rssm)
         for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.rssm.named_parameters(), self._frozen_rssm.named_parameters()
-        ):
+                self.rssm.named_parameters(),
+                self._frozen_rssm.named_parameters()):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
         self._frozen_reward = copy.deepcopy(self.reward)
         for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.reward.named_parameters(), self._frozen_reward.named_parameters()
-        ):
+                self.reward.named_parameters(),
+                self._frozen_reward.named_parameters()):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
         self._frozen_cont = copy.deepcopy(self.cont)
         for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.cont.named_parameters(), self._frozen_cont.named_parameters()
-        ):
+                self.cont.named_parameters(),
+                self._frozen_cont.named_parameters()):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
         self._frozen_actor = copy.deepcopy(self.actor)
         for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.actor.named_parameters(), self._frozen_actor.named_parameters()
-        ):
+                self.actor.named_parameters(),
+                self._frozen_actor.named_parameters()):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
         self._frozen_value = copy.deepcopy(self.value)
         for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.value.named_parameters(), self._frozen_value.named_parameters()
-        ):
+                self.value.named_parameters(),
+                self._frozen_value.named_parameters()):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
         self._frozen_slow_value = copy.deepcopy(self._slow_value)
         for (name_orig, param_orig), (name_new, param_new) in zip(
-            self._slow_value.named_parameters(), self._frozen_slow_value.named_parameters()
-        ):
+                self._slow_value.named_parameters(),
+                self._frozen_slow_value.named_parameters()):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
@@ -256,22 +269,37 @@ class Dreamer(nn.Module):
             state["prev_action"],
         )
         # (B, S, K), (B, D)
-        stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
+        stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter,
+                                                     prev_action, embed,
+                                                     obs["is_first"])
         # (B, F)
         feat = self._frozen_rssm.get_feat(stoch, deter)
         action_dist = self._frozen_actor(feat)
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
         return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action},
+            {
+                "stoch": stoch,
+                "deter": deter,
+                "prev_action": action
+            },
             batch_size=state.batch_size,
         )
 
     @torch.no_grad()
     def get_initial_state(self, B):
         stoch, deter = self.rssm.initial(B)
-        action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
-        return TensorDict({"stoch": stoch, "deter": deter, "prev_action": action}, batch_size=(B,))
+        action = torch.zeros(B,
+                             self.act_dim,
+                             dtype=torch.float32,
+                             device=self.device)
+        return TensorDict(
+            {
+                "stoch": stoch,
+                "deter": deter,
+                "prev_action": action
+            },
+            batch_size=(B, ))
 
     @torch.no_grad()
     def video_pred(self, data, initial):
@@ -282,7 +310,9 @@ class Dreamer(nn.Module):
     def _video_pred(self, data, initial):
         """Video prediction utility."""
         if self.rep_loss != "dreamer":
-            raise NotImplementedError("video_pred requires decoder and is only supported when rep_loss == 'dreamer'.")
+            raise NotImplementedError(
+                "video_pred requires decoder and is only supported when rep_loss == 'dreamer'."
+            )
 
         B = min(data["action"].shape[0], 6)
         # (B, T, E)
@@ -322,8 +352,13 @@ class Dreamer(nn.Module):
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
         if self._log_grads:
-            old_params = [p.data.clone().detach() for p in self._named_params.values()]
-            grads = [p.grad for p in self._named_params.values() if p.grad is not None]  # log grads before clipping
+            old_params = [
+                p.data.clone().detach() for p in self._named_params.values()
+            ]
+            grads = [
+                p.grad for p in self._named_params.values()
+                if p.grad is not None
+            ]  # log grads before clipping
             grad_norm = tools.compute_global_norm(grads)
             grad_rms = tools.compute_rms(grads)
             mets["opt/grad_norm"] = grad_norm
@@ -336,7 +371,10 @@ class Dreamer(nn.Module):
         mets["opt/lr"] = self._scheduler.get_lr()[0]
         mets["opt/grad_scale"] = self._scaler.get_scale()
         if self._log_grads:
-            updates = [(new - old) for (new, old) in zip(self._named_params.values(), old_params)]
+            updates = [
+                (new - old)
+                for (new, old) in zip(self._named_params.values(), old_params)
+            ]
             update_rms = tools.compute_rms(updates)
             params_rms = tools.compute_rms(self._named_params.values())
             mets["opt/param_rms"] = params_rms
@@ -366,10 +404,12 @@ class Dreamer(nn.Module):
         # (B, T, E)
         embed = self.encoder(data)
         # (B, T, S, K), (B, T, D), (B, T, S, K)
-        post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
+        post_stoch, post_deter, post_logit = self.rssm.observe(
+            embed, data["action"], initial, data["is_first"])
         # (B, T, S, K)
         _, prior_logit = self.rssm.prior(post_deter)
-        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
+                                               self.kl_free)
         losses["dyn"] = torch.mean(dyn_loss)
         losses["rep"] = torch.mean(rep_loss)
         # === Representation / auxiliary losses ===
@@ -377,7 +417,8 @@ class Dreamer(nn.Module):
         feat = self.rssm.get_feat(post_stoch, post_deter)
         if self.rep_loss == "dreamer":
             recon_losses = {
-                key: torch.mean(-dist.log_prob(data[key])) for key, dist in self.decoder(post_stoch, post_deter).items()
+                key: torch.mean(-dist.log_prob(data[key]))
+                for key, dist in self.decoder(post_stoch, post_deter).items()
             }
             losses.update(recon_losses)
         elif self.rep_loss == "r2dreamer":
@@ -393,9 +434,11 @@ class Dreamer(nn.Module):
 
             c = torch.mm(x1_norm.T, x2_norm) / (B * T)
             invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
-            off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
+            off_diag_mask = ~torch.eye(
+                x1.shape[-1], dtype=torch.bool, device=x1.device)
             redundancy_loss = c[off_diag_mask].pow(2).sum()
-            losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+            losses[
+                "barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
         elif self.rep_loss == "infonce":
             # Contrastive (InfoNCE) objective between projected latent features and encoder embeddings.
             # (B, T, F) -> (B*T, F)
@@ -405,7 +448,8 @@ class Dreamer(nn.Module):
             logits = torch.matmul(x1, x2.T)
             norm_logits = logits - torch.max(logits, 1)[0][:, None]
             labels = torch.arange(norm_logits.shape[0]).long().to(self.device)
-            losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
+            losses["infonce"] = torch.nn.functional.cross_entropy(
+                norm_logits, labels)
         elif self.rep_loss == "dreamerpro":
             # DreamerPro uses augmentation + EMA targets + Sinkhorn assignment.
             with torch.no_grad():
@@ -419,20 +463,24 @@ class Dreamer(nn.Module):
 
             embed_aug = self.encoder(data_aug)
             post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
-                embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
-            )
-            proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
+                embed_aug, data_aug["action"], initial_aug,
+                data_aug["is_first"])
+            proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug,
+                                           embed_aug, ema_proj)
             losses.update(proto_losses)
         else:
             raise NotImplementedError
 
         # reward and continue
-        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
+        losses["rew"] = torch.mean(
+            -self.reward(feat).log_prob(to_f32(data["reward"])))
         cont = 1.0 - to_f32(data["is_terminal"])
         losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
         # log
-        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
-        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        metrics["dyn_entropy"] = torch.mean(
+            self.rssm.get_dist(prior_logit).entropy())
+        metrics["rep_entropy"] = torch.mean(
+            self.rssm.get_dist(post_logit).entropy())
 
         # === Imagination rollout for actor-critic ===
         # (B*T, S, K), (B*T, D)
@@ -456,9 +504,9 @@ class Dreamer(nn.Module):
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
-        ret = self._lambda_return(
-            last, term, imag_reward, imag_value, imag_value, disc, self.lamb
-        )  # (B*T, T_imag-1, 1)
+        ret = self._lambda_return(last, term, imag_reward, imag_value,
+                                  imag_value, disc,
+                                  self.lamb)  # (B*T, T_imag-1, 1)
         ret_offset, ret_scale = self.return_ema(ret)
         # (B*T, T_imag-1, 1)
         adv = (ret - imag_value[:, :-1]) / ret_scale
@@ -467,17 +515,18 @@ class Dreamer(nn.Module):
         # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+        losses["policy"] = torch.mean(
+            weight[:, :-1].detach() *
+            -(logpi * adv.detach() + self.act_entropy * entropy))
 
         imag_value_dist = self.value(imag_feat)
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
         losses["value"] = torch.mean(
-            weight[:, :-1].detach()
-            * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
-                :, :-1
-            ].unsqueeze(-1)
-        )
+            weight[:, :-1].detach() *
+            (-imag_value_dist.log_prob(tar_padded.detach()) -
+             imag_value_dist.log_prob(
+                 imag_slow_value.detach()))[:, :-1].unsqueeze(-1))
         # log
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -506,17 +555,16 @@ class Dreamer(nn.Module):
         slow_value = self._frozen_slow_value(feat).mode()
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last
-        ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
+        ret = self._lambda_return(last, term, reward, value, boot, disc,
+                                  self.lamb)
         ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
         # Keep this attached to the world model so gradients can flow through
         value_dist = self.value(feat)
         losses["repval"] = torch.mean(
-            weight[:, :-1]
-            * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(
-                -1
-            )
-        )
+            weight[:, :-1] *
+            (-value_dist.log_prob(ret_padded.detach()) -
+             value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1))
         # log
         metrics.update(tools.tensorstats(ret, "ret_replay"))
         metrics.update(tools.tensorstats(value, "value_replay"))
@@ -599,9 +647,11 @@ class Dreamer(nn.Module):
         self._prototypes.data.copy_(prototypes)
         if self._ema_updates % self.ema_update_every == 0:
             mix = self.ema_update_fraction if self._ema_updates > 0 else 1.0
-            for s, d in zip(self.encoder.parameters(), self._ema_encoder.parameters()):
+            for s, d in zip(self.encoder.parameters(),
+                            self._ema_encoder.parameters()):
                 d.data.copy_(mix * s.data + (1 - mix) * d.data)
-            for s, d in zip(self.obs_proj.parameters(), self._ema_obs_proj.parameters()):
+            for s, d in zip(self.obs_proj.parameters(),
+                            self._ema_obs_proj.parameters()):
                 d.data.copy_(mix * s.data + (1 - mix) * d.data)
         self._ema_updates += 1
 
@@ -642,7 +692,7 @@ class Dreamer(nn.Module):
         obs_scores = torch.matmul(obs_proj, prototypes.T)
         # (B*T, K) -> (B, T, K) -> (K, B, T)
         obs_scores = obs_scores.reshape(B, T, -1).permute(2, 0, 1)
-        obs_scores = obs_scores[:, :, self.warm_up :]
+        obs_scores = obs_scores[:, :, self.warm_up:]
         obs_logits = F.log_softmax(obs_scores / self.temperature, dim=0)
         obs_logits_1, obs_logits_2 = torch.chunk(obs_logits, 2, dim=1)
 
@@ -651,7 +701,7 @@ class Dreamer(nn.Module):
         ema_scores = torch.matmul(ema_proj, prototypes.T)
         # (B*T, K) -> (B, T, K) -> (K, B, T)
         ema_scores = ema_scores.reshape(B, T, -1).permute(2, 0, 1)
-        ema_scores = ema_scores[:, :, self.warm_up :]
+        ema_scores = ema_scores[:, :, self.warm_up:]
         ema_scores_1, ema_scores_2 = torch.chunk(ema_scores, 2, dim=1)
 
         with torch.no_grad():
@@ -669,14 +719,15 @@ class Dreamer(nn.Module):
         feat_scores = torch.matmul(feat_proj, prototypes.T)
         # (B*T, K) -> (B, T, K) -> (K, B, T)
         feat_scores = feat_scores.reshape(B, T, -1).permute(2, 0, 1)
-        feat_scores = feat_scores[:, :, self.warm_up :]
+        feat_scores = feat_scores[:, :, self.warm_up:]
         feat_logits = F.log_softmax(feat_scores / self.temperature, dim=0)
 
-        swav_loss = -0.5 * torch.mean(torch.sum(ema_targets_2 * obs_logits_1, dim=0)) - 0.5 * torch.mean(
-            torch.sum(ema_targets_1 * obs_logits_2, dim=0)
-        )
+        swav_loss = -0.5 * torch.mean(
+            torch.sum(ema_targets_2 * obs_logits_1, dim=0)) - 0.5 * torch.mean(
+                torch.sum(ema_targets_1 * obs_logits_2, dim=0))
         temp_loss = -torch.mean(torch.sum(ema_targets * feat_logits, dim=0))
-        norm_loss = torch.mean(torch.square(obs_norm - 1)) + torch.mean(torch.square(feat_norm - 1))
+        norm_loss = torch.mean(torch.square(obs_norm - 1)) + torch.mean(
+            torch.square(feat_norm - 1))
 
         return {
             "swav": swav_loss,
@@ -685,7 +736,11 @@ class Dreamer(nn.Module):
         }
 
     @torch.no_grad()
-    def random_translate(self, x, max_delta, same_across_time=False, bilinear=False):
+    def random_translate(self,
+                         x,
+                         max_delta,
+                         same_across_time=False,
+                         bilinear=False):
         B, T, C, H, W = x.shape
         x_flat = x.reshape(B * T, C, H, W)
         pad = int(max_delta)
@@ -697,8 +752,16 @@ class Dreamer(nn.Module):
         # Create base grid
         eps_h = 1.0 / h_padded
         eps_w = 1.0 / w_padded
-        arange_h = torch.linspace(-1.0 + eps_h, 1.0 - eps_h, h_padded, device=x.device, dtype=x.dtype)[:H]
-        arange_w = torch.linspace(-1.0 + eps_w, 1.0 - eps_w, w_padded, device=x.device, dtype=x.dtype)[:W]
+        arange_h = torch.linspace(-1.0 + eps_h,
+                                  1.0 - eps_h,
+                                  h_padded,
+                                  device=x.device,
+                                  dtype=x.dtype)[:H]
+        arange_w = torch.linspace(-1.0 + eps_w,
+                                  1.0 - eps_w,
+                                  w_padded,
+                                  device=x.device,
+                                  dtype=x.dtype)[:W]
         arange_h = arange_h.unsqueeze(1).repeat(1, W).unsqueeze(2)
         arange_w = arange_w.unsqueeze(0).repeat(H, 1).unsqueeze(2)
         base_grid = torch.cat([arange_w, arange_h], dim=2)
@@ -706,16 +769,29 @@ class Dreamer(nn.Module):
 
         # Create shift
         if same_across_time:
-            shift = torch.randint(0, 2 * pad + 1, size=(B, 1, 1, 1, 2), device=x.device, dtype=x.dtype)
+            shift = torch.randint(0,
+                                  2 * pad + 1,
+                                  size=(B, 1, 1, 1, 2),
+                                  device=x.device,
+                                  dtype=x.dtype)
             shift = shift.repeat(1, T, 1, 1, 1).reshape(B * T, 1, 1, 2)
         else:
-            shift = torch.randint(0, 2 * pad + 1, size=(B * T, 1, 1, 2), device=x.device, dtype=x.dtype)
+            shift = torch.randint(0,
+                                  2 * pad + 1,
+                                  size=(B * T, 1, 1, 2),
+                                  device=x.device,
+                                  dtype=x.dtype)
 
-        shift = shift * 2.0 / torch.tensor([w_padded, h_padded], device=x.device, dtype=x.dtype)
+        shift = shift * 2.0 / torch.tensor(
+            [w_padded, h_padded], device=x.device, dtype=x.dtype)
 
         # Apply shift and sample
         grid = base_grid + shift
         mode = "bilinear" if bilinear else "nearest"
-        x_translated = F.grid_sample(x_padded, grid, mode=mode, padding_mode="zeros", align_corners=False)
+        x_translated = F.grid_sample(x_padded,
+                                     grid,
+                                     mode=mode,
+                                     padding_mode="zeros",
+                                     align_corners=False)
 
         return x_translated.reshape(B, T, C, H, W)

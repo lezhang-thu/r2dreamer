@@ -8,25 +8,35 @@ from tools import rpad, weight_init_
 
 
 class Deter(nn.Module):
-    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
+
+    def __init__(self,
+                 deter,
+                 stoch,
+                 act_dim,
+                 hidden,
+                 blocks,
+                 dynlayers,
+                 act="SiLU"):
         super().__init__()
         self.blocks = int(blocks)
         self.dynlayers = int(dynlayers)
         act = getattr(torch.nn, act)
         self._dyn_in0 = nn.Sequential(
-            nn.Linear(deter, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
-        )
+            nn.Linear(deter, hidden, bias=True),
+            nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act())
         self._dyn_in1 = nn.Sequential(
-            nn.Linear(stoch, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
-        )
+            nn.Linear(stoch, hidden, bias=True),
+            nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act())
         self._dyn_in2 = nn.Sequential(
-            nn.Linear(act_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
-        )
+            nn.Linear(act_dim, hidden, bias=True),
+            nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act())
         self._dyn_hid = nn.Sequential()
         in_ch = (3 * hidden + deter // self.blocks) * self.blocks
         for i in range(self.dynlayers):
-            self._dyn_hid.add_module(f"dyn_hid_{i}", BlockLinear(in_ch, deter, self.blocks))
-            self._dyn_hid.add_module(f"norm_{i}", nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32))
+            self._dyn_hid.add_module(f"dyn_hid_{i}",
+                                     BlockLinear(in_ch, deter, self.blocks))
+            self._dyn_hid.add_module(
+                f"norm_{i}", nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32))
             self._dyn_hid.add_module(f"act_{i}", act())
             in_ch = deter
         self._dyn_gru = BlockLinear(in_ch, 3 * deter, self.blocks)
@@ -76,6 +86,7 @@ class Deter(nn.Module):
 
 
 class RSSM(nn.Module):
+
     def __init__(self, config, embed_size, act_dim):
         super().__init__()
         self._stoch = int(config.stoch)
@@ -107,35 +118,53 @@ class RSSM(nn.Module):
         #inp_dim = self._deter + embed_size
         inp_dim = embed_size
         for i in range(self._obs_layers):
-            self._obs_net.add_module(f"obs_net_{i}", nn.Linear(inp_dim, self._hidden, bias=True))
-            self._obs_net.add_module(f"obs_net_n_{i}", nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
+            self._obs_net.add_module(
+                f"obs_net_{i}", nn.Linear(inp_dim, self._hidden, bias=True))
+            self._obs_net.add_module(
+                f"obs_net_n_{i}",
+                nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
             self._obs_net.add_module(f"obs_net_a_{i}", act())
             inp_dim = self._hidden
-        self._obs_net.add_module("obs_net_logit", nn.Linear(inp_dim, self._stoch * self._discrete, bias=True))
+        self._obs_net.add_module(
+            "obs_net_logit",
+            nn.Linear(inp_dim, self._stoch * self._discrete, bias=True))
         self._obs_net.add_module(
             "obs_net_lambda",
-            LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self._discrete)),
+            LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
+                                            _discrete)),
         )
 
         self._img_net = nn.Sequential()
         inp_dim = self._deter
         for i in range(self._img_layers):
-            self._img_net.add_module(f"img_net_{i}", nn.Linear(inp_dim, self._hidden, bias=True))
-            self._img_net.add_module(f"img_net_n_{i}", nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
+            self._img_net.add_module(
+                f"img_net_{i}", nn.Linear(inp_dim, self._hidden, bias=True))
+            self._img_net.add_module(
+                f"img_net_n_{i}",
+                nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
             self._img_net.add_module(f"img_net_a_{i}", act())
             inp_dim = self._hidden
-        self._img_net.add_module("img_net_logit", nn.Linear(inp_dim, self._stoch * self._discrete))
+        self._img_net.add_module(
+            "img_net_logit", nn.Linear(inp_dim, self._stoch * self._discrete))
         self._img_net.add_module(
             "img_net_lambda",
-            LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self._discrete)),
+            LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
+                                            _discrete)),
         )
         self.apply(weight_init_)
 
     def initial(self, batch_size):
         """Return an initial latent state."""
         # (B, D), (B, S, K)
-        deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
-        stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
+        deter = torch.zeros(batch_size,
+                            self._deter,
+                            dtype=torch.float32,
+                            device=self._device)
+        stoch = torch.zeros(batch_size,
+                            self._stoch,
+                            self._discrete,
+                            dtype=torch.float32,
+                            device=self._device)
         return stoch, deter
 
     def observe(self, embed, action, initial, reset):
@@ -146,7 +175,8 @@ class RSSM(nn.Module):
         stochs, deters, logits = [], [], []
         for i in range(L):
             # (B, S, K), (B, D), (B, S, K)
-            stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
+            stoch, deter, logit = self.obs_step(stoch, deter, action[:, i],
+                                                embed[:, i], reset[:, i])
             stochs.append(stoch)
             deters.append(deter)
             logits.append(logit)
@@ -159,11 +189,16 @@ class RSSM(nn.Module):
     def obs_step(self, stoch, deter, prev_action, embed, reset):
         """Single posterior step."""
         # (B, S, K), (B, D), (B, A), (B, E), (B,)
-        stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
-        deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
+        stoch = torch.where(rpad(reset,
+                                 stoch.dim() - int(reset.dim())),
+                            torch.zeros_like(stoch), stoch)
+        deter = torch.where(rpad(reset,
+                                 deter.dim() - int(reset.dim())),
+                            torch.zeros_like(deter), deter)
         prev_action = torch.where(
-            rpad(reset, prev_action.dim() - int(reset.dim())), torch.zeros_like(prev_action), prev_action
-        )
+            rpad(reset,
+                 prev_action.dim() - int(reset.dim())),
+            torch.zeros_like(prev_action), prev_action)
 
         # Deterministic transition then posterior logits conditioned on embed.
         # (B, D)
@@ -219,7 +254,8 @@ class RSSM(nn.Module):
         return torch.cat([stoch, deter], -1)
 
     def get_dist(self, logit):
-        return torchd.independent.Independent(dists.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1)
+        return torchd.independent.Independent(
+            dists.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1)
 
     def kl_loss(self, post_logit, prior_logit, free):
         kld = dists.kl

@@ -3,19 +3,21 @@ import numpy as np
 
 
 class MetaWorld(gym.Env):
+
     def __init__(
-        self,
-        name,
-        action_repeat=1,
-        size=(64, 64),
-        camera=None,
-        seed=0,
+            self,
+            name,
+            action_repeat=1,
+            size=(64, 64),
+            camera=None,
+            seed=0,
     ):
         import metaworld
 
         self._camera = camera
         mt1 = metaworld.MT1(name + "-v3", seed=seed)
-        env = mt1.train_classes[name + "-v3"](render_mode="rgb_array", camera_name=self._camera)
+        env = mt1.train_classes[name + "-v3"](render_mode="rgb_array",
+                                              camera_name=self._camera)
         env.set_task(mt1.train_tasks[0])
 
         if self._camera == "corner2":
@@ -32,9 +34,12 @@ class MetaWorld(gym.Env):
     @property
     def observation_space(self):
         spaces = {
-            "image": gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8),
-            "state": self._env.observation_space,
-            "log_success": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            "image":
+            gym.spaces.Box(0, 255, self._size + (3, ), dtype=np.uint8),
+            "state":
+            self._env.observation_space,
+            "log_success":
+            gym.spaces.Box(-np.inf, np.inf, (1, ), dtype=np.float32),
         }
         return gym.spaces.Dict(spaces)
 
