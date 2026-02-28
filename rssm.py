@@ -104,7 +104,8 @@ class RSSM(nn.Module):
         )
 
         self._obs_net = nn.Sequential()
-        inp_dim = self._deter + embed_size
+        #inp_dim = self._deter + embed_size
+        inp_dim = embed_size
         for i in range(self._obs_layers):
             self._obs_net.add_module(f"obs_net_{i}", nn.Linear(inp_dim, self._hidden, bias=True))
             self._obs_net.add_module(f"obs_net_n_{i}", nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
@@ -168,7 +169,8 @@ class RSSM(nn.Module):
         # (B, D)
         deter = self._deter_net(stoch, deter, prev_action)
         # (B, D + E)
-        x = torch.cat([deter, embed], dim=-1)
+        #x = torch.cat([deter, embed], dim=-1)
+        x = embed
         # (B, S, K)
         logit = self._obs_net(x)
 
