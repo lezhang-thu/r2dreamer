@@ -29,16 +29,25 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
         self.rep_loss = str(config.rep_loss)
+        self._use_transformer = str(getattr(config, 'dyn_type', 'rssm')) == 'transformer'
+        self.imag_last = int(getattr(config, 'imag_last', 0))
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
-        self.rssm = rssm.RSSM(
-            config.rssm,
-            self.embed_size,
-            self.act_dim,
-        )
+        if self._use_transformer:
+            self.rssm = rssm.TransformerRSSM(
+                config.transformer,
+                self.embed_size,
+                self.act_dim,
+            )
+        else:
+            self.rssm = rssm.RSSM(
+                config.rssm,
+                self.embed_size,
+                self.act_dim,
+            )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
@@ -185,48 +194,82 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def act(self, obs, state, eval=False):
         """Policy inference step."""
-        # obs: dict of (B, *), state: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
         torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs)
         # (B, E)
         embed = self._frozen_encoder(p_obs)
-        prev_stoch, prev_deter, prev_action = (
-            state["stoch"],
-            state["deter"],
-            state["prev_action"],
-        )
-        # (B, S, K), (B, D)
-        stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter,
-                                                     prev_action, embed,
-                                                     obs["is_first"])
-        # (B, F)
-        feat = self._frozen_rssm.get_feat(stoch, deter)
-        action_dist = self._frozen_actor(feat)
-        # (B, A)
-        action = action_dist.mode if eval else action_dist.rsample()
-        return action, TensorDict(
-            {
-                "stoch": stoch,
-                "deter": deter,
-                "prev_action": action
-            },
-            batch_size=state.batch_size,
-        )
+
+        if self._use_transformer:
+            # Two-phase KV-cache inference
+            carry = {
+                'kv_cache': state['kv_cache'],
+                'pos': state['pos'],
+                'h_prev': state['h_prev'],
+            }
+            # Phase 1: posterior from h_prev + tokens
+            carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
+                carry, embed, obs["is_first"])
+            feat = self._frozen_rssm.get_feat(stoch, h_prev)
+            action_dist = self._frozen_actor(feat)
+            action = action_dist.mode if eval else action_dist.rsample()
+            # Phase 2: update KV-cache with (tokens, action)
+            carry = self._frozen_rssm.update_carry(
+                carry, embed, action, obs["is_first"])
+            return action, TensorDict(
+                {
+                    "kv_cache": carry['kv_cache'],
+                    "pos": carry['pos'],
+                    "h_prev": carry['h_prev'],
+                },
+                batch_size=state.batch_size,
+            )
+        else:
+            prev_stoch, prev_deter, prev_action = (
+                state["stoch"],
+                state["deter"],
+                state["prev_action"],
+            )
+            # (B, S, K), (B, D)
+            stoch, deter, _ = self._frozen_rssm.obs_step(
+                prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
+            # (B, F)
+            feat = self._frozen_rssm.get_feat(stoch, deter)
+            action_dist = self._frozen_actor(feat)
+            # (B, A)
+            action = action_dist.mode if eval else action_dist.rsample()
+            return action, TensorDict(
+                {
+                    "stoch": stoch,
+                    "deter": deter,
+                    "prev_action": action
+                },
+                batch_size=state.batch_size,
+            )
 
     @torch.no_grad()
     def get_initial_state(self, B):
-        stoch, deter = self.rssm.initial(B)
-        action = torch.zeros(B,
-                             self.act_dim,
-                             dtype=torch.float32,
-                             device=self.device)
-        return TensorDict(
-            {
-                "stoch": stoch,
-                "deter": deter,
-                "prev_action": action
-            },
-            batch_size=(B, ))
+        if self._use_transformer:
+            carry = self.rssm.initial(B)
+            return TensorDict(
+                {
+                    "kv_cache": carry['kv_cache'],
+                    "pos": carry['pos'],
+                    "h_prev": carry['h_prev'],
+                },
+                batch_size=(B, ))
+        else:
+            stoch, deter = self.rssm.initial(B)
+            action = torch.zeros(B,
+                                 self.act_dim,
+                                 dtype=torch.float32,
+                                 device=self.device)
+            return TensorDict(
+                {
+                    "stoch": stoch,
+                    "deter": deter,
+                    "prev_action": action
+                },
+                batch_size=(B, ))
 
     @torch.no_grad()
     def get_initial_carry(self, B):
@@ -234,8 +277,12 @@ class Dreamer(nn.Module):
 
         Returns a tuple (stoch, deter, prev_action) analogous to carry_train
         in dreamerv3-jax/embodied/run/x_train.py.
+        For transformer: carry_train is unused (complete episodes), but we
+        return a compatible tuple for interface consistency.
         """
-        stoch, deter = self.rssm.initial(B)
+        stoch, deter = self.rssm.initial(B) if not self._use_transformer \
+            else (torch.zeros(B, dtype=torch.float32, device=self.device),
+                  torch.zeros(B, dtype=torch.float32, device=self.device))
         prev_action = torch.zeros(B,
                                   self.act_dim,
                                   dtype=torch.float32,
@@ -305,15 +352,19 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
         metrics.update(mets)
-        # Update carry_train with the endpoint latent state and last action.
-        # clone() is needed because stoch/deter are outputs of the CUDAGraph
-        # (torch.compile reduce-overhead); without cloning, the next graph
-        # replay would overwrite the memory that carry_train points to.
-        new_carry = (
-            stoch[:, -1].detach().clone(),
-            deter[:, -1].detach().clone(),
-            data["action"][:, -1].detach().clone(),
-        )
+        if self._use_transformer:
+            # Transformer sees complete episodes; no carry state to propagate.
+            new_carry = carry_train
+        else:
+            # Update carry_train with the endpoint latent state and last action.
+            # clone() is needed because stoch/deter are outputs of the CUDAGraph
+            # (torch.compile reduce-overhead); without cloning, the next graph
+            # replay would overwrite the memory that carry_train points to.
+            new_carry = (
+                stoch[:, -1].detach().clone(),
+                deter[:, -1].detach().clone(),
+                data["action"][:, -1].detach().clone(),
+            )
         return new_carry, metrics
 
     def _cal_grad(self, data, carry_train):
@@ -331,16 +382,6 @@ class Dreamer(nn.Module):
         3) Imagination rollouts for actor-critic updates
         4) Replay-based value learning
         """
-        # carry_train: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
-        carry_stoch, carry_deter, carry_prev_action = carry_train
-        initial = (carry_stoch, carry_deter)
-
-        # Apply replay context: prepend prev_action from carry, analogous to
-        # _apply_replay_context in dreamerv3-jax/dreamerv3/agent.py.
-        # action[:, 0] comes from carry, action[:, 1:-1] from data[:, :-1]
-        action = torch.cat(
-            [carry_prev_action.unsqueeze(1), data["action"][:, :-1]], dim=1)
-
         # t_mask: (B, T) bool — True for real data, False for padding
         t_mask = data["t_mask"].float()  # (B, T)
 
@@ -351,16 +392,36 @@ class Dreamer(nn.Module):
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
         embed = self.encoder(data)
-        # (B, T, S, K), (B, T, D), (B, T, S, K)
-        post_stoch, post_deter, post_logit = self.rssm.observe(
-            embed, action, initial, data["is_first"])
-        # (B, T, S, K)
-        _, prior_logit = self.rssm.prior(post_deter)
-        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
-                                               self.kl_free)
-        # Mask world-model losses: (B, T) -> scalar
-        losses["dyn"] = (dyn_loss * t_mask).mean()
-        losses["rep"] = (rep_loss * t_mask).mean()
+
+        if self._use_transformer:
+            # Transformer path: current action, full-sequence observe
+            action = data["action"]  # (B, T, A) — current action a_t
+            entries, feat_dict = self.rssm.observe(
+                embed, action, data["is_first"])
+            post_stoch = feat_dict['stoch']       # (B, T, S, K)
+            post_deter = feat_dict['deter']       # (B, T, D) = h_prev
+            post_logit = feat_dict['post_logit']  # (B, T, S, K)
+            prior_logit = feat_dict['prior_logit']
+            dyn_loss, rep_loss = self.rssm.kl_loss(
+                post_logit, prior_logit, self.kl_free)
+            losses["dyn"] = (dyn_loss * t_mask).mean()
+            losses["rep"] = (rep_loss * t_mask).mean()
+            losses["align"] = (feat_dict['imag_core_loss'] * t_mask).mean()
+        else:
+            # GRU RSSM path: shifted prev_action, sequential observe
+            carry_stoch, carry_deter, carry_prev_action = carry_train
+            initial = (carry_stoch, carry_deter)
+            action = torch.cat(
+                [carry_prev_action.unsqueeze(1), data["action"][:, :-1]],
+                dim=1)
+            post_stoch, post_deter, post_logit = self.rssm.observe(
+                embed, action, initial, data["is_first"])
+            _, prior_logit = self.rssm.prior(post_deter)
+            dyn_loss, rep_loss = self.rssm.kl_loss(
+                post_logit, prior_logit, self.kl_free)
+            losses["dyn"] = (dyn_loss * t_mask).mean()
+            losses["rep"] = (rep_loss * t_mask).mean()
+
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
@@ -405,46 +466,54 @@ class Dreamer(nn.Module):
             self.rssm.get_dist(post_logit).entropy())
 
         # === Imagination rollout for actor-critic ===
-        # (B*T, S, K), (B*T, D)
-        start = (
-            post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
-            post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
-        )
-        # (B, T, ...) -> (B*T, ...)
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
-        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+        if self._use_transformer:
+            # Start from K contiguous positions at random offset
+            K = min(self.imag_last if self.imag_last > 0 else T, T)
+            s = torch.randint(0, T - K + 1, ()).item() if K < T else 0
+            start = (
+                post_stoch[:, s:s + K].reshape(
+                    B * K, *post_stoch.shape[2:]).detach(),
+                post_deter[:, s:s + K].reshape(
+                    B * K, *post_deter.shape[2:]).detach(),
+            )
+            imag_feat, imag_action = self._imagine(
+                start, self.imag_horizon + 1)
+            imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+            imag_mask = t_mask[:, s:s + K].reshape(B * K, 1, 1)
+        else:
+            # (B*T, S, K), (B*T, D)
+            start = (
+                post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
+                post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
+            )
+            imag_feat, imag_action = self._imagine(
+                start, self.imag_horizon + 1)
+            imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+            imag_mask = t_mask.reshape(B * T, 1, 1)
 
-        # (B*T, T_imag, 1)
+        # (N, T_imag, 1) where N = B*K (transformer) or B*T (rssm)
         imag_reward = self._frozen_reward(imag_feat).mode()
-        # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
-        # (B*T, T_imag, 1)
         imag_value = self._frozen_value(imag_feat).mode()
         imag_slow_value = self._frozen_slow_value(imag_feat).mode()
         disc = 1 - 1 / self.horizon
-        # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
         ret = self._lambda_return(last, term, imag_reward, imag_value,
                                   imag_value, disc,
-                                  self.lamb)  # (B*T, T_imag-1, 1)
+                                  self.lamb)  # (N, T_imag-1, 1)
         ret_offset, ret_scale = self.return_ema(ret)
-        # (B*T, T_imag-1, 1)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
         policy = self.actor(imag_feat)
-        # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        # Imagination policy loss — mask by t_mask expanded to (B*T, 1, 1)
-        imag_mask = t_mask.reshape(B * T, 1, 1)  # (B*T, 1, 1)
         policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() +
                                                   self.act_entropy * entropy)
         losses["policy"] = (policy_loss * imag_mask).mean()
 
         imag_value_dist = self.value(imag_feat)
-        # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
         value_loss = (weight[:, :-1].detach() *
                       (-imag_value_dist.log_prob(tar_padded.detach()) -
