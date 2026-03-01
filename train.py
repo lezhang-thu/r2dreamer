@@ -7,7 +7,7 @@ import hydra
 import torch
 
 import tools
-from buffer import Buffer
+from replay_y import ReplayY
 from dreamer import Dreamer
 from envs import make_envs
 from trainer import OnlineTrainer
@@ -36,7 +36,10 @@ def main(config):
     # save config
     logger.log_hydra_config(config)
 
-    replay_buffer = Buffer(config.buffer)
+    replay_buffer = ReplayY(
+        length=int(config.batch_length),
+        seed=config.seed,
+    )
 
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)

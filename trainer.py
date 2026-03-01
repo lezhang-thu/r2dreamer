@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 import tools
@@ -15,8 +16,8 @@ class OnlineTrainer:
         self.pretrain = int(config.pretrain)
         self.eval_every = int(config.eval_every)
         self.eval_episode_num = int(config.eval_episode_num)
-        self.video_pred_log = bool(config.video_pred_log)
         self.params_hist_log = bool(config.params_hist_log)
+        self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
         batch_steps = int(config.batch_size * config.batch_length)
         # train_ratio is based on data steps rather than environment steps.
@@ -49,7 +50,7 @@ class OnlineTrainer:
                               dtype=torch.float32,
                               device=agent.device)
         log_metrics = {}
-        # cache is only used for video logging / open-loop prediction.
+        # cache is only used for video logging.
         cache = []
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
@@ -94,16 +95,6 @@ class OnlineTrainer:
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
-        if self.video_pred_log and cache is not None:
-            initial = agent.get_initial_state(1)
-            self.logger.video(
-                "eval_open_loop",
-                tools.to_np(
-                    agent.video_pred(
-                        cache[:1],  # give only first batch
-                        (initial["stoch"], initial["deter"]),
-                    )),
-            )
         self.logger.write(train_step)
         agent.train()
 
@@ -116,7 +107,7 @@ class OnlineTrainer:
         """
         envs = self.train_envs
         video_cache = []
-        step = self.replay_buffer.count() * self._action_repeat
+        step = 0
         update_count = 0
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
@@ -126,13 +117,16 @@ class OnlineTrainer:
         lengths = torch.zeros(envs.env_num,
                               dtype=torch.int32,
                               device=agent.device)
-        episode_ids = torch.arange(
-            envs.env_num, dtype=torch.int32, device=agent.device
-        )  # Increment this to prevent sampling across episode boundaries
         train_metrics = {}
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
+
+        # Carry state for chunked replay training, analogous to carry_train
+        # in dreamerv3-jax/embodied/run/x_train.py.
+        # (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
+        carry_train = agent.get_initial_carry(self.batch_size)
+
         while step < self.steps:
             # Evaluation
             if self._should_eval(step) and self.eval_episode_num > 0:
@@ -176,26 +170,37 @@ class OnlineTrainer:
                                          agent_state,
                                          eval=False)
 
-            # Store transition.
-            # We keep the observation and the action that produced it together.
+            # Store transition into ReplayY.
+            # We pair each observation s_t with the action a_t = π(s_t) taken in response.
             # Mask actions after an episode has ended.
             trans["action"] = act * ~done.unsqueeze(-1)
-            trans["stoch"] = agent_state["stoch"]
-            trans["deter"] = agent_state["deter"]
-            trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])
-            self.replay_buffer.add_transition(trans.detach())
+            # Add each env's transition to the replay as a separate worker.
+            # Scalar fields (reward, is_first, ...) have a singleton time dim
+            # (B, 1) from lift_dim; squeeze it so each step stores a scalar.
+            _SCALAR_KEYS = {"reward", "is_first", "is_last", "is_terminal"}
+            trans_np = {
+                k:
+                tools.to_np(v.squeeze(1))
+                if k in _SCALAR_KEYS else tools.to_np(v)
+                for k, v in trans.items()
+            }
+            for i in range(envs.env_num):
+                step_dict = {k: v[i] for k, v in trans_np.items()}
+                self.replay_buffer.add(step_dict, worker=i)
             returns += trans["reward"][:, 0]
             # Update models after enough data has accumulated
-            if step // (envs.env_num *
-                        self._action_repeat) > self.batch_length + 1:
+            #if step // (envs.env_num *
+            #            self._action_repeat) > self.batch_length:
+            if len(self.replay_buffer) >= self.batch_size:
                 if self._should_pretrain():
                     update_num = self.pretrain
                 else:
                     update_num = self._updates_needed(step)
                 for _ in range(update_num):
-                    _metrics = agent.update(self.replay_buffer)
+                    carry_train, _metrics = agent.update(
+                        self.replay_buffer, carry_train)
                     train_metrics = _metrics
                 update_count += update_num
                 # Log training metrics
@@ -205,11 +210,6 @@ class OnlineTrainer:
                             value, torch.Tensor) else value
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
-                    if self.video_pred_log:
-                        data, _, initial = self.replay_buffer.sample()
-                        self.logger.video(
-                            "open_loop",
-                            tools.to_np(agent.video_pred(data, initial)))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
