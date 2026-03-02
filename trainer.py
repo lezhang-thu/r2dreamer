@@ -70,7 +70,9 @@ class OnlineTrainer:
             done = done_cpu.to(agent.device)
 
             # Store transition.
-            # We keep the observation and the action that produced it together.
+            # Attach the action sent to env.step at this loop step.
+            # For envs that were done, trans may be reset output, so this is
+            # for logging/cache consistency rather than strict causality.
             trans["action"] = act
             if len(cache) < self.batch_length:
                 cache.append(trans.clone())

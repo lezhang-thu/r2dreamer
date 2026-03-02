@@ -52,8 +52,8 @@ Training (observe path):
 3. Run causal transformer (`_fwd`) over the full sequence.
 4. Shift-right to get `h_prev`.
 5. `prior_logit = _prior_head(h_prev)`.
-6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) and `pos_before`
-   for efficient imagination-start construction without replaying history.
+6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) for efficient
+   imagination-start construction without replaying history.
 
 Posterior is conditioned on `tokens` only. It does **not** take `h_prev`.
 
@@ -69,7 +69,9 @@ Given current latent `(stoch_t, h_prev_t)` and action `a_t`:
 Carry keeps only `window_size` past steps, matching inference memory behavior.
 During training, starts are built from `observe()`-returned trajectory KV tensors
 for contiguous `K` offsets (`B*K` parallel starts), so no extra history replay is
-needed in `_cal_grad`.
+needed in `_cal_grad`. `window_size` dummy all-zero KV slots are prepended
+before start-window extraction so imagination uses the same zero-cache style as
+`initial()` in policy inference.
 
 ### 3. Policy inference: two-phase KV-cache
 
@@ -128,6 +130,8 @@ python3 train.py model.dyn_type=transformer model.compile=False batch_length=500
 - Full-sequence training still uses parallel causal attention.
 - In imagination/inference, dynamics are rolled with a bounded KV window to
   control memory.
+- Training assumes complete trajectories (no concatenation of different
+  trajectories inside one sampled sequence).
 - RoPE uses a modern cached implementation with dynamic cache growth if
   positions exceed `rope_max_seq_len`.
 - `post_head` and `prior_head` are now multi-layer MLP heads (Linear + RMSNorm

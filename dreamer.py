@@ -302,8 +302,8 @@ class Dreamer(nn.Module):
     def update(self, replay_buffer, carry_train):
         """Sample a batch from replay and perform one optimization step.
 
-        Uses chunked replay (ReplayY) with carry_train state, analogous to
-        dreamerv3-jax/embodied/run/x_train.py.
+        ReplayY provides complete trajectories (padded, no concatenation across
+        trajectories). carry_train is kept for interface compatibility.
 
         Args:
             replay_buffer: ReplayY instance.
@@ -475,22 +475,17 @@ class Dreamer(nn.Module):
 
         # === Imagination rollout for actor-critic ===
         if self._use_transformer:
-            # Sample one start position and build KV carry from recent history.
-            K = min(self.imag_last if self.imag_last > 0 else T, T)
-            s0 = torch.randint(0, T - K + 1, ()).item() if K < T else 0
-            start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
+            start_stoch, start_deter, imag_carry, imag_mask = self._prepare_transformer_imag_start(
                 post_stoch.detach(),
                 post_deter.detach(),
                 feat_dict["kv_k"],
                 feat_dict["kv_v"],
-                feat_dict["pos_before"],
-                s0,
-                K,
+                t_mask,
+                T,
             )
             imag_feat, imag_action = self._imagine(
                 (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-            imag_mask = t_mask[:, s0:s0 + K].reshape(B * K, 1, 1)
         else:
             # (B*T, S, K), (B*T, D)
             start = (
@@ -582,6 +577,24 @@ class Dreamer(nn.Module):
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), metrics
+
+    @torch.no_grad()
+    def _prepare_transformer_imag_start(self, post_stoch, post_deter, kv_k,
+                                        kv_v, t_mask, T):
+        """Prepare transformer imagination starts from trajectory KV tensors."""
+        B = post_stoch.shape[0]
+        K = min(self.imag_last if self.imag_last > 0 else T, T)
+        #s0 = torch.randint(0, T - K + 1, ()).item() if K < T else 0
+        s0 = torch.randint(0, 1024, ()).item()
+
+        # Prepend W dummy zero-KV slots to match initial() style exactly.
+        W = int(self._frozen_rssm._window_size)
+        kv_k = torch.cat([torch.zeros_like(kv_k[:, :, :W]), kv_k], dim=2)
+        kv_v = torch.cat([torch.zeros_like(kv_v[:, :, :W]), kv_v], dim=2)
+        start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
+            post_stoch, post_deter, kv_k, kv_v, s0, K)
+        imag_mask = t_mask[:, s0:s0 + K].reshape(B * K, 1, 1)
+        return start_stoch, start_deter, imag_carry, imag_mask
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon, imag_carry=None):

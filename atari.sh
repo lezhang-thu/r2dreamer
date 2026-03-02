@@ -52,6 +52,6 @@ for task in "${tasks[@]}"; do
 			model=size12M \
 			model.rep_loss=${METHOD} \
 			seed=$seed \
-			batch_size=2 batch_length=1024
+			batch_size=2 batch_length=2049
 	done
 done

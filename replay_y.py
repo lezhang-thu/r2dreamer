@@ -1,4 +1,3 @@
-import math
 import threading
 
 import numpy as np
@@ -20,15 +19,6 @@ class ReplayY:
         # Per-worker buffers that accumulate steps until episode ends.
         self.local = {}
         self.lock = threading.Lock()
-
-        # Stateful chunked-sampling state.  The first call to sample() draws a
-        # fresh batch of episodes; the next ceil(M/length)-1 calls serve
-        # successive non-overlapping windows of the *same* episodes, where M is
-        # the maximum episode length in the batch.
-        self._current_eps = None  # list of episode dicts (length == batch)
-        self._ep_lens = None  # list of int, actual episode lengths
-        self._chunk_idx = 0  # which chunk is being served right now
-        self._n_chunks = 0  # total chunks for the current episode batch
 
     def __len__(self):
         # Count any stored episode (zero-padding handles episodes shorter than
@@ -58,57 +48,39 @@ class ReplayY:
 
     def sample(self, batch):
         L = self.length
+        with self.lock:
+            valid = [ep for ep in self.eps if ep is not None]
+        if not valid:
+            raise RuntimeError(
+                "ReplayY.sample() called with no complete episodes.")
 
-        # ---- start of a new episode-batch cycle ----
-        if self._chunk_idx == 0:
-            with self.lock:
-                valid = [ep for ep in self.eps if ep is not None]
-            self._current_eps = [
-                valid[self.rng.integers(0, len(valid))] for _ in range(batch)
-            ]
-            self._ep_lens = [
-                len(next(iter(ep.values()))) for ep in self._current_eps
-            ]
-            M = max(self._ep_lens)
-            self._n_chunks = math.ceil(M / L)
-
-        # ---- build the chunk for the current index ----
-        c = self._chunk_idx
-        start = c * L
-        end = start + L
+        sampled_eps = [
+            valid[self.rng.integers(0, len(valid))] for _ in range(batch)
+        ]
+        ep_lens = [len(next(iter(ep.values()))) for ep in sampled_eps]
+        max_len = max(ep_lens)
+        if max_len > L:
+            raise ValueError(
+                f"ReplayY length={L} is smaller than sampled complete episode "
+                f"length={max_len}. Increase batch_length to avoid truncation.")
 
         seqs = []
-        for ep, ep_len in zip(self._current_eps, self._ep_lens):
-            real_start = min(start, ep_len)
-            real_end = min(end, ep_len)
-            real_len = real_end - real_start
-            pad_len = L - real_len
-
-            chunk = {}
+        for ep, ep_len in zip(sampled_eps, ep_lens):
+            pad_len = L - ep_len
+            item = {}
             for k, v in ep.items():
-                if real_len > 0:
-                    arr = v[real_start:real_end]
-                    if pad_len > 0:
-                        pad = np.zeros((pad_len, *v.shape[1:]), v.dtype)
-                        arr = np.concatenate([arr, pad], axis=0)
-                else:
-                    arr = np.zeros((L, *v.shape[1:]), v.dtype)
-                chunk[k] = arr
-            seqs.append(chunk)
+                arr = v
+                if pad_len > 0:
+                    pad = np.zeros((pad_len, *v.shape[1:]), dtype=v.dtype)
+                    arr = np.concatenate([arr, pad], axis=0)
+                item[k] = arr
+            seqs.append(item)
 
         data = {k: np.stack([s[k] for s in seqs]) for k in seqs[0]}
 
-        # t_mask[i, t] = True  <=>  transition t of episode i is real data,
-        #                           not zero-padding.
+        # t_mask[i, t] = True iff step t is real (not padding).
         t_mask = np.zeros((batch, L), dtype=bool)
-        for i, ep_len in enumerate(self._ep_lens):
-            real_start = min(start, ep_len)
-            real_end = min(end, ep_len)
-            real_len = real_end - real_start
-            t_mask[i, :real_len] = True
-        data['t_mask'] = t_mask
-
-        # Advance and wrap the chunk counter.
-        self._chunk_idx = (self._chunk_idx + 1) % self._n_chunks
-
+        for i, ep_len in enumerate(ep_lens):
+            t_mask[i, :ep_len] = True
+        data["t_mask"] = t_mask
         return data
