@@ -309,7 +309,6 @@ class TransformerRSSM(nn.Module):
         self._n_heads = int(config.n_heads)
         self._n_layers = int(config.n_layers)
         self._d_ff = int(config.d_ff)
-        self._imag_layers = int(config.imag_layers)
         self._window_size = int(config.window_size)
         act_fn = getattr(torch.nn, config.act)
 
@@ -324,8 +323,8 @@ class TransformerRSSM(nn.Module):
         # Activation for FFN sublayers
         self._act_fn = act_fn()
 
-        # Input projection: (embed + action) -> deter
-        self._inp_proj = nn.Linear(embed_size + act_dim, D)
+        # Input projection: (flat_stoch + action) -> deter
+        self._inp_proj = nn.Linear(self.flat_stoch + act_dim, D)
 
         # Per-layer transformer components
         self._attn_norms = nn.ModuleList()
@@ -352,31 +351,48 @@ class TransformerRSSM(nn.Module):
         # Output norm
         self._outnorm = nn.RMSNorm(D, eps=1e-04, dtype=torch.float32)
 
-        # Posterior head: tokens -> (S, K)
-        self._post_head = nn.Sequential(
-            nn.Linear(embed_size, self._stoch * self._discrete),
+        # Richer posterior/prior heads, analogous to RSSM obs/img heads.
+        self._head_hidden = int(getattr(config, 'head_hidden', D))
+        self._post_layers = int(getattr(config, 'post_layers', 1))
+        self._prior_layers = int(getattr(config, 'prior_layers', 2))
+
+        self._post_head = nn.Sequential()
+        inp_dim = embed_size
+        for i in range(self._post_layers):
+            self._post_head.add_module(
+                f"post_{i}", nn.Linear(inp_dim, self._head_hidden, bias=True))
+            self._post_head.add_module(
+                f"post_n_{i}",
+                nn.RMSNorm(self._head_hidden, eps=1e-04, dtype=torch.float32))
+            self._post_head.add_module(f"post_a_{i}", act_fn())
+            inp_dim = self._head_hidden
+        self._post_head.add_module(
+            "post_logit",
+            nn.Linear(inp_dim, self._stoch * self._discrete, bias=True))
+        self._post_head.add_module(
+            "post_lambda",
             LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
                                             _discrete)),
         )
 
-        # Prior head: deter -> (S, K)
-        self._prior_head = nn.Sequential(
-            nn.Linear(D, self._stoch * self._discrete),
+        self._prior_head = nn.Sequential()
+        inp_dim = D
+        for i in range(self._prior_layers):
+            self._prior_head.add_module(
+                f"prior_{i}", nn.Linear(inp_dim, self._head_hidden, bias=True))
+            self._prior_head.add_module(
+                f"prior_n_{i}",
+                nn.RMSNorm(self._head_hidden, eps=1e-04, dtype=torch.float32))
+            self._prior_head.add_module(f"prior_a_{i}", act_fn())
+            inp_dim = self._head_hidden
+        self._prior_head.add_module(
+            "prior_logit",
+            nn.Linear(inp_dim, self._stoch * self._discrete, bias=True))
+        self._prior_head.add_module(
+            "prior_lambda",
             LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
                                             _discrete)),
         )
-
-        # Imagination MLP core: cat(deter, flat_stoch, action) -> next_deter
-        self._imag_mlp = nn.Sequential()
-        inp_dim = D + self.flat_stoch + act_dim
-        for i in range(self._imag_layers):
-            self._imag_mlp.add_module(f"imag_{i}", nn.Linear(inp_dim, D))
-            self._imag_mlp.add_module(
-                f"imag_norm_{i}", nn.RMSNorm(D, eps=1e-04,
-                                             dtype=torch.float32))
-            if i < self._imag_layers - 1:
-                self._imag_mlp.add_module(f"imag_act_{i}", act_fn())
-            inp_dim = D
 
         self.apply(weight_init_)
 
@@ -393,16 +409,20 @@ class TransformerRSSM(nn.Module):
             reset: (B, T) boolean, True at episode start.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
-            feat: dict with deter, stoch, post_logit, prior_logit,
-                  imag_core_loss.
+            feat: dict with deter, stoch, post_logit, prior_logit.
         """
-        B, T = tokens.shape[:2]
+        _ = tokens.shape[:2]
 
         # Normalize action magnitude
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
-        # Input projection: cat(tokens, action) -> d_model
-        x = self._inp_proj(torch.cat([tokens, action_norm], -1))  # (B, T, D)
+        # Posterior: conditioned on tokens only
+        post_logit = self._post_head(tokens)  # (B, T, S, K)
+        stoch = self.get_dist(post_logit).rsample()  # (B, T, S, K)
+
+        # Input projection: cat(stoch, action) -> d_model
+        stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)
+        x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
 
         # Causal Transformer forward
         h = self._fwd(x)  # (B, T, D)
@@ -414,17 +434,8 @@ class TransformerRSSM(nn.Module):
         reset_mask = reset.unsqueeze(-1).float()  # (B, T, 1)
         h_prev = h_prev * (1.0 - reset_mask)
 
-        # Posterior: conditioned on tokens only
-        post_logit = self._post_head(tokens)  # (B, T, S, K)
-        stoch = self.get_dist(post_logit).rsample()  # (B, T, S, K)
-
         # Prior: conditioned on h_prev only
         prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
-
-        # Alignment: train _imag_mlp to predict h from sg(h_prev, stoch, act)
-        deter_pred = self._imag_core(h_prev.detach(), stoch.detach(),
-                                     action_norm)
-        imag_core_loss = ((h.detach() - deter_pred)**2).mean(-1)  # (B, T)
 
         entries = {'deter': h_prev, 'stoch': stoch}
         feat = {
@@ -432,7 +443,6 @@ class TransformerRSSM(nn.Module):
             'stoch': stoch,
             'post_logit': post_logit,
             'prior_logit': prior_logit,
-            'imag_core_loss': imag_core_loss,
         }
         return entries, feat
 
@@ -473,35 +483,66 @@ class TransformerRSSM(nn.Module):
         return self._outnorm(x)
 
     # ------------------------------------------------------------------
-    # Imagination (Markovian MLP)
+    # Imagination (KV-cache transition)
     # ------------------------------------------------------------------
 
-    def _imag_core(self, deter, stoch, action):
-        """MLP transition: (deter, flat_stoch, action) -> next_deter."""
-        stoch_flat = stoch.reshape(*stoch.shape[:-2], -1)
-        x = torch.cat([deter, stoch_flat, action], -1)
-        return self._imag_mlp(x)
-
     def img_step(self, stoch, deter, action):
-        """Single prior step using Markovian MLP."""
-        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
-        deter = self._imag_core(deter, stoch, action_norm)
-        stoch, _ = self.prior(deter)
+        """Fallback single-step prior using zeroed KV carry."""
+        carry = self.initial(stoch.shape[0])
+        carry['h_prev'] = deter
+        stoch, deter, _ = self.img_step_with_carry(stoch, carry, action)
         return stoch, deter
 
-    def imagine_with_action(self, stoch, deter, actions):
-        """Roll out prior dynamics given a sequence of actions."""
-        # (B, S, K), (B, D), (B, T, A)
+    def img_step_with_carry(self, stoch, carry, action):
+        """Single prior step with KV-cache carry."""
+        reset = torch.zeros(stoch.shape[0],
+                            dtype=torch.bool,
+                            device=stoch.device)
+        carry = self.update_carry(carry, stoch, action, reset)
+        deter = carry['h_prev']
+        stoch, _ = self.prior(deter)
+        return stoch, deter, carry
+
+    @torch.no_grad()
+    def build_imag_start(self, stoch_seq, action_seq, reset, start):
+        """Build imagination start state/carry from recent sequence history.
+
+        Uses at most `window_size` historical steps, matching KV-cache policy
+        inference memory behavior.
+        """
+        B = stoch_seq.shape[0]
+        start = int(start)
+        hist_start = max(0, start - self._window_size)
+        carry = self.initial(B)
+        if hist_start > 0:
+            carry['pos'] = torch.full((B, ),
+                                      hist_start,
+                                      dtype=torch.int32,
+                                      device=stoch_seq.device)
+        for t in range(hist_start, start):
+            carry = self.update_carry(carry, stoch_seq[:, t], action_seq[:, t],
+                                      reset[:, t])
+        return stoch_seq[:, start], carry['h_prev'], carry
+
+    def imagine_with_action(self, stoch, deter, actions, carry=None):
+        """Roll out prior dynamics given a sequence of actions.
+
+        If carry is provided, rolling context is preserved with KV-cache.
+        """
         L = actions.shape[1]
         stochs, deters = [], []
+        if carry is None:
+            carry = self.initial(stoch.shape[0])
+            carry['h_prev'] = deter
         for i in range(L):
-            stoch, deter = self.img_step(stoch, deter, actions[:, i])
+            stoch, deter, carry = self.img_step_with_carry(
+                stoch, carry, actions[:, i])
             stochs.append(stoch)
             deters.append(deter)
         # (B, T, S, K), (B, T, D)
         stochs = torch.stack(stochs, dim=1)
         deters = torch.stack(deters, dim=1)
-        return stochs, deters
+        return stochs, deters, carry
 
     # ------------------------------------------------------------------
     # KV-cache policy inference
@@ -530,7 +571,7 @@ class TransformerRSSM(nn.Module):
         }
 
     def get_feat_step(self, carry, tokens, reset):
-        """Phase 1: posterior from h_prev + tokens. No action needed.
+        """Phase 1: posterior from tokens. No action needed.
 
         Args:
             carry: dict with kv_cache, pos, h_prev.
@@ -541,31 +582,36 @@ class TransformerRSSM(nn.Module):
             stoch: (B, S, K) sampled posterior stochastic state.
             h_prev: (B, D) transformer context from previous step.
         """
-        # Zero carry on reset
-        reset_f = reset.float()
-        h_prev = carry['h_prev'] * (1.0 - reset_f.unsqueeze(-1))
-        kv_cache = carry['kv_cache'] * (1.0 - reset_f.reshape(-1, 1, 1, 1, 1))
-        pos = carry['pos'] * (~reset).int()
-        carry = {'kv_cache': kv_cache, 'pos': pos, 'h_prev': h_prev}
+        carry = self._mask_carry(carry, reset)
 
         # Posterior from tokens only
         post_logit = self._post_head(tokens)  # (B, S, K)
         stoch = self.get_dist(post_logit).rsample()  # (B, S, K)
 
-        return carry, stoch, h_prev
+        return carry, stoch, carry['h_prev']
 
-    def update_carry(self, carry, tokens, action, reset):
-        """Phase 2: KV-cache Transformer step with (tokens, action) -> h_t.
+    def _mask_carry(self, carry, reset):
+        """Zero carry state on episode reset."""
+        reset_f = reset.float()
+        h_prev = carry['h_prev'] * (1.0 - reset_f.unsqueeze(-1))
+        kv_cache = carry['kv_cache'] * (1.0 - reset_f.reshape(-1, 1, 1, 1, 1))
+        pos = carry['pos'] * (~reset).int()
+        return {'kv_cache': kv_cache, 'pos': pos, 'h_prev': h_prev}
+
+    def update_carry(self, carry, stoch, action, reset):
+        """Phase 2: KV-cache Transformer step with (stoch, action) -> h_t.
 
         Args:
-            carry: dict with kv_cache, pos, h_prev (already reset-masked).
-            tokens: (B, E) encoder embeddings.
+            carry: dict with kv_cache, pos, h_prev.
+            stoch: (B, S, K) posterior/imagined stochastic state.
             action: (B, A) action taken at current step.
             reset: (B,) boolean.
         Returns:
             Updated carry dict with new h_prev = h_t.
         """
-        B = tokens.shape[0]
+        carry = self._mask_carry(carry, reset)
+
+        B = stoch.shape[0]
         D = self._deter
         H = self._n_heads
         D_head = self._d_head
@@ -575,7 +621,8 @@ class TransformerRSSM(nn.Module):
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
         # Input projection
-        x_t = self._inp_proj(torch.cat([tokens, action_norm], -1))  # (B, D)
+        stoch_flat = stoch.reshape(B, self.flat_stoch)
+        x_t = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
         x_t = x_t.unsqueeze(1)  # (B, 1, D)
 
         kv_cache = carry['kv_cache']  # (B, L, 2, W, D)

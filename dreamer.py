@@ -210,14 +210,14 @@ class Dreamer(nn.Module):
             # Trainer provides (B, 1, *) tensors; squeeze time dim
             embed_sq = embed.squeeze(1)  # (B, E)
             is_first = obs["is_first"].squeeze(1)  # (B,)
-            # Phase 1: posterior from h_prev + tokens
+            # Phase 1: posterior from tokens
             carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
                 carry, embed_sq, is_first)
             feat = self._frozen_rssm.get_feat(stoch, h_prev)
             action_dist = self._frozen_actor(feat)
             action = action_dist.mode if eval else action_dist.rsample()
-            # Phase 2: update KV-cache with (tokens, action)
-            carry = self._frozen_rssm.update_carry(carry, embed_sq, action,
+            # Phase 2: update KV-cache with (stoch, action)
+            carry = self._frozen_rssm.update_carry(carry, stoch, action,
                                                    is_first)
             return action, TensorDict(
                 {
@@ -404,10 +404,9 @@ class Dreamer(nn.Module):
         embed = self.encoder(data)
 
         if self._use_transformer:
-            # Transformer path: current action, full-sequence observe
+            # Transformer path: posterior from tokens, transition on (stoch, a_t)
             action = data["action"]  # (B, T, A) — current action a_t
-            entries, feat_dict = self.rssm.observe(embed, action,
-                                                   data["is_first"])
+            _, feat_dict = self.rssm.observe(embed, action, data["is_first"])
             post_stoch = feat_dict['stoch']  # (B, T, S, K)
             post_deter = feat_dict['deter']  # (B, T, D) = h_prev
             post_logit = feat_dict['post_logit']  # (B, T, S, K)
@@ -416,7 +415,6 @@ class Dreamer(nn.Module):
                                                    self.kl_free)
             losses["dyn"] = (dyn_loss * t_mask).mean()
             losses["rep"] = (rep_loss * t_mask).mean()
-            losses["align"] = (feat_dict['imag_core_loss'] * t_mask).mean()
         else:
             # GRU RSSM path: shifted prev_action, sequential observe
             carry_stoch, carry_deter, carry_prev_action = carry_train
@@ -477,19 +475,16 @@ class Dreamer(nn.Module):
 
         # === Imagination rollout for actor-critic ===
         if self._use_transformer:
-            # Start from K contiguous positions at random offset
+            # Sample one start position and build KV carry from recent history.
             K = min(self.imag_last if self.imag_last > 0 else T, T)
-            s = torch.randint(0, T - K + 1, ()).item() if K < T else 0
-            start = (
-                post_stoch[:, s:s + K].reshape(B * K,
-                                               *post_stoch.shape[2:]).detach(),
-                post_deter[:, s:s + K].reshape(B * K,
-                                               *post_deter.shape[2:]).detach(),
-            )
-            imag_feat, imag_action = self._imagine(start,
-                                                   self.imag_horizon + 1)
+            s0 = torch.randint(0, T - K + 1, ()).item() if K < T else 0
+            s = s0 + torch.randint(0, K, ()).item()
+            start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_start(
+                post_stoch.detach(), action.detach(), data["is_first"], s)
+            imag_feat, imag_action = self._imagine(
+                (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-            imag_mask = t_mask[:, s:s + K].reshape(B * K, 1, 1)
+            imag_mask = t_mask[:, s:s + 1].reshape(B, 1, 1)
         else:
             # (B*T, S, K), (B*T, D)
             start = (
@@ -501,7 +496,7 @@ class Dreamer(nn.Module):
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
             imag_mask = t_mask.reshape(B * T, 1, 1)
 
-        # (N, T_imag, 1) where N = B*K (transformer) or B*T (rssm)
+        # (N, T_imag, 1) where N = B (transformer) or B*T (rssm)
         imag_reward = self._frozen_reward(imag_feat).mode()
         imag_cont = self._frozen_cont(imag_feat).mean
         imag_value = self._frozen_value(imag_feat).mode()
@@ -585,8 +580,10 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), metrics
 
     @torch.no_grad()
-    def _imagine(self, start, imag_horizon):
+    def _imagine(self, start, imag_horizon, imag_carry=None):
         """Roll out the policy in latent space."""
+        if self._use_transformer:
+            assert imag_carry is not None
         # (B, S, K), (B, D)
         feats = []
         actions = []
@@ -599,7 +596,11 @@ class Dreamer(nn.Module):
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
-            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
+            if self._use_transformer:
+                stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(
+                    stoch, imag_carry, action)
+            else:
+                stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
 
         # Stack along sequence dim T_imag.
         # (B, T_imag, F), (B, T_imag, A)
