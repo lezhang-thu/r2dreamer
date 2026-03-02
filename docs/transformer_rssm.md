@@ -106,6 +106,8 @@ transformer:
   discrete: ${model.discrete}
   unimix_ratio: ${model.rssm.unimix_ratio}
   act: ${model.act}
+  rope_base: 1000000.0
+  rope_max_seq_len: 32768
   head_hidden: ${model.hidden}
   post_layers: 1
   prior_layers: 2
@@ -126,5 +128,7 @@ python3 train.py model.dyn_type=transformer model.compile=False batch_length=500
 - Full-sequence training still uses parallel causal attention.
 - In imagination/inference, dynamics are rolled with a bounded KV window to
   control memory.
+- RoPE uses a modern cached implementation with dynamic cache growth if
+  positions exceed `rope_max_seq_len`.
 - `post_head` and `prior_head` are now multi-layer MLP heads (Linear + RMSNorm
   + activation blocks), not single linear projections.

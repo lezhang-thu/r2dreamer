@@ -57,6 +57,8 @@ transformer:
   discrete: ${model.discrete}
   unimix_ratio: ${model.rssm.unimix_ratio}
   act: ${model.act}
+  rope_base: 1000000.0
+  rope_max_seq_len: 32768
   head_hidden: ${model.hidden}
   post_layers: 1
   prior_layers: 2

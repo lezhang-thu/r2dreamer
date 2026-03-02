@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 
 import distributions as dists
+from _positional_embeddings import Qwen2RotaryPositionalEmbeddings
 from networks import BlockLinear, LambdaLayer
 from tools import rpad, weight_init_
 
@@ -269,32 +270,6 @@ class RSSM(nn.Module):
         return dyn_loss, rep_loss
 
 
-def apply_rope(x, positions):
-    """Apply rotary position embedding.
-
-    Args:
-        x: (B, H, T, D_head) tensor to rotate.
-        positions: (T,) or (B, T) integer position indices.
-    Returns:
-        Rotated tensor, same shape as x.
-    """
-    D_head = x.shape[-1]
-    half = D_head // 2
-    freqs = 1.0 / (10000.0**(
-        torch.arange(half, device=x.device, dtype=torch.float32) / half))
-    if positions.dim() == 1:
-        # (T,) -> (1, 1, T, half) for broadcasting with (B, H, T, D_head)
-        angles = (positions.unsqueeze(-1).float() *
-                  freqs).unsqueeze(0).unsqueeze(0)
-    else:
-        # (B, T) -> (B, 1, T, half) for broadcasting with (B, H, T, D_head)
-        angles = (positions.unsqueeze(-1).float() * freqs).unsqueeze(1)
-    cos_a = torch.cos(angles)
-    sin_a = torch.sin(angles)
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat([x1 * cos_a - x2 * sin_a, x2 * cos_a + x1 * sin_a], dim=-1)
-
-
 class TransformerRSSM(nn.Module):
 
     def __init__(self, config, embed_size, act_dim):
@@ -318,6 +293,17 @@ class TransformerRSSM(nn.Module):
         H = self._n_heads
         assert D % H == 0, f"deter ({D}) must be divisible by n_heads ({H})"
         self._d_head = D // H
+        assert self._d_head % 2 == 0, (
+            f"d_head ({self._d_head}) must be even for RoPE")
+
+        self._rope_base = float(getattr(config, 'rope_base', 1_000_000.0))
+        self._rope_max_seq_len = int(
+            getattr(config, 'rope_max_seq_len', max(self._window_size, 4096)))
+        self._rope = Qwen2RotaryPositionalEmbeddings(
+            dim=self._d_head,
+            max_seq_len=self._rope_max_seq_len,
+            base=self._rope_base,
+        )
 
         # Activation for FFN sublayers
         self._act_fn = act_fn()
@@ -411,8 +397,6 @@ class TransformerRSSM(nn.Module):
             feat: dict with deter, stoch, post_logit, prior_logit, and
                 trajectory KV tensors for imagination starts.
         """
-        _ = tokens.shape[:2]
-
         # Normalize action magnitude
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
@@ -451,6 +435,18 @@ class TransformerRSSM(nn.Module):
         }
         return entries, feat
 
+    def _apply_rope(self, x, positions=None):
+        """Apply RoPE to (B, H, T, D_head) tensor."""
+        # Qwen2 RoPE expects (B, T, H, D_head).
+        x_t = x.transpose(1, 2)
+        if positions is None:
+            x_t = self._rope(x_t, input_pos=None)
+        else:
+            if positions.dim() == 1:
+                positions = positions.unsqueeze(0).expand(x.shape[0], -1)
+            x_t = self._rope(x_t, input_pos=positions.to(torch.long))
+        return x_t.transpose(1, 2)
+
     def _compute_pos_before(self, reset):
         """Count processed steps before each timestep under reset semantics."""
         B, T = reset.shape
@@ -473,7 +469,6 @@ class TransformerRSSM(nn.Module):
         B, T, D = x.shape
         H = self._n_heads
         D_head = self._d_head
-        positions = torch.arange(T, device=x.device)  # (T,)
         if return_kv:
             k_layers = []
             v_layers = []
@@ -486,8 +481,8 @@ class TransformerRSSM(nn.Module):
                 1, 2)  # (B, H, T, D_head)
             K = self._k_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
             V = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            Q = apply_rope(Q, positions)
-            K = apply_rope(K, positions)
+            Q = self._apply_rope(Q, positions=None)
+            K = self._apply_rope(K, positions=None)
             if return_kv:
                 # Match cache storage layout used by update_carry.
                 k_layers.append(K.transpose(1, 2).reshape(B, T, D))
@@ -717,8 +712,8 @@ class TransformerRSSM(nn.Module):
                                                   D_head).transpose(1, 2)
 
             # Apply RoPE at current position
-            Q = apply_rope(Q, ts)
-            K_new = apply_rope(K_new, ts)
+            Q = self._apply_rope(Q, ts)
+            K_new = self._apply_rope(K_new, ts)
 
             # Flatten K_new, V_new to (B, 1, D) for cache storage
             k_new_flat = K_new.transpose(1, 2).reshape(B, 1, D)
