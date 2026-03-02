@@ -409,7 +409,8 @@ class TransformerRSSM(nn.Module):
             reset: (B, T) boolean, True at episode start.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
-            feat: dict with deter, stoch, post_logit, prior_logit.
+            feat: dict with deter, stoch, post_logit, prior_logit, and
+                trajectory KV tensors for imagination starts.
         """
         _ = tokens.shape[:2]
 
@@ -425,7 +426,7 @@ class TransformerRSSM(nn.Module):
         x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
 
         # Causal Transformer forward
-        h = self._fwd(x)  # (B, T, D)
+        h, kv = self._fwd(x, return_kv=True)  # (B, T, D)
 
         # Shift right: h_prev[t] = h[t-1], h_prev[0] = 0
         h_prev = torch.cat([torch.zeros_like(h[:, :1]), h[:, :-1]], dim=1)
@@ -436,6 +437,7 @@ class TransformerRSSM(nn.Module):
 
         # Prior: conditioned on h_prev only
         prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
+        pos_before = self._compute_pos_before(reset)  # (B, T) int32
 
         entries = {'deter': h_prev, 'stoch': stoch}
         feat = {
@@ -443,10 +445,25 @@ class TransformerRSSM(nn.Module):
             'stoch': stoch,
             'post_logit': post_logit,
             'prior_logit': prior_logit,
+            # Detached to avoid expanding the autograd graph.
+            'kv_k': kv['k'].detach(),  # (B, L, T, D)
+            'kv_v': kv['v'].detach(),  # (B, L, T, D)
+            'pos_before': pos_before,  # (B, T) int32
         }
         return entries, feat
 
-    def _fwd(self, x):
+    def _compute_pos_before(self, reset):
+        """Count processed steps before each timestep under reset semantics."""
+        B, T = reset.shape
+        pos = torch.zeros(B, dtype=torch.int32, device=reset.device)
+        out = []
+        for t in range(T):
+            pos = pos * (~reset[:, t]).int()
+            out.append(pos)
+            pos = pos + 1
+        return torch.stack(out, dim=1)  # (B, T) int32
+
+    def _fwd(self, x, return_kv=False):
         """Pre-norm causal Transformer with RoPE.
 
         Args:
@@ -458,6 +475,9 @@ class TransformerRSSM(nn.Module):
         H = self._n_heads
         D_head = self._d_head
         positions = torch.arange(T, device=x.device)  # (T,)
+        if return_kv:
+            k_layers = []
+            v_layers = []
 
         for i in range(self._n_layers):
             # Self-attention sublayer (pre-norm)
@@ -469,6 +489,10 @@ class TransformerRSSM(nn.Module):
             V = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
             Q = apply_rope(Q, positions)
             K = apply_rope(K, positions)
+            if return_kv:
+                # Match cache storage layout used by update_carry.
+                k_layers.append(K.transpose(1, 2).reshape(B, T, D))
+                v_layers.append(V.transpose(1, 2).reshape(B, T, D))
             x = F.scaled_dot_product_attention(
                 Q, K, V, is_causal=True)  # (B, H, T, D_head)
             x = x.transpose(1, 2).reshape(B, T, D)
@@ -480,7 +504,13 @@ class TransformerRSSM(nn.Module):
             x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
             x = res + x
 
-        return self._outnorm(x)
+        out = self._outnorm(x)
+        if return_kv:
+            return out, {
+                'k': torch.stack(k_layers, dim=1),  # (B, L, T, D)
+                'v': torch.stack(v_layers, dim=1),  # (B, L, T, D)
+            }
+        return out
 
     # ------------------------------------------------------------------
     # Imagination (KV-cache transition)
@@ -504,25 +534,62 @@ class TransformerRSSM(nn.Module):
         return stoch, deter, carry
 
     @torch.no_grad()
-    def build_imag_start(self, stoch_seq, action_seq, reset, start):
-        """Build imagination start state/carry from recent sequence history.
+    def build_imag_starts(self, stoch_seq, deter_seq, kv_k, kv_v, pos_before,
+                          start, length):
+        """Build B*K imagination starts from trajectory KV tensors.
 
-        Uses at most `window_size` historical steps, matching KV-cache policy
-        inference memory behavior.
+        Args:
+            stoch_seq: (B, T, S, Kcat)
+            deter_seq: (B, T, D) h_prev sequence
+            kv_k: (B, L, T, D) cached keys for the training trajectory
+            kv_v: (B, L, T, D) cached values for the training trajectory
+            pos_before: (B, T) int32 positions before step t
+            start: int start index s0
+            length: int number of contiguous starts K
+        Returns:
+            start_stoch: (B*K, S, Kcat)
+            start_deter: (B*K, D)
+            carry: dict with kv_cache (B*K,L,2,W,D), pos (B*K), h_prev (B*K,D)
         """
-        B = stoch_seq.shape[0]
+        B, T = stoch_seq.shape[:2]
+        W = self._window_size
         start = int(start)
-        hist_start = max(0, start - self._window_size)
-        carry = self.initial(B)
-        if hist_start > 0:
-            carry['pos'] = torch.full((B, ),
-                                      hist_start,
-                                      dtype=torch.int32,
-                                      device=stoch_seq.device)
-        for t in range(hist_start, start):
-            carry = self.update_carry(carry, stoch_seq[:, t], action_seq[:, t],
-                                      reset[:, t])
-        return stoch_seq[:, start], carry['h_prev'], carry
+        length = int(length)
+        assert 0 <= start < T
+        assert length >= 1 and start + length <= T
+
+        j = torch.arange(W, device=stoch_seq.device)
+        stoch_list, deter_list, cache_list, pos_list = [], [], [], []
+
+        for s in range(start, start + length):
+            # Number of valid history entries before step s, clipped by window.
+            n_valid = torch.clamp(pos_before[:, s].to(torch.long),
+                                  max=W)  # (B,)
+
+            # Right-aligned window indices ending at s-1.
+            src_idx = torch.clamp(j + (s - W), min=0, max=T - 1)  # (W,)
+            k_slice = kv_k[:, :, src_idx, :]  # (B, L, W, D)
+            v_slice = kv_v[:, :, src_idx, :]  # (B, L, W, D)
+
+            valid = (j.unsqueeze(0) >= (W - n_valid).unsqueeze(1))
+            valid = valid.unsqueeze(1).unsqueeze(-1)  # (B, 1, W, 1)
+            k_cache = k_slice * valid
+            v_cache = v_slice * valid
+            kv_cache = torch.stack([k_cache, v_cache], dim=2)  # (B,L,2,W,D)
+
+            stoch_list.append(stoch_seq[:, s])
+            deter_list.append(deter_seq[:, s])
+            cache_list.append(kv_cache)
+            pos_list.append(pos_before[:, s])
+
+        start_stoch = torch.cat(stoch_list, dim=0)  # (B*K, S, Kcat)
+        start_deter = torch.cat(deter_list, dim=0)  # (B*K, D)
+        carry = {
+            'kv_cache': torch.cat(cache_list, dim=0),  # (B*K,L,2,W,D)
+            'pos': torch.cat(pos_list, dim=0).to(torch.int32),  # (B*K,)
+            'h_prev': start_deter,
+        }
+        return start_stoch, start_deter, carry
 
     def imagine_with_action(self, stoch, deter, actions, carry=None):
         """Roll out prior dynamics given a sequence of actions.

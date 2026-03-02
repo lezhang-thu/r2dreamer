@@ -52,6 +52,8 @@ Training (observe path):
 3. Run causal transformer (`_fwd`) over the full sequence.
 4. Shift-right to get `h_prev`.
 5. `prior_logit = _prior_head(h_prev)`.
+6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) and `pos_before`
+   for efficient imagination-start construction without replaying history.
 
 Posterior is conditioned on `tokens` only. It does **not** take `h_prev`.
 
@@ -65,6 +67,9 @@ Given current latent `(stoch_t, h_prev_t)` and action `a_t`:
 3. `prior_head(h_t)` predicts `stoch_{t+1}`.
 
 Carry keeps only `window_size` past steps, matching inference memory behavior.
+During training, starts are built from `observe()`-returned trajectory KV tensors
+for contiguous `K` offsets (`B*K` parallel starts), so no extra history replay is
+needed in `_cal_grad`.
 
 ### 3. Policy inference: two-phase KV-cache
 

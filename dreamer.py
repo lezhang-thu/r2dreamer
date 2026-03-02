@@ -478,13 +478,19 @@ class Dreamer(nn.Module):
             # Sample one start position and build KV carry from recent history.
             K = min(self.imag_last if self.imag_last > 0 else T, T)
             s0 = torch.randint(0, T - K + 1, ()).item() if K < T else 0
-            s = s0 + torch.randint(0, K, ()).item()
-            start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_start(
-                post_stoch.detach(), action.detach(), data["is_first"], s)
+            start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
+                post_stoch.detach(),
+                post_deter.detach(),
+                feat_dict["kv_k"],
+                feat_dict["kv_v"],
+                feat_dict["pos_before"],
+                s0,
+                K,
+            )
             imag_feat, imag_action = self._imagine(
                 (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-            imag_mask = t_mask[:, s:s + 1].reshape(B, 1, 1)
+            imag_mask = t_mask[:, s0:s0 + K].reshape(B * K, 1, 1)
         else:
             # (B*T, S, K), (B*T, D)
             start = (
@@ -496,7 +502,7 @@ class Dreamer(nn.Module):
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
             imag_mask = t_mask.reshape(B * T, 1, 1)
 
-        # (N, T_imag, 1) where N = B (transformer) or B*T (rssm)
+        # (N, T_imag, 1) where N = B*K (transformer) or B*T (rssm)
         imag_reward = self._frozen_reward(imag_feat).mode()
         imag_cont = self._frozen_cont(imag_feat).mean
         imag_value = self._frozen_value(imag_feat).mode()
