@@ -35,11 +35,11 @@ class MetaWorld(gym.Env):
     def observation_space(self):
         spaces = {
             "image":
-            gym.spaces.Box(0, 255, self._size + (3, ), dtype=np.uint8),
+                gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8),
             "state":
-            self._env.observation_space,
+                self._env.observation_space,
             "log_success":
-            gym.spaces.Box(-np.inf, np.inf, (1, ), dtype=np.float32),
+                gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
         }
         return gym.spaces.Dict(spaces)
 

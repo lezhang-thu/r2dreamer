@@ -52,7 +52,7 @@ class Dreamer(nn.Module):
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
-        config.actor.shape = (act_space.n, ) if hasattr(
+        config.actor.shape = (act_space.n,) if hasattr(
             act_space, "n") else tuple(map(int, act_space.shape))
         self.act_discrete = False
         if hasattr(act_space, "multi_discrete"):
@@ -266,7 +266,7 @@ class Dreamer(nn.Module):
                     "h_prev": carry['h_prev'],
                     "prev_action": action,
                 },
-                batch_size=(B, ))
+                batch_size=(B,))
         else:
             stoch, deter = self.rssm.initial(B)
             action = torch.zeros(B,
@@ -279,7 +279,7 @@ class Dreamer(nn.Module):
                     "deter": deter,
                     "prev_action": action
                 },
-                batch_size=(B, ))
+                batch_size=(B,))
 
     @torch.no_grad()
     def get_initial_carry(self, B):
@@ -338,7 +338,8 @@ class Dreamer(nn.Module):
                 p.data.clone().detach() for p in self._named_params.values()
             ]
             grads = [
-                p.grad for p in self._named_params.values()
+                p.grad
+                for p in self._named_params.values()
                 if p.grad is not None
             ]  # log grads before clipping
             grad_norm = tools.compute_global_norm(grads)
@@ -420,8 +421,7 @@ class Dreamer(nn.Module):
             carry_stoch, carry_deter, carry_prev_action = carry_train
             initial = (carry_stoch, carry_deter)
             action = torch.cat(
-                [carry_prev_action.unsqueeze(1), data["action"][:, :-1]],
-                dim=1)
+                [carry_prev_action.unsqueeze(1), data["action"][:, :-1]], dim=1)
             post_stoch, post_deter, post_logit = self.rssm.observe(
                 embed, action, initial, data["is_first"])
             _, prior_logit = self.rssm.prior(post_deter)
@@ -497,8 +497,7 @@ class Dreamer(nn.Module):
                 post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
                 post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
             )
-            imag_feat, imag_action = self._imagine(start,
-                                                   self.imag_horizon + 1)
+            imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
             imag_mask = t_mask.reshape(B * T, 1, 1)
 
@@ -566,10 +565,9 @@ class Dreamer(nn.Module):
 
             # Keep this attached to the world model so gradients can flow through
             value_dist = self.value(feat)
-            repval_loss = (weight[:, :-1] *
-                           (-value_dist.log_prob(ret_padded.detach()) -
-                            value_dist.log_prob(
-                                slow_value.detach()))[:, :-1].unsqueeze(-1))
+            repval_loss = (weight[:, :-1] * (
+                -value_dist.log_prob(ret_padded.detach()) -
+                value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1))
             # Mask repval by t_mask[:, :-1] (repval has shape (B, T-1, 1))
             repval_mask = t_mask[:, :-1].unsqueeze(-1)  # (B, T-1, 1)
             losses["repval"] = (repval_loss * repval_mask).mean()

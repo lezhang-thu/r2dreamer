@@ -109,7 +109,7 @@ class LaProp(Optimizer):
 
                 bias_correction1 = (state["exp_avg_lr_1"] /
                                     group["lr"] if group["lr"] != 0.0 else 1.0
-                                    )  # 1 - beta1 ** state['step']
+                                   )  # 1 - beta1 ** state['step']
                 step_size = 1 / bias_correction1
 
                 bias_correction2 = state["exp_avg_lr_2"]

@@ -36,8 +36,8 @@ def clip_grad_agc_(parameters: _tensor_or_tensors,
                             [params, grads])  # type: ignore[assignment]
 
     for (device, _), ([device_params, device_grads], _) in grouped.items():
-        if (foreach is None and _has_foreach_support(device_grads, device)
-            ) or (foreach and _device_has_foreach_support(device)):
+        if (foreach is None and _has_foreach_support(device_grads, device)) or (
+                foreach and _device_has_foreach_support(device)):
             pnorm = torch._foreach_norm(device_params, ord=2)
             gnorm = torch._foreach_norm(device_grads, ord=2)
             upper = torch._foreach_mul(torch._foreach_maximum(pnorm, pmin),

@@ -139,7 +139,7 @@ class MultiEncoder(nn.Module):
         self.encoders = []
         if self.cnn_shapes:
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
-            input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch, )
+            input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
             self.encoders.append(ConvEncoder(config.cnn, input_shape))
             self.selectors.append(
                 lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
@@ -193,7 +193,7 @@ class MultiDecoder(nn.Module):
         if self.cnn_shapes:
             some_shape = list(self.cnn_shapes.values())[0]
             shape = (sum(
-                x[-1] for x in self.cnn_shapes.values()), ) + some_shape[:-1]
+                x[-1] for x in self.cnn_shapes.values()),) + some_shape[:-1]
             self._cnn = ConvDecoder(
                 config.cnn,
                 deter,
@@ -203,7 +203,7 @@ class MultiDecoder(nn.Module):
             self._image_dist = partial(
                 getattr(dists, str(config.cnn_dist.name)), **config.cnn_dist)
         if self.mlp_shapes:
-            shape = (sum(sum(x) for x in self.mlp_shapes.values()), )
+            shape = (sum(sum(x) for x in self.mlp_shapes.values()),)
             config.mlp.shape = shape
             self._mlp = MLPHead(config.mlp, deter + flat_stoch)
             self._mlp_dist = partial(getattr(dists, str(config.mlp_dist.name)),
@@ -339,8 +339,8 @@ class ConvDecoder(nn.Module):
         # (B, T, S, K), (B, T, D)
         B_T = deter.shape[:-1]
         # (B*T, D), (B*T, S*K)
-        x0, x1 = deter.reshape(B_T.numel(), deter.shape[-1]), stoch.reshape(
-            B_T.numel(), -1)
+        x0, x1 = deter.reshape(B_T.numel(),
+                               deter.shape[-1]), stoch.reshape(B_T.numel(), -1)
 
         # Spatial features from deterministic state
         # (H_feat, W_feat, C_feat)
@@ -476,8 +476,7 @@ class ReturnEMA(nn.Module):
         self.alpha = alpha
         self.range = torch.tensor([0.05, 0.95], device=device)
         self.register_buffer(
-            "ema_vals", torch.zeros(2, dtype=torch.float32,
-                                    device=self.device))
+            "ema_vals", torch.zeros(2, dtype=torch.float32, device=self.device))
 
     def __call__(self, x):
         x_quantile = torch.quantile(torch.flatten(x.detach()), self.range)

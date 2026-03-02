@@ -65,14 +65,12 @@ class ParallelEnv:
                 new_r.append(r)
                 new_d.append(d)
         obs_stacked = {
-            k: np.stack([o[k] for o in new_o])
-            for k in new_o[0].keys()
+            k: np.stack([o[k] for o in new_o]) for k in new_o[0].keys()
         }
 
         # Build CPU tensors first to avoid implicit GPU syncs and enable async H2D in caller.
         obs_tensors = {
-            k: torch.as_tensor(v, device="cpu")
-            for k, v in obs_stacked.items()
+            k: torch.as_tensor(v, device="cpu") for k, v in obs_stacked.items()
         }
         rew_stacked = torch.as_tensor(new_r, dtype=torch.float32, device="cpu")
 
@@ -81,7 +79,7 @@ class ParallelEnv:
         td = TensorDict({
             **obs_tensors, "reward": rew_stacked
         },
-                        batch_size=(self.env_num, ),
+                        batch_size=(self.env_num,),
                         device="cpu").pin_memory()
         done = torch.as_tensor(new_d, device="cpu")
         return self.lift_dim(td), done

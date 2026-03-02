@@ -292,8 +292,7 @@ def apply_rope(x, positions):
     cos_a = torch.cos(angles)
     sin_a = torch.sin(angles)
     x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat([x1 * cos_a - x2 * sin_a, x2 * cos_a + x1 * sin_a],
-                     dim=-1)
+    return torch.cat([x1 * cos_a - x2 * sin_a, x2 * cos_a + x1 * sin_a], dim=-1)
 
 
 class TransformerRSSM(nn.Module):
@@ -343,8 +342,8 @@ class TransformerRSSM(nn.Module):
             self._k_projs.append(nn.Linear(D, D, bias=False))
             self._v_projs.append(nn.Linear(D, D, bias=False))
             self._o_projs.append(nn.Linear(D, D, bias=False))
-            self._ffn_norms.append(
-                nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
+            self._ffn_norms.append(nn.RMSNorm(D, eps=1e-04,
+                                              dtype=torch.float32))
             self._ff1s.append(nn.Linear(D, self._d_ff))
             self._ff2s.append(nn.Linear(self._d_ff, D))
 
@@ -621,20 +620,20 @@ class TransformerRSSM(nn.Module):
         W = self._window_size
         return {
             'kv_cache':
-            torch.zeros(batch_size,
-                        self._n_layers,
-                        2,
-                        W,
-                        D,
-                        dtype=torch.float32,
-                        device=self._device),
+                torch.zeros(batch_size,
+                            self._n_layers,
+                            2,
+                            W,
+                            D,
+                            dtype=torch.float32,
+                            device=self._device),
             'pos':
-            torch.zeros(batch_size, dtype=torch.int32, device=self._device),
+                torch.zeros(batch_size, dtype=torch.int32, device=self._device),
             'h_prev':
-            torch.zeros(batch_size,
-                        D,
-                        dtype=torch.float32,
-                        device=self._device),
+                torch.zeros(batch_size,
+                            D,
+                            dtype=torch.float32,
+                            device=self._device),
         }
 
     def get_feat_step(self, carry, tokens, reset):

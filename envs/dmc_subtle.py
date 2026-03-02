@@ -37,8 +37,7 @@ def reacher_subtle(time_limit=reacher._DEFAULT_TIME_LIMIT,
     """Returns reacher with a custom target size."""
     _DEFAULT_SIZE = reacher._SMALL_TARGET
     physics = reacher.Physics.from_xml_string(*reacher.get_model_and_assets())
-    task = reacher.Reacher(target_size=_DEFAULT_SIZE *
-                           SCALES["reacher_subtle"],
+    task = reacher.Reacher(target_size=_DEFAULT_SIZE * SCALES["reacher_subtle"],
                            random=random)
     environment_kwargs = environment_kwargs or {}
     return control.Environment(physics,

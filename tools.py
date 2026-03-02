@@ -213,8 +213,7 @@ class Logger:
         except ImportError:
             # Fallback to string representation
             yaml_str = str(config)
-        self._writer.add_text(f"{name}/yaml", f"```yaml\n{yaml_str}\n```",
-                              step)
+        self._writer.add_text(f"{name}/yaml", f"```yaml\n{yaml_str}\n```", step)
 
         # 2) Log flattened hparams to HParams plugin
         flat = {}
@@ -332,7 +331,8 @@ def recursively_collect_optim_state_dict(obj,
     if isinstance(obj, torch.nn.Module):
         attrs.update({
             k: attr
-            for k, attr in obj.named_modules() if "." not in k and obj != attr
+            for k, attr in obj.named_modules()
+            if "." not in k and obj != attr
         })
     for name, attr in attrs.items():
         new_path = path + "." + name if path else name
@@ -371,8 +371,8 @@ def build_module_tree(module: nn.Module, module_name: str = "") -> dict:
         children_info[cname] = build_module_tree(child, cname)
 
     # 3) Calculate total parameter count for this module (including all children)
-    total = direct_param_count + sum(child["total"]
-                                     for child in children_info.values())
+    total = direct_param_count + sum(
+        child["total"] for child in children_info.values())
 
     return {
         "name": module_name,

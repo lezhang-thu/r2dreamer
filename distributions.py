@@ -33,10 +33,7 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
 
     def rsample(self, sample_shape=(), temperature=1.0):
         # (..., K)
-        return F.gumbel_softmax(self.logits,
-                                tau=temperature,
-                                hard=True,
-                                dim=-1)
+        return F.gumbel_softmax(self.logits, tau=temperature, hard=True, dim=-1)
 
     def sample(self, **kwargs):
         raise NotImplementedError
@@ -65,9 +62,7 @@ class MultiOneHotDist:
 
     def log_prob(self, value):
         splits = torch.split(value, self.shape, dim=-1)
-        _log_probs = [
-            dist.log_prob(s) for dist, s in zip(self.onehots, splits)
-        ]
+        _log_probs = [dist.log_prob(s) for dist, s in zip(self.onehots, splits)]
         return sum(_log_probs)
 
     def entropy(self):
@@ -100,15 +95,15 @@ class TwoHot:
             b2 = self.bins[..., m:m + 1]
             b3 = self.bins[..., m + 1:]
             wavg = (p2 * b2).sum(dim=-1, keepdim=True) + (
-                (p1 * b1).flip(dims=(-1, )) +
+                (p1 * b1).flip(dims=(-1,)) +
                 (p3 * b3)).sum(dim=-1, keepdim=True)
             return self.unsquash(wavg)
         p1 = self.probs[..., :n // 2]
         p2 = self.probs[..., n // 2:]
         b1 = self.bins[..., :n // 2]
         b2 = self.bins[..., n // 2:]
-        wavg = ((p1 * b1).flip(dims=(-1, )) + (p2 * b2)).sum(dim=-1,
-                                                             keepdim=True)
+        wavg = ((p1 * b1).flip(dims=(-1,)) + (p2 * b2)).sum(dim=-1,
+                                                            keepdim=True)
         return self.unsquash(wavg)
 
     def log_prob(self, target):
@@ -268,7 +263,7 @@ def symexp_twohot(logits, bin_num, **kwargs):
                               dtype=torch.float32,
                               device=logits.device)
         half = symexp(half)
-        bins = torch.concatenate([half, -half[:-1].flip(dims=(0, ))], 0)
+        bins = torch.concatenate([half, -half[:-1].flip(dims=(0,))], 0)
     else:
         half = torch.linspace(-20,
                               0,
@@ -276,7 +271,7 @@ def symexp_twohot(logits, bin_num, **kwargs):
                               dtype=torch.float32,
                               device=logits.device)
         half = symexp(half)
-        bins = torch.concatenate([half, -half.flip(dims=(0, ))], 0)
+        bins = torch.concatenate([half, -half.flip(dims=(0,))], 0)
     return TwoHot(to_f32(logits), bins)
 
 

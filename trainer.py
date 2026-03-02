@@ -90,8 +90,8 @@ class OnlineTrainer:
                            steps.to(torch.float32).mean())
         for key, value in log_metrics.items():
             if key == "log_success":
-                value = torch.clip(
-                    value, max=1.0)  # make sure 1.0 for success episode
+                value = torch.clip(value,
+                                   max=1.0)  # make sure 1.0 for success episode
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
@@ -145,9 +145,8 @@ class OnlineTrainer:
                         self.logger.write(
                             step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
-            step += int(
-                (~done
-                 ).sum()) * self._action_repeat  # step is based on env side
+            step += int((
+                ~done).sum()) * self._action_repeat  # step is based on env side
             lengths += ~done
 
             # Step environments on CPU to avoid GPU<->CPU sync in the worker processes.
@@ -166,9 +165,7 @@ class OnlineTrainer:
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.
             # (B, A)
-            act, agent_state = agent.act(trans.clone(),
-                                         agent_state,
-                                         eval=False)
+            act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
 
             # Store transition into ReplayY.
             # We pair each observation s_t with the action a_t = π(s_t) taken in response.
@@ -182,8 +179,8 @@ class OnlineTrainer:
             _SCALAR_KEYS = {"reward", "is_first", "is_last", "is_terminal"}
             trans_np = {
                 k:
-                tools.to_np(v.squeeze(1))
-                if k in _SCALAR_KEYS else tools.to_np(v)
+                    tools.to_np(v.squeeze(1))
+                    if k in _SCALAR_KEYS else tools.to_np(v)
                 for k, v in trans.items()
             }
             for i in range(envs.env_num):

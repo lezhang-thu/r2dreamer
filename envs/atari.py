@@ -114,16 +114,12 @@ class Atari(gym.Env):
 
     @property
     def observation_space(self):
-        img_shape = self._size + ((1, ) if self._gray else (3, ))
+        img_shape = self._size + ((1,) if self._gray else (3,))
         return gym.spaces.Dict({
-            "image":
-            gym.spaces.Box(0, 255, img_shape, np.uint8),
-            "is_first":
-            gym.spaces.Box(0, 1, (), bool),
-            "is_last":
-            gym.spaces.Box(0, 1, (), bool),
-            "is_terminal":
-            gym.spaces.Box(0, 1, (), bool),
+            "image": gym.spaces.Box(0, 255, img_shape, np.uint8),
+            "is_first": gym.spaces.Box(0, 1, (), bool),
+            "is_last": gym.spaces.Box(0, 1, (), bool),
+            "is_terminal": gym.spaces.Box(0, 1, (), bool),
         })
 
     @property
@@ -152,8 +148,8 @@ class Atari(gym.Env):
                 break
             self._last_lives = current_lives
 
-        self._done = self.ale.game_over() or (self._length
-                                              and self._step >= self._length)
+        self._done = self.ale.game_over() or (self._length and
+                                              self._step >= self._length)
 
         return self._obs(
             total_reward,

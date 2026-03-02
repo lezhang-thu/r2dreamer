@@ -12,9 +12,7 @@ class Crafter(gym.Env):
         assert task in ("reward", "noreward")
         import crafter
 
-        self._env = crafter.Env(size=size,
-                                reward=(task == "reward"),
-                                seed=seed)
+        self._env = crafter.Env(size=size, reward=(task == "reward"), seed=seed)
         self._achievements = crafter.constants.achievements.copy()
         self.reward_range = [-np.inf, np.inf]
 
@@ -22,14 +20,13 @@ class Crafter(gym.Env):
     def observation_space(self):
         spaces = {
             "image":
-            gym.spaces.Box(0,
-                           255,
-                           self._env.observation_space.shape,
-                           dtype=np.uint8),
+                gym.spaces.Box(0,
+                               255,
+                               self._env.observation_space.shape,
+                               dtype=np.uint8),
         }
         spaces.update({
-            f"log_{k}":
-            gym.spaces.Box(-np.inf, np.inf, (1, ), dtype=np.float32)
+            f"log_{k}": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32)
             for k in self._achievements
         })
         return gym.spaces.Dict(spaces)

@@ -54,7 +54,7 @@ class OneHotAction(gym.Wrapper):
         assert isinstance(env.action_space, gym.spaces.Discrete)
         super().__init__(env)
         self._random = np.random.RandomState()
-        shape = (self.env.action_space.n, )
+        shape = (self.env.action_space.n,)
         space = gym.spaces.Box(low=0, high=1, shape=shape, dtype=np.float32)
         space.discrete = True
         self.action_space = space
@@ -100,9 +100,7 @@ class MultiOneHotAction(gym.Wrapper):
         now = 0
         indexes = []
         for dim in self.action_space.shape:
-            index = torch.argmax(action[:, now:now + dim],
-                                 dim=-1,
-                                 keepdim=True)
+            index = torch.argmax(action[:, now:now + dim], dim=-1, keepdim=True)
             indexes.append(index)
             now += dim
         return torch.cat(indexes, dim=-1) + self.index_low
@@ -116,7 +114,7 @@ class RewardObs(gym.Wrapper):
         if "obs_reward" not in spaces:
             spaces["obs_reward"] = gym.spaces.Box(-np.inf,
                                                   np.inf,
-                                                  shape=(1, ),
+                                                  shape=(1,),
                                                   dtype=np.float32)
         self.observation_space = gym.spaces.Dict(spaces)
 
