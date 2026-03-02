@@ -280,20 +280,20 @@ def apply_rope(x, positions):
     """
     D_head = x.shape[-1]
     half = D_head // 2
-    freqs = 1.0 / (10000.0 ** (
+    freqs = 1.0 / (10000.0**(
         torch.arange(half, device=x.device, dtype=torch.float32) / half))
     if positions.dim() == 1:
         # (T,) -> (1, 1, T, half) for broadcasting with (B, H, T, D_head)
-        angles = (positions.unsqueeze(-1).float() * freqs
-                  ).unsqueeze(0).unsqueeze(0)
+        angles = (positions.unsqueeze(-1).float() *
+                  freqs).unsqueeze(0).unsqueeze(0)
     else:
         # (B, T) -> (B, 1, T, half) for broadcasting with (B, H, T, D_head)
         angles = (positions.unsqueeze(-1).float() * freqs).unsqueeze(1)
     cos_a = torch.cos(angles)
     sin_a = torch.sin(angles)
     x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat(
-        [x1 * cos_a - x2 * sin_a, x2 * cos_a + x1 * sin_a], dim=-1)
+    return torch.cat([x1 * cos_a - x2 * sin_a, x2 * cos_a + x1 * sin_a],
+                     dim=-1)
 
 
 class TransformerRSSM(nn.Module):
@@ -338,30 +338,32 @@ class TransformerRSSM(nn.Module):
         self._ff2s = nn.ModuleList()
 
         for _ in range(self._n_layers):
-            self._attn_norms.append(nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
+            self._attn_norms.append(
+                nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
             self._q_projs.append(nn.Linear(D, D, bias=False))
             self._k_projs.append(nn.Linear(D, D, bias=False))
             self._v_projs.append(nn.Linear(D, D, bias=False))
             self._o_projs.append(nn.Linear(D, D, bias=False))
-            self._ffn_norms.append(nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
+            self._ffn_norms.append(
+                nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
             self._ff1s.append(nn.Linear(D, self._d_ff))
             self._ff2s.append(nn.Linear(self._d_ff, D))
 
         # Output norm
         self._outnorm = nn.RMSNorm(D, eps=1e-04, dtype=torch.float32)
 
-        # Posterior head: cat(h_prev, tokens) -> (S, K)
+        # Posterior head: tokens -> (S, K)
         self._post_head = nn.Sequential(
-            nn.Linear(D + embed_size, self._stoch * self._discrete),
-            LambdaLayer(lambda x: x.reshape(
-                *x.shape[:-1], self._stoch, self._discrete)),
+            nn.Linear(embed_size, self._stoch * self._discrete),
+            LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
+                                            _discrete)),
         )
 
         # Prior head: deter -> (S, K)
         self._prior_head = nn.Sequential(
             nn.Linear(D, self._stoch * self._discrete),
-            LambdaLayer(lambda x: x.reshape(
-                *x.shape[:-1], self._stoch, self._discrete)),
+            LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
+                                            _discrete)),
         )
 
         # Imagination MLP core: cat(deter, flat_stoch, action) -> next_deter
@@ -370,9 +372,10 @@ class TransformerRSSM(nn.Module):
         for i in range(self._imag_layers):
             self._imag_mlp.add_module(f"imag_{i}", nn.Linear(inp_dim, D))
             self._imag_mlp.add_module(
-                f"imag_norm_{i}",
-                nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
-            self._imag_mlp.add_module(f"imag_act_{i}", act_fn())
+                f"imag_norm_{i}", nn.RMSNorm(D, eps=1e-04,
+                                             dtype=torch.float32))
+            if i < self._imag_layers - 1:
+                self._imag_mlp.add_module(f"imag_act_{i}", act_fn())
             inp_dim = D
 
         self.apply(weight_init_)
@@ -396,8 +399,7 @@ class TransformerRSSM(nn.Module):
         B, T = tokens.shape[:2]
 
         # Normalize action magnitude
-        action_norm = action / torch.clip(
-            torch.abs(action), min=1.0).detach()
+        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
         # Input projection: cat(tokens, action) -> d_model
         x = self._inp_proj(torch.cat([tokens, action_norm], -1))  # (B, T, D)
@@ -406,26 +408,23 @@ class TransformerRSSM(nn.Module):
         h = self._fwd(x)  # (B, T, D)
 
         # Shift right: h_prev[t] = h[t-1], h_prev[0] = 0
-        h_prev = torch.cat(
-            [torch.zeros_like(h[:, :1]), h[:, :-1]], dim=1)
+        h_prev = torch.cat([torch.zeros_like(h[:, :1]), h[:, :-1]], dim=1)
 
         # Zero h_prev at episode resets
         reset_mask = reset.unsqueeze(-1).float()  # (B, T, 1)
         h_prev = h_prev * (1.0 - reset_mask)
 
-        # Posterior: conditioned on (h_prev, tokens)
-        post_logit = self._post_head(
-            torch.cat([h_prev, tokens], -1))  # (B, T, S, K)
+        # Posterior: conditioned on tokens only
+        post_logit = self._post_head(tokens)  # (B, T, S, K)
         stoch = self.get_dist(post_logit).rsample()  # (B, T, S, K)
 
         # Prior: conditioned on h_prev only
         prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
 
         # Alignment: train _imag_mlp to predict h from sg(h_prev, stoch, act)
-        deter_pred = self._imag_core(
-            h_prev.detach(), stoch.detach(), action_norm)
-        imag_core_loss = (
-            (h.detach() - deter_pred) ** 2).mean(-1)  # (B, T)
+        deter_pred = self._imag_core(h_prev.detach(), stoch.detach(),
+                                     action_norm)
+        imag_core_loss = ((h.detach() - deter_pred)**2).mean(-1)  # (B, T)
 
         entries = {'deter': h_prev, 'stoch': stoch}
         feat = {
@@ -454,12 +453,10 @@ class TransformerRSSM(nn.Module):
             # Self-attention sublayer (pre-norm)
             res = x
             x = self._attn_norms[i](x)
-            Q = self._q_projs[i](x).reshape(
-                B, T, H, D_head).transpose(1, 2)  # (B, H, T, D_head)
-            K = self._k_projs[i](x).reshape(
-                B, T, H, D_head).transpose(1, 2)
-            V = self._v_projs[i](x).reshape(
-                B, T, H, D_head).transpose(1, 2)
+            Q = self._q_projs[i](x).reshape(B, T, H, D_head).transpose(
+                1, 2)  # (B, H, T, D_head)
+            K = self._k_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
+            V = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
             Q = apply_rope(Q, positions)
             K = apply_rope(K, positions)
             x = F.scaled_dot_product_attention(
@@ -487,8 +484,7 @@ class TransformerRSSM(nn.Module):
 
     def img_step(self, stoch, deter, action):
         """Single prior step using Markovian MLP."""
-        action_norm = action / torch.clip(
-            torch.abs(action), min=1.0).detach()
+        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
         deter = self._imag_core(deter, stoch, action_norm)
         stoch, _ = self.prior(deter)
         return stoch, deter
@@ -516,14 +512,21 @@ class TransformerRSSM(nn.Module):
         D = self._deter
         W = self._window_size
         return {
-            'kv_cache': torch.zeros(
-                batch_size, self._n_layers, 2, W, D,
-                dtype=torch.float32, device=self._device),
-            'pos': torch.zeros(
-                batch_size, dtype=torch.int32, device=self._device),
-            'h_prev': torch.zeros(
-                batch_size, D,
-                dtype=torch.float32, device=self._device),
+            'kv_cache':
+            torch.zeros(batch_size,
+                        self._n_layers,
+                        2,
+                        W,
+                        D,
+                        dtype=torch.float32,
+                        device=self._device),
+            'pos':
+            torch.zeros(batch_size, dtype=torch.int32, device=self._device),
+            'h_prev':
+            torch.zeros(batch_size,
+                        D,
+                        dtype=torch.float32,
+                        device=self._device),
         }
 
     def get_feat_step(self, carry, tokens, reset):
@@ -541,14 +544,12 @@ class TransformerRSSM(nn.Module):
         # Zero carry on reset
         reset_f = reset.float()
         h_prev = carry['h_prev'] * (1.0 - reset_f.unsqueeze(-1))
-        kv_cache = carry['kv_cache'] * (
-            1.0 - reset_f.reshape(-1, 1, 1, 1, 1))
+        kv_cache = carry['kv_cache'] * (1.0 - reset_f.reshape(-1, 1, 1, 1, 1))
         pos = carry['pos'] * (~reset).int()
         carry = {'kv_cache': kv_cache, 'pos': pos, 'h_prev': h_prev}
 
-        # Posterior from (h_prev, tokens)
-        post_logit = self._post_head(
-            torch.cat([h_prev, tokens], -1))  # (B, S, K)
+        # Posterior from tokens only
+        post_logit = self._post_head(tokens)  # (B, S, K)
         stoch = self.get_dist(post_logit).rsample()  # (B, S, K)
 
         return carry, stoch, h_prev
@@ -571,12 +572,10 @@ class TransformerRSSM(nn.Module):
         W = self._window_size
 
         # Normalize action
-        action_norm = action / torch.clip(
-            torch.abs(action), min=1.0).detach()
+        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
         # Input projection
-        x_t = self._inp_proj(
-            torch.cat([tokens, action_norm], -1))  # (B, D)
+        x_t = self._inp_proj(torch.cat([tokens, action_norm], -1))  # (B, D)
         x_t = x_t.unsqueeze(1)  # (B, 1, D)
 
         kv_cache = carry['kv_cache']  # (B, L, 2, W, D)
@@ -597,12 +596,12 @@ class TransformerRSSM(nn.Module):
             x_t = self._attn_norms[i](x_t)
 
             # Project Q, K_new, V_new
-            Q = self._q_projs[i](x_t).reshape(
-                B, 1, H, D_head).transpose(1, 2)  # (B, H, 1, D_head)
-            K_new = self._k_projs[i](x_t).reshape(
-                B, 1, H, D_head).transpose(1, 2)
-            V_new = self._v_projs[i](x_t).reshape(
-                B, 1, H, D_head).transpose(1, 2)
+            Q = self._q_projs[i](x_t).reshape(B, 1, H, D_head).transpose(
+                1, 2)  # (B, H, 1, D_head)
+            K_new = self._k_projs[i](x_t).reshape(B, 1, H,
+                                                  D_head).transpose(1, 2)
+            V_new = self._v_projs[i](x_t).reshape(B, 1, H,
+                                                  D_head).transpose(1, 2)
 
             # Apply RoPE at current position
             Q = apply_rope(Q, ts)
@@ -613,21 +612,20 @@ class TransformerRSSM(nn.Module):
             v_new_flat = V_new.transpose(1, 2).reshape(B, 1, D)
 
             # Shift cache left by 1, append new K/V
-            k_cache = torch.cat(
-                [kv_cache[:, i, 0, 1:], k_new_flat], dim=1)  # (B, W, D)
-            v_cache = torch.cat(
-                [kv_cache[:, i, 1, 1:], v_new_flat], dim=1)
+            k_cache = torch.cat([kv_cache[:, i, 0, 1:], k_new_flat],
+                                dim=1)  # (B, W, D)
+            v_cache = torch.cat([kv_cache[:, i, 1, 1:], v_new_flat], dim=1)
             new_kv_cache_layers.append((k_cache, v_cache))
 
             # Reshape cached K/V for attention: (B, W, D) -> (B, H, W, D_head)
-            K_cached = k_cache.reshape(
-                B, W, H, D_head).transpose(1, 2)
-            V_cached = v_cache.reshape(
-                B, W, H, D_head).transpose(1, 2)
+            K_cached = k_cache.reshape(B, W, H, D_head).transpose(1, 2)
+            V_cached = v_cache.reshape(B, W, H, D_head).transpose(1, 2)
 
             # Cross-attend Q to cached K/V
-            x_t = F.scaled_dot_product_attention(
-                Q, K_cached, V_cached, attn_mask=attn_mask)
+            x_t = F.scaled_dot_product_attention(Q,
+                                                 K_cached,
+                                                 V_cached,
+                                                 attn_mask=attn_mask)
             x_t = x_t.transpose(1, 2).reshape(B, 1, D)
             x_t = res + self._o_projs[i](x_t)
 
@@ -641,10 +639,9 @@ class TransformerRSSM(nn.Module):
         h_t = x_t[:, 0]  # (B, D)
 
         # Assemble updated KV cache
-        ks = torch.stack(
-            [kv[0] for kv in new_kv_cache_layers], dim=1)  # (B, L, W, D)
-        vs = torch.stack(
-            [kv[1] for kv in new_kv_cache_layers], dim=1)
+        ks = torch.stack([kv[0] for kv in new_kv_cache_layers],
+                         dim=1)  # (B, L, W, D)
+        vs = torch.stack([kv[1] for kv in new_kv_cache_layers], dim=1)
         new_kv_cache = torch.stack([ks, vs], dim=2)  # (B, L, 2, W, D)
 
         return {
@@ -665,8 +662,7 @@ class TransformerRSSM(nn.Module):
 
     def get_feat(self, stoch, deter):
         """Flatten stoch and concatenate with deter."""
-        stoch = stoch.reshape(
-            *stoch.shape[:-2], self._stoch * self._discrete)
+        stoch = stoch.reshape(*stoch.shape[:-2], self._stoch * self._discrete)
         return torch.cat([stoch, deter], -1)
 
     def get_dist(self, logit):

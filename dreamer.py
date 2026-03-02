@@ -29,7 +29,8 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
         self.rep_loss = str(config.rep_loss)
-        self._use_transformer = str(getattr(config, 'dyn_type', 'rssm')) == 'transformer'
+        self._use_transformer = str(getattr(config, 'dyn_type',
+                                            'rssm')) == 'transformer'
         self.imag_last = int(getattr(config, 'imag_last', 0))
 
         # World model components
@@ -206,20 +207,24 @@ class Dreamer(nn.Module):
                 'pos': state['pos'],
                 'h_prev': state['h_prev'],
             }
+            # Trainer provides (B, 1, *) tensors; squeeze time dim
+            embed_sq = embed.squeeze(1)  # (B, E)
+            is_first = obs["is_first"].squeeze(1)  # (B,)
             # Phase 1: posterior from h_prev + tokens
             carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
-                carry, embed, obs["is_first"])
+                carry, embed_sq, is_first)
             feat = self._frozen_rssm.get_feat(stoch, h_prev)
             action_dist = self._frozen_actor(feat)
             action = action_dist.mode if eval else action_dist.rsample()
             # Phase 2: update KV-cache with (tokens, action)
-            carry = self._frozen_rssm.update_carry(
-                carry, embed, action, obs["is_first"])
+            carry = self._frozen_rssm.update_carry(carry, embed_sq, action,
+                                                   is_first)
             return action, TensorDict(
                 {
                     "kv_cache": carry['kv_cache'],
                     "pos": carry['pos'],
                     "h_prev": carry['h_prev'],
+                    "prev_action": action,
                 },
                 batch_size=state.batch_size,
             )
@@ -250,11 +255,16 @@ class Dreamer(nn.Module):
     def get_initial_state(self, B):
         if self._use_transformer:
             carry = self.rssm.initial(B)
+            action = torch.zeros(B,
+                                 self.act_dim,
+                                 dtype=torch.float32,
+                                 device=self.device)
             return TensorDict(
                 {
                     "kv_cache": carry['kv_cache'],
                     "pos": carry['pos'],
                     "h_prev": carry['h_prev'],
+                    "prev_action": action,
                 },
                 batch_size=(B, ))
         else:
@@ -396,14 +406,14 @@ class Dreamer(nn.Module):
         if self._use_transformer:
             # Transformer path: current action, full-sequence observe
             action = data["action"]  # (B, T, A) — current action a_t
-            entries, feat_dict = self.rssm.observe(
-                embed, action, data["is_first"])
-            post_stoch = feat_dict['stoch']       # (B, T, S, K)
-            post_deter = feat_dict['deter']       # (B, T, D) = h_prev
+            entries, feat_dict = self.rssm.observe(embed, action,
+                                                   data["is_first"])
+            post_stoch = feat_dict['stoch']  # (B, T, S, K)
+            post_deter = feat_dict['deter']  # (B, T, D) = h_prev
             post_logit = feat_dict['post_logit']  # (B, T, S, K)
             prior_logit = feat_dict['prior_logit']
-            dyn_loss, rep_loss = self.rssm.kl_loss(
-                post_logit, prior_logit, self.kl_free)
+            dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
+                                                   self.kl_free)
             losses["dyn"] = (dyn_loss * t_mask).mean()
             losses["rep"] = (rep_loss * t_mask).mean()
             losses["align"] = (feat_dict['imag_core_loss'] * t_mask).mean()
@@ -417,8 +427,8 @@ class Dreamer(nn.Module):
             post_stoch, post_deter, post_logit = self.rssm.observe(
                 embed, action, initial, data["is_first"])
             _, prior_logit = self.rssm.prior(post_deter)
-            dyn_loss, rep_loss = self.rssm.kl_loss(
-                post_logit, prior_logit, self.kl_free)
+            dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
+                                                   self.kl_free)
             losses["dyn"] = (dyn_loss * t_mask).mean()
             losses["rep"] = (rep_loss * t_mask).mean()
 
@@ -471,13 +481,13 @@ class Dreamer(nn.Module):
             K = min(self.imag_last if self.imag_last > 0 else T, T)
             s = torch.randint(0, T - K + 1, ()).item() if K < T else 0
             start = (
-                post_stoch[:, s:s + K].reshape(
-                    B * K, *post_stoch.shape[2:]).detach(),
-                post_deter[:, s:s + K].reshape(
-                    B * K, *post_deter.shape[2:]).detach(),
+                post_stoch[:, s:s + K].reshape(B * K,
+                                               *post_stoch.shape[2:]).detach(),
+                post_deter[:, s:s + K].reshape(B * K,
+                                               *post_deter.shape[2:]).detach(),
             )
-            imag_feat, imag_action = self._imagine(
-                start, self.imag_horizon + 1)
+            imag_feat, imag_action = self._imagine(start,
+                                                   self.imag_horizon + 1)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
             imag_mask = t_mask[:, s:s + K].reshape(B * K, 1, 1)
         else:
@@ -486,8 +496,8 @@ class Dreamer(nn.Module):
                 post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
                 post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
             )
-            imag_feat, imag_action = self._imagine(
-                start, self.imag_horizon + 1)
+            imag_feat, imag_action = self._imagine(start,
+                                                   self.imag_horizon + 1)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
             imag_mask = t_mask.reshape(B * T, 1, 1)
 

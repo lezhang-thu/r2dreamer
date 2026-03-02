@@ -4,7 +4,8 @@ env_num: 1
 eval_episode_num: 100
 action_repeat: 4
 train_ratio: 128
-time_limit: 108000
+#time_limit: 108000
+time_limit: 4096
 
 seed: ${seed}
 device: ${device}
