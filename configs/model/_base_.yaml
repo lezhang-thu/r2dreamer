@@ -10,7 +10,7 @@ rep_loss: "r2dreamer" # r2dreamer/dreamer
 #dyn_type: "rssm"      # "rssm" or "transformer"
 dyn_type: "transformer"      # "rssm" or "transformer"
 #imag_last: 0          # 0 = all T positions; >0 = K contiguous positions
-imag_last: 128         # 0 = all T positions; >0 = K contiguous positions
+imag_last: 64          # 0 = all T positions; >0 = K contiguous positions
 
 lr: 4e-5
 agc: 0.3

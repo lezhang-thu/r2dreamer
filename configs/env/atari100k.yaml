@@ -7,7 +7,7 @@ eval_episode_num: 10
 action_repeat: 4
 train_ratio: 128
 #time_limit: 108000
-time_limit: 8192 
+time_limit: 20476
 
 seed: ${seed}
 device: ${device}

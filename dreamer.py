@@ -584,7 +584,10 @@ class Dreamer(nn.Module):
         """Prepare transformer imagination starts from trajectory KV tensors."""
         B = post_stoch.shape[0]
         K = min(self.imag_last if self.imag_last > 0 else T, T)
-        s0 = torch.randint(0, T - K + 1, ()).item() if K < T else 0
+
+        # Compute max episode length from t_mask to avoid sampling from padding
+        max_eps_len = int(t_mask.sum(dim=1).max().item())  # max valid length in batch
+        s0 = torch.randint(0, max_eps_len - K + 1, ()).item() if K < max_eps_len else 0
 
         # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
