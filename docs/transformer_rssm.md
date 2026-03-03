@@ -49,11 +49,13 @@ Training (observe path):
 
 1. `post_logit = _post_head(tokens)` and sample posterior `stoch`.
 2. Build transformer inputs from `(stoch, action)`.
-3. Run causal transformer (`_fwd`) over the full sequence.
+3. Run windowed-causal transformer (`_fwd`) over the full sequence, where each
+   step attends to at most `window_size` recent steps (including itself).
 4. Shift-right to get `h_prev`.
 5. `prior_logit = _prior_head(h_prev)`.
-6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) for efficient
-   imagination-start construction without replaying history.
+6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) with `window_size`
+   prepended dummy zero slots for efficient imagination-start construction
+   without replaying history.
 
 Posterior is conditioned on `tokens` only. It does **not** take `h_prev`.
 
@@ -128,6 +130,8 @@ python3 train.py model.dyn_type=transformer model.compile=False batch_length=500
 ## Practical notes
 
 - Full-sequence training still uses parallel causal attention.
+- Training attention is windowed to `window_size`, matching inference and
+  imagination context limits.
 - In imagination/inference, dynamics are rolled with a bounded KV window to
   control memory.
 - Training assumes complete trajectories (no concatenation of different

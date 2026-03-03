@@ -584,13 +584,9 @@ class Dreamer(nn.Module):
         """Prepare transformer imagination starts from trajectory KV tensors."""
         B = post_stoch.shape[0]
         K = min(self.imag_last if self.imag_last > 0 else T, T)
-        #s0 = torch.randint(0, T - K + 1, ()).item() if K < T else 0
-        s0 = torch.randint(0, 1024, ()).item()
+        s0 = torch.randint(0, T - K + 1, ()).item() if K < T else 0
 
-        # Prepend W dummy zero-KV slots to match initial() style exactly.
-        W = int(self._frozen_rssm._window_size)
-        kv_k = torch.cat([torch.zeros_like(kv_k[:, :, :W]), kv_k], dim=2)
-        kv_v = torch.cat([torch.zeros_like(kv_v[:, :, :W]), kv_v], dim=2)
+        # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
             post_stoch, post_deter, kv_k, kv_v, s0, K)
         imag_mask = t_mask[:, s0:s0 + K].reshape(B * K, 1, 1)

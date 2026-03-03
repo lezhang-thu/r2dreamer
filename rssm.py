@@ -386,7 +386,7 @@ class TransformerRSSM(nn.Module):
     # ------------------------------------------------------------------
 
     def observe(self, tokens, action, reset):
-        """Full-sequence training path (causal attention over entire episode).
+        """Windowed-causal full-sequence training path.
 
         Args:
             tokens: (B, T, E) encoder embeddings.
@@ -422,14 +422,30 @@ class TransformerRSSM(nn.Module):
         prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
 
         entries = {'deter': h_prev, 'stoch': stoch}
+        B, L, T, D = kv['k'].shape
+        dummy_k = torch.zeros(B,
+                              L,
+                              self._window_size,
+                              D,
+                              dtype=kv['k'].dtype,
+                              device=kv['k'].device)
+        dummy_v = torch.zeros(B,
+                              L,
+                              self._window_size,
+                              D,
+                              dtype=kv['v'].dtype,
+                              device=kv['v'].device)
         feat = {
             'deter': h_prev,
             'stoch': stoch,
             'post_logit': post_logit,
             'prior_logit': prior_logit,
             # Detached to avoid expanding the autograd graph.
-            'kv_k': kv['k'].detach(),  # (B, L, T, D)
-            'kv_v': kv['v'].detach(),  # (B, L, T, D)
+            # Prepend W dummy zero-KV slots to match initial() cache style.
+            'kv_k': torch.cat([dummy_k, kv['k']],
+                              dim=2).detach(),  # (B, L, T+W, D)
+            'kv_v': torch.cat([dummy_v, kv['v']],
+                              dim=2).detach(),  # (B, L, T+W, D)
         }
         return entries, feat
 
@@ -456,6 +472,15 @@ class TransformerRSSM(nn.Module):
         B, T, D = x.shape
         H = self._n_heads
         D_head = self._d_head
+        W = self._window_size
+        # Windowed causal mask: each query can attend to at most W recent keys
+        # (including itself), matching inference/imagination transition scope.
+        causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        if W < T:
+            local = torch.triu(causal, diagonal=-(W - 1))
+        else:
+            local = causal
+        attn_mask = local.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
         if return_kv:
             k_layers = []
             v_layers = []
@@ -475,7 +500,7 @@ class TransformerRSSM(nn.Module):
                 k_layers.append(K.transpose(1, 2).reshape(B, T, D))
                 v_layers.append(V.transpose(1, 2).reshape(B, T, D))
             x = F.scaled_dot_product_attention(
-                Q, K, V, is_causal=True)  # (B, H, T, D_head)
+                Q, K, V, attn_mask=attn_mask)  # (B, H, T, D_head)
             x = x.transpose(1, 2).reshape(B, T, D)
             x = res + self._o_projs[i](x)
 
