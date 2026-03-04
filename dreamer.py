@@ -30,6 +30,9 @@ class Dreamer(nn.Module):
             act_space.shape)
         self.rep_loss = str(config.rep_loss)
         self.imag_last = int(getattr(config, 'imag_last', 0))
+        self.wm_accum_steps = max(1, int(getattr(config, 'wm_accum_steps', 1)))
+        self.ac_accum_steps = max(1, int(getattr(config, 'ac_accum_steps', 1)))
+        self.ac_repeats = max(1, int(getattr(config, 'ac_repeats', 1)))
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -279,7 +282,7 @@ class Dreamer(nn.Module):
         self._update_slow_target()
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            _, mets = self._cal_grad(p_data, carry_train)
+            mets = self._cal_grad(p_data, carry_train)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self._log_grads:
             old_params = [
@@ -315,25 +318,48 @@ class Dreamer(nn.Module):
         new_carry = carry_train
         return new_carry, metrics
 
-    def _cal_grad(self, data, _carry_train):
-        """Compute gradients for one batch.
+    def _iter_batch_chunks(self, data, accum_steps):
+        """Yield replay batch chunks and their batch-fraction weights."""
+        B = data.shape[0]
+        splits = min(max(1, int(accum_steps)), int(B))
+        if splits <= 1:
+            yield data, 1.0
+            return
+        chunk = (B + splits - 1) // splits
+        for start in range(0, B, chunk):
+            end = min(start + chunk, B)
+            # Use native TensorDict slicing for compatibility with torch.compile.
+            sub = data[start:end]
+            yield sub, float(end - start) / float(B)
 
-        carry_train is unused and kept only for trainer API compatibility.
-        t_mask from data masks out zero-padded positions.
+    def _iter_start_chunks(self, start_stoch, start_deter, imag_carry, imag_mask,
+                           accum_steps):
+        """Yield imagination-start chunks and their batch-fraction weights."""
+        N = int(start_stoch.shape[0])
+        splits = min(max(1, int(accum_steps)), max(1, N))
+        if splits <= 1:
+            yield start_stoch, start_deter, imag_carry, imag_mask, 1.0
+            return
+        chunk = (N + splits - 1) // splits
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            carry = {k: v[start:end] for k, v in imag_carry.items()}
+            yield (
+                start_stoch[start:end],
+                start_deter[start:end],
+                carry,
+                imag_mask[start:end],
+                float(end - start) / float(N),
+            )
 
-        Notes
-        -----
-        This function computes:
-        1) World model loss (dynamics + representation)
-        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
-        3) Imagination rollouts for actor-critic updates
-        """
+    def _world_model_forward(self, data):
+        """World-model losses and detached cache for repeated AC updates."""
         # t_mask: (B, T) bool — True for real data, False for padding
         t_mask = data["t_mask"].float()  # (B, T)
+        B, T = data.shape
 
         losses = {}
         metrics = {}
-        B, T = data.shape
 
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
@@ -388,26 +414,34 @@ class Dreamer(nn.Module):
         cont = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         con_loss = -self.cont(feat).log_prob(cont)  # (B, T)
         losses["con"] = (con_loss * t_mask).mean()
-        # log
+
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(
             self.rssm.get_dist(post_logit).entropy())
 
-        # === Imagination rollout for actor-critic ===
-        start_stoch, start_deter, imag_carry, imag_mask = self._prepare_transformer_imag_start(
-            post_stoch.detach(),
-            post_deter.detach(),
-            feat_dict["kv_k"],
-            feat_dict["kv_v"],
-            t_mask,
-            T,
-        )
+        # Keep only detached tensors needed by repeated AC updates.
+        imag_cache = {
+            "post_stoch": post_stoch.detach(),
+            "post_deter": post_deter.detach(),
+            "kv_k": feat_dict["kv_k"],
+            "kv_v": feat_dict["kv_v"],
+            "t_mask": t_mask.detach(),
+            "T": T,
+        }
+        return losses, metrics, imag_cache
+
+    def _actor_critic_forward(self, start_stoch, start_deter, imag_carry,
+                              imag_mask):
+        """Single AC forward from a batch of imagination starts."""
+        losses = {}
+        metrics = {}
+
         imag_feat, imag_action = self._imagine(
             (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
-        # (N, T_imag, 1) where N = B*K sampled imagination starts.
+        # (N, T_imag, 1)
         imag_reward = self._frozen_reward(imag_feat).mode()
         imag_cont = self._frozen_cont(imag_feat).mean
         imag_value = self._frozen_value(imag_feat).mode()
@@ -436,7 +470,7 @@ class Dreamer(nn.Module):
                        imag_value_dist.log_prob(
                            imag_slow_value.detach()))[:, :-1].unsqueeze(-1))
         losses["value"] = (value_loss * imag_mask).mean()
-        # log
+
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
         metrics["ret_005"] = self.return_ema.ema_vals[0]
@@ -452,12 +486,78 @@ class Dreamer(nn.Module):
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
 
-        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
-        self._scaler.scale(total_loss).backward()
+        return losses, metrics
+
+    def _cal_grad(self, data, _carry_train):
+        """Compute gradients for one batch.
+
+        carry_train is unused and kept only for trainer API compatibility.
+        t_mask from data masks out zero-padded positions.
+
+        Notes
+        -----
+        This function computes:
+        1) World model loss (dynamics + representation)
+        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
+        3) Repeated imagination rollouts for actor-critic updates
+        """
+        metrics = {}
+        losses = {}
+        opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+
+        def _accum(target, source, weight):
+            for name, value in source.items():
+                if not isinstance(value, torch.Tensor):
+                    value = torch.tensor(value,
+                                         dtype=torch.float32,
+                                         device=self.device)
+                target[name] = target.get(
+                    name, torch.zeros((), dtype=torch.float32,
+                                      device=self.device))
+                target[name] = target[name] + value.detach() * float(weight)
+
+        # Phase 1: world model (possibly chunked over batch) + backward.
+        for wm_data, wm_weight in self._iter_batch_chunks(data,
+                                                          self.wm_accum_steps):
+            wm_losses, wm_metrics, imag_cache = self._world_model_forward(wm_data)
+            wm_total = sum([self._loss_scales[k] * v for k, v in wm_losses.items()])
+            self._scaler.scale(wm_total * wm_weight).backward()
+            opt_loss = opt_loss + wm_total.detach() * wm_weight
+            _accum(losses, wm_losses, wm_weight)
+            _accum(metrics, wm_metrics, wm_weight)
+
+            # Phase 2: repeated AC imagination from detached static WM cache.
+            repeat_weight = wm_weight / float(self.ac_repeats)
+            for _ in range(self.ac_repeats):
+                start_stoch, start_deter, imag_carry, imag_mask = self._prepare_transformer_imag_start(
+                    imag_cache["post_stoch"],
+                    imag_cache["post_deter"],
+                    imag_cache["kv_k"],
+                    imag_cache["kv_v"],
+                    imag_cache["t_mask"],
+                    imag_cache["T"],
+                )
+                rep_losses = {}
+                rep_metrics = {}
+                for s_stoch, s_deter, s_carry, s_mask, s_weight in self._iter_start_chunks(
+                        start_stoch, start_deter, imag_carry, imag_mask,
+                        self.ac_accum_steps):
+                    ac_losses, ac_metrics = self._actor_critic_forward(
+                        s_stoch, s_deter, s_carry, s_mask)
+                    ac_total = (self._loss_scales["policy"] *
+                                ac_losses["policy"] + self._loss_scales["value"] *
+                                ac_losses["value"])
+                    grad_weight = wm_weight * s_weight
+                    self._scaler.scale(ac_total * grad_weight).backward()
+                    opt_loss = opt_loss + ac_total.detach() * grad_weight
+                    _accum(rep_losses, ac_losses, s_weight)
+                    _accum(rep_metrics, ac_metrics, s_weight)
+                _accum(losses, rep_losses, repeat_weight)
+                _accum(metrics, rep_metrics, repeat_weight)
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
-        metrics.update({"opt/loss": total_loss})
-        return (post_stoch, post_deter), metrics
+        metrics.update({"opt/loss": opt_loss})
+        return metrics
 
     @torch.no_grad()
     def _prepare_transformer_imag_start(self, post_stoch, post_deter, kv_k,

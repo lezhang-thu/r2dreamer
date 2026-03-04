@@ -93,6 +93,9 @@ In `configs/model/_base_.yaml`:
 
 ```yaml
 imag_last: 64
+wm_accum_steps: 1
+ac_accum_steps: 1
+ac_repeats: 1
 
 transformer:
   stoch: ${model.rssm.stoch}
@@ -114,7 +117,8 @@ transformer:
 Usage:
 
 ```bash
-python3 train.py model.compile=False batch_length=500
+python3 train.py model.compile=False batch_length=500 \
+  model.wm_accum_steps=2 model.ac_accum_steps=2 model.ac_repeats=4
 ```
 
 ## Practical notes
@@ -124,6 +128,9 @@ python3 train.py model.compile=False batch_length=500
   imagination context limits.
 - In imagination/inference, dynamics are rolled with a bounded KV window to
   control memory.
+- Training can split world-model and actor-critic gradients across chunks
+  (`wm_accum_steps`, `ac_accum_steps`) and repeat actor-critic imagination
+  updates with different random starts per replay batch (`ac_repeats`).
 - Training assumes complete trajectories (no concatenation of different
   trajectories inside one sampled sequence).
 - RoPE uses a modern cached implementation with dynamic cache growth if

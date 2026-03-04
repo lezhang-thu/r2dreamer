@@ -212,14 +212,11 @@ class TransformerRSSM(nn.Module):
         H = self._n_heads
         D_head = self._d_head
         W = self._window_size
-        # Windowed causal mask: each query can attend to at most W recent keys
-        # (including itself), matching inference/imagination transition scope.
-        causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
-        if W < T:
-            local = torch.triu(causal, diagonal=-(W - 1))
-        else:
-            local = causal
-        attn_mask = local.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+        assert W <= T, f"window_size ({W}) must be <= sequence length T ({T})"
+        # This optimized path relies on full causal attention with W == T.
+        assert W == T, (
+            f"window_size ({W}) must equal T ({T}) for is_causal path; "
+            "W < T requires an explicit local-window mask.")
         if return_kv:
             k_layers = []
             v_layers = []
@@ -239,7 +236,7 @@ class TransformerRSSM(nn.Module):
                 k_layers.append(K.transpose(1, 2).reshape(B, T, D))
                 v_layers.append(V.transpose(1, 2).reshape(B, T, D))
             x = F.scaled_dot_product_attention(
-                Q, K, V, attn_mask=attn_mask)  # (B, H, T, D_head)
+                Q, K, V, is_causal=True)  # (B, H, T, D_head)
             x = x.transpose(1, 2).reshape(B, T, D)
             x = res + self._o_projs[i](x)
 
@@ -260,13 +257,6 @@ class TransformerRSSM(nn.Module):
     # ------------------------------------------------------------------
     # Imagination (KV-cache transition)
     # ------------------------------------------------------------------
-
-    def img_step(self, stoch, deter, action):
-        """Fallback single-step prior using zeroed KV carry."""
-        carry = self.initial(stoch.shape[0])
-        carry['h_prev'] = deter
-        stoch, deter, _ = self.img_step_with_carry(stoch, carry, action)
-        return stoch, deter
 
     def img_step_with_carry(self, stoch, carry, action):
         """Single prior step with KV-cache carry."""
@@ -328,26 +318,6 @@ class TransformerRSSM(nn.Module):
             'h_prev': start_deter,
         }
         return start_stoch, start_deter, carry
-
-    def imagine_with_action(self, stoch, deter, actions, carry=None):
-        """Roll out prior dynamics given a sequence of actions.
-
-        If carry is provided, rolling context is preserved with KV-cache.
-        """
-        L = actions.shape[1]
-        stochs, deters = [], []
-        if carry is None:
-            carry = self.initial(stoch.shape[0])
-            carry['h_prev'] = deter
-        for i in range(L):
-            stoch, deter, carry = self.img_step_with_carry(
-                stoch, carry, actions[:, i])
-            stochs.append(stoch)
-            deters.append(deter)
-        # (B, T, S, K), (B, T, D)
-        stochs = torch.stack(stochs, dim=1)
-        deters = torch.stack(deters, dim=1)
-        return stochs, deters, carry
 
     # ------------------------------------------------------------------
     # KV-cache policy inference

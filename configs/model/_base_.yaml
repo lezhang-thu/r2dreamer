@@ -9,6 +9,9 @@ device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer
 #imag_last: 0          # 0 = all T positions; >0 = K contiguous positions
 imag_last: 64          # 0 = all T positions; >0 = K contiguous positions
+wm_accum_steps: 1      # split replay batch for world-model grad accumulation
+ac_accum_steps: 1      # split imagination starts for actor-critic grad accumulation
+ac_repeats: 1          # repeated AC imagination updates per world-model pass
 
 lr: 4e-5
 agc: 0.3
