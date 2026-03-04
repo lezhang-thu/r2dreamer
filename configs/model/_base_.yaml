@@ -7,8 +7,6 @@ compile: True
 log_grads: False
 device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer
-#dyn_type: "rssm"      # "rssm" or "transformer"
-dyn_type: "transformer"      # "rssm" or "transformer"
 #imag_last: 0          # 0 = all T positions; >0 = K contiguous positions
 imag_last: 64          # 0 = all T positions; >0 = K contiguous positions
 
@@ -31,25 +29,13 @@ loss_scales:
   rep: 0.1
   policy: 1.0
   value: 1.0
-  repval: 0.3
 
 r2dreamer:
   lambd: 5e-4
 
 rssm:
   stoch: 32
-  deter: ${model.deter}
-  hidden: ${model.hidden}
-  discrete: ${model.discrete}
-  img_layers: 2
-  obs_layers: 1
-  dyn_layers: 1
-  blocks: 8
-  act: ${model.act}
-  norm: ${model.norm}
   unimix_ratio: 0.01
-  initial: 'learned'
-  device: ${device}
 
 transformer:
   stoch: ${model.rssm.stoch}

@@ -124,9 +124,7 @@ class OnlineTrainer:
         # (B, A)
         act = agent_state["prev_action"].clone()
 
-        # Carry state for chunked replay training, analogous to carry_train
-        # in dreamerv3-jax/embodied/run/x_train.py.
-        # (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
+        # Placeholder carry kept for API compatibility with agent.update().
         carry_train = agent.get_initial_carry(self.batch_size)
 
         while step < self.steps:

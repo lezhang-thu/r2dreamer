@@ -1,14 +1,12 @@
 # Transformer-based RSSM (TransformerRSSM)
 
-This document describes `TransformerRSSM` in `rssm.py`, enabled by
-`model.dyn_type=transformer`.
+This document describes `TransformerRSSM` in `rssm.py`, which is now the
+default and only dynamics model used in `dreamer.py`.
 
 ## Motivation
 
-The GRU RSSM transition is sequential and uses `(prev_stoch, prev_action)` per
-step. The transformer variant now follows the same transition-style input
-semantics: it updates latent dynamics from `(stoch, action)`, where `stoch` is
-posterior-sampled from observation tokens.
+`TransformerRSSM` updates latent dynamics from `(stoch, action)`, where
+`stoch` is posterior-sampled from observation tokens.
 
 Key change from earlier versions:
 - Transition input is now `(stoch, action)`, not `(tokens, action)`.
@@ -84,24 +82,16 @@ before start-window extraction so imagination uses the same zero-cache style as
 
 ## Integration in `dreamer.py`
 
-Controlled by `model.dyn_type` (`"rssm"` or `"transformer"`):
-
-| Aspect | GRU RSSM | TransformerRSSM |
-|--------|----------|-----------------|
-| Training transition input | `(prev_stoch, prev_action)` via recurrent step | `(post_stoch, action)` via transformer |
-| `observe()` args | `(embed, action, initial, reset)` | `(tokens, action, reset)` |
-| Posterior input | embed | tokens |
-| Prior input | deter | `h_prev` |
-| Inference carry | `{stoch, deter, prev_action}` | `{kv_cache, pos, h_prev}` |
-| Imagination transition | GRU `img_step` | KV-cache `img_step_with_carry` + prior head |
-| Extra alignment loss | N/A | removed |
+`Dreamer` always instantiates `rssm.TransformerRSSM` and uses:
+- Training observe path: `observe(tokens, action, reset)`
+- Inference carry: `{kv_cache, pos, h_prev}`
+- Imagination transition: `img_step_with_carry` + prior head
 
 ## Configuration
 
 In `configs/model/_base_.yaml`:
 
 ```yaml
-dyn_type: "transformer"
 imag_last: 64
 
 transformer:
@@ -118,13 +108,13 @@ transformer:
   n_heads: 8
   n_layers: 4
   d_ff: 4096
-  window_size: 128
+  window_size: 64
 ```
 
 Usage:
 
 ```bash
-python3 train.py model.dyn_type=transformer model.compile=False batch_length=500
+python3 train.py model.compile=False batch_length=500
 ```
 
 ## Practical notes

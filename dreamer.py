@@ -29,26 +29,17 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
         self.rep_loss = str(config.rep_loss)
-        self._use_transformer = str(getattr(config, 'dyn_type',
-                                            'rssm')) == 'transformer'
         self.imag_last = int(getattr(config, 'imag_last', 0))
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
-        if self._use_transformer:
-            self.rssm = rssm.TransformerRSSM(
-                config.transformer,
-                self.embed_size,
-                self.act_dim,
-            )
-        else:
-            self.rssm = rssm.RSSM(
-                config.rssm,
-                self.embed_size,
-                self.act_dim,
-            )
+        self.rssm = rssm.TransformerRSSM(
+            config.transformer,
+            self.embed_size,
+            self.act_dim,
+        )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
@@ -146,8 +137,7 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         if config.compile:
             print("Compiling update function with torch.compile...")
-            self._cal_grad = torch.compile(self._cal_grad,
-                                           mode="reduce-overhead")
+            self._cal_grad = torch.compile(self._cal_grad, mode="default")
 
     def _update_slow_target(self):
         """Update slow-moving value target network."""
@@ -200,99 +190,57 @@ class Dreamer(nn.Module):
         # (B, E)
         embed = self._frozen_encoder(p_obs)
 
-        if self._use_transformer:
-            # Two-phase KV-cache inference
-            carry = {
-                'kv_cache': state['kv_cache'],
-                'pos': state['pos'],
-                'h_prev': state['h_prev'],
-            }
-            # Trainer provides (B, 1, *) tensors; squeeze time dim
-            embed_sq = embed.squeeze(1)  # (B, E)
-            is_first = obs["is_first"].squeeze(1)  # (B,)
-            # Phase 1: posterior from tokens
-            carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
-                carry, embed_sq, is_first)
-            feat = self._frozen_rssm.get_feat(stoch, h_prev)
-            action_dist = self._frozen_actor(feat)
-            action = action_dist.mode if eval else action_dist.rsample()
-            # Phase 2: update KV-cache with (stoch, action)
-            carry = self._frozen_rssm.update_carry(carry, stoch, action,
-                                                   is_first)
-            return action, TensorDict(
-                {
-                    "kv_cache": carry['kv_cache'],
-                    "pos": carry['pos'],
-                    "h_prev": carry['h_prev'],
-                    "prev_action": action,
-                },
-                batch_size=state.batch_size,
-            )
-        else:
-            prev_stoch, prev_deter, prev_action = (
-                state["stoch"],
-                state["deter"],
-                state["prev_action"],
-            )
-            # (B, S, K), (B, D)
-            stoch, deter, _ = self._frozen_rssm.obs_step(
-                prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
-            # (B, F)
-            feat = self._frozen_rssm.get_feat(stoch, deter)
-            action_dist = self._frozen_actor(feat)
-            # (B, A)
-            action = action_dist.mode if eval else action_dist.rsample()
-            return action, TensorDict(
-                {
-                    "stoch": stoch,
-                    "deter": deter,
-                    "prev_action": action
-                },
-                batch_size=state.batch_size,
-            )
+        # Two-phase KV-cache inference
+        carry = {
+            'kv_cache': state['kv_cache'],
+            'pos': state['pos'],
+            'h_prev': state['h_prev'],
+        }
+        # Trainer provides (B, 1, *) tensors; squeeze time dim
+        embed_sq = embed.squeeze(1)  # (B, E)
+        is_first = obs["is_first"].squeeze(1)  # (B,)
+        # Phase 1: posterior from tokens
+        carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
+            carry, embed_sq, is_first)
+        feat = self._frozen_rssm.get_feat(stoch, h_prev)
+        action_dist = self._frozen_actor(feat)
+        action = action_dist.mode if eval else action_dist.rsample()
+        # Phase 2: update KV-cache with (stoch, action)
+        carry = self._frozen_rssm.update_carry(carry, stoch, action, is_first)
+        return action, TensorDict(
+            {
+                "kv_cache": carry['kv_cache'],
+                "pos": carry['pos'],
+                "h_prev": carry['h_prev'],
+                "prev_action": action,
+            },
+            batch_size=state.batch_size,
+        )
 
     @torch.no_grad()
     def get_initial_state(self, B):
-        if self._use_transformer:
-            carry = self.rssm.initial(B)
-            action = torch.zeros(B,
-                                 self.act_dim,
-                                 dtype=torch.float32,
-                                 device=self.device)
-            return TensorDict(
-                {
-                    "kv_cache": carry['kv_cache'],
-                    "pos": carry['pos'],
-                    "h_prev": carry['h_prev'],
-                    "prev_action": action,
-                },
-                batch_size=(B,))
-        else:
-            stoch, deter = self.rssm.initial(B)
-            action = torch.zeros(B,
-                                 self.act_dim,
-                                 dtype=torch.float32,
-                                 device=self.device)
-            return TensorDict(
-                {
-                    "stoch": stoch,
-                    "deter": deter,
-                    "prev_action": action
-                },
-                batch_size=(B,))
+        carry = self.rssm.initial(B)
+        action = torch.zeros(B,
+                             self.act_dim,
+                             dtype=torch.float32,
+                             device=self.device)
+        return TensorDict(
+            {
+                "kv_cache": carry['kv_cache'],
+                "pos": carry['pos'],
+                "h_prev": carry['h_prev'],
+                "prev_action": action,
+            },
+            batch_size=(B,))
 
     @torch.no_grad()
     def get_initial_carry(self, B):
         """Return initial carry_train state for chunked replay training.
 
-        Returns a tuple (stoch, deter, prev_action) analogous to carry_train
-        in dreamerv3-jax/embodied/run/x_train.py.
-        For transformer: carry_train is unused (complete episodes), but we
-        return a compatible tuple for interface consistency.
+        carry_train is retained only for trainer API compatibility.
         """
-        stoch, deter = self.rssm.initial(B) if not self._use_transformer \
-            else (torch.zeros(B, dtype=torch.float32, device=self.device),
-                  torch.zeros(B, dtype=torch.float32, device=self.device))
+        stoch = torch.zeros(B, dtype=torch.float32, device=self.device)
+        deter = torch.zeros(B, dtype=torch.float32, device=self.device)
         prev_action = torch.zeros(B,
                                   self.act_dim,
                                   dtype=torch.float32,
@@ -307,10 +255,10 @@ class Dreamer(nn.Module):
 
         Args:
             replay_buffer: ReplayY instance.
-            carry_train: Tuple (stoch, deter, prev_action) from previous chunk.
+            carry_train: Placeholder tuple (unused).
 
         Returns:
-            carry_train: Updated carry state for the next chunk.
+            carry_train: Unchanged placeholder tuple.
             metrics: Dict of training metrics.
         """
         B = carry_train[0].shape[0]
@@ -331,7 +279,7 @@ class Dreamer(nn.Module):
         self._update_slow_target()
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, carry_train)
+            _, mets = self._cal_grad(p_data, carry_train)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self._log_grads:
             old_params = [
@@ -363,26 +311,14 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
         metrics.update(mets)
-        if self._use_transformer:
-            # Transformer sees complete episodes; no carry state to propagate.
-            new_carry = carry_train
-        else:
-            # Update carry_train with the endpoint latent state and last action.
-            # clone() is needed because stoch/deter are outputs of the CUDAGraph
-            # (torch.compile reduce-overhead); without cloning, the next graph
-            # replay would overwrite the memory that carry_train points to.
-            new_carry = (
-                stoch[:, -1].detach().clone(),
-                deter[:, -1].detach().clone(),
-                data["action"][:, -1].detach().clone(),
-            )
+        # Transformer sees complete episodes; no carry state to propagate.
+        new_carry = carry_train
         return new_carry, metrics
 
-    def _cal_grad(self, data, carry_train):
+    def _cal_grad(self, data, _carry_train):
         """Compute gradients for one batch.
 
-        Uses carry_train (stoch, deter, prev_action) from the previous chunk
-        instead of storing initial latent states in the replay buffer.
+        carry_train is unused and kept only for trainer API compatibility.
         t_mask from data masks out zero-padded positions.
 
         Notes
@@ -391,7 +327,6 @@ class Dreamer(nn.Module):
         1) World model loss (dynamics + representation)
         2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
         3) Imagination rollouts for actor-critic updates
-        4) Replay-based value learning
         """
         # t_mask: (B, T) bool — True for real data, False for padding
         t_mask = data["t_mask"].float()  # (B, T)
@@ -404,31 +339,17 @@ class Dreamer(nn.Module):
         # (B, T, E)
         embed = self.encoder(data)
 
-        if self._use_transformer:
-            # Transformer path: posterior from tokens, transition on (stoch, a_t)
-            action = data["action"]  # (B, T, A) — current action a_t
-            _, feat_dict = self.rssm.observe(embed, action, data["is_first"])
-            post_stoch = feat_dict['stoch']  # (B, T, S, K)
-            post_deter = feat_dict['deter']  # (B, T, D) = h_prev
-            post_logit = feat_dict['post_logit']  # (B, T, S, K)
-            prior_logit = feat_dict['prior_logit']
-            dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
-                                                   self.kl_free)
-            losses["dyn"] = (dyn_loss * t_mask).mean()
-            losses["rep"] = (rep_loss * t_mask).mean()
-        else:
-            # GRU RSSM path: shifted prev_action, sequential observe
-            carry_stoch, carry_deter, carry_prev_action = carry_train
-            initial = (carry_stoch, carry_deter)
-            action = torch.cat(
-                [carry_prev_action.unsqueeze(1), data["action"][:, :-1]], dim=1)
-            post_stoch, post_deter, post_logit = self.rssm.observe(
-                embed, action, initial, data["is_first"])
-            _, prior_logit = self.rssm.prior(post_deter)
-            dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
-                                                   self.kl_free)
-            losses["dyn"] = (dyn_loss * t_mask).mean()
-            losses["rep"] = (rep_loss * t_mask).mean()
+        # Transformer path: posterior from tokens, transition on (stoch, a_t)
+        action = data["action"]  # (B, T, A) — current action a_t
+        _, feat_dict = self.rssm.observe(embed, action, data["is_first"])
+        post_stoch = feat_dict['stoch']  # (B, T, S, K)
+        post_deter = feat_dict['deter']  # (B, T, D) = h_prev
+        post_logit = feat_dict['post_logit']  # (B, T, S, K)
+        prior_logit = feat_dict['prior_logit']
+        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
+                                               self.kl_free)
+        losses["dyn"] = (dyn_loss * t_mask).mean()
+        losses["rep"] = (rep_loss * t_mask).mean()
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
@@ -474,29 +395,19 @@ class Dreamer(nn.Module):
             self.rssm.get_dist(post_logit).entropy())
 
         # === Imagination rollout for actor-critic ===
-        if self._use_transformer:
-            start_stoch, start_deter, imag_carry, imag_mask = self._prepare_transformer_imag_start(
-                post_stoch.detach(),
-                post_deter.detach(),
-                feat_dict["kv_k"],
-                feat_dict["kv_v"],
-                t_mask,
-                T,
-            )
-            imag_feat, imag_action = self._imagine(
-                (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
-            imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-        else:
-            # (B*T, S, K), (B*T, D)
-            start = (
-                post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
-                post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
-            )
-            imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
-            imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-            imag_mask = t_mask.reshape(B * T, 1, 1)
+        start_stoch, start_deter, imag_carry, imag_mask = self._prepare_transformer_imag_start(
+            post_stoch.detach(),
+            post_deter.detach(),
+            feat_dict["kv_k"],
+            feat_dict["kv_v"],
+            t_mask,
+            T,
+        )
+        imag_feat, imag_action = self._imagine(
+            (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
+        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
-        # (N, T_imag, 1) where N = B*K (transformer) or B*T (rssm)
+        # (N, T_imag, 1) where N = B*K sampled imagination starts.
         imag_reward = self._frozen_reward(imag_feat).mode()
         imag_cont = self._frozen_cont(imag_feat).mean
         imag_value = self._frozen_value(imag_feat).mode()
@@ -541,36 +452,6 @@ class Dreamer(nn.Module):
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
 
-        if False:
-            # === Replay-based value learning (keep gradients through world model) ===
-            last, term, reward = (
-                to_f32(data["is_last"]).unsqueeze(-1),
-                to_f32(data["is_terminal"]).unsqueeze(-1),
-                to_f32(data["reward"]).unsqueeze(-1),
-            )
-            feat = self.rssm.get_feat(post_stoch, post_deter)
-            boot = ret[:, 0].reshape(B, T, 1)
-            value = self._frozen_value(feat).mode()
-            slow_value = self._frozen_slow_value(feat).mode()
-            disc = 1 - 1 / self.horizon
-            weight = 1.0 - last
-            ret = self._lambda_return(last, term, reward, value, boot, disc,
-                                      self.lamb)
-            ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
-
-            # Keep this attached to the world model so gradients can flow through
-            value_dist = self.value(feat)
-            repval_loss = (weight[:, :-1] * (
-                -value_dist.log_prob(ret_padded.detach()) -
-                value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1))
-            # Mask repval by t_mask[:, :-1] (repval has shape (B, T-1, 1))
-            repval_mask = t_mask[:, :-1].unsqueeze(-1)  # (B, T-1, 1)
-            losses["repval"] = (repval_loss * repval_mask).mean()
-            # log
-            metrics.update(tools.tensorstats(ret, "ret_replay"))
-            metrics.update(tools.tensorstats(value, "value_replay"))
-            metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
-
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
         self._scaler.scale(total_loss).backward()
 
@@ -586,8 +467,10 @@ class Dreamer(nn.Module):
         K = min(self.imag_last if self.imag_last > 0 else T, T)
 
         # Compute max episode length from t_mask to avoid sampling from padding
-        max_eps_len = int(t_mask.sum(dim=1).max().item())  # max valid length in batch
-        s0 = torch.randint(0, max_eps_len - K + 1, ()).item() if K < max_eps_len else 0
+        max_eps_len = int(
+            t_mask.sum(dim=1).max().item())  # max valid length in batch
+        s0 = torch.randint(0, max_eps_len - K + 1,
+                           ()).item() if K < max_eps_len else 0
 
         # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
@@ -598,8 +481,7 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def _imagine(self, start, imag_horizon, imag_carry=None):
         """Roll out the policy in latent space."""
-        if self._use_transformer:
-            assert imag_carry is not None
+        assert imag_carry is not None
         # (B, S, K), (B, D)
         feats = []
         actions = []
@@ -612,11 +494,8 @@ class Dreamer(nn.Module):
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
-            if self._use_transformer:
-                stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(
-                    stoch, imag_carry, action)
-            else:
-                stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
+            stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(
+                stoch, imag_carry, action)
 
         # Stack along sequence dim T_imag.
         # (B, T_imag, F), (B, T_imag, A)
