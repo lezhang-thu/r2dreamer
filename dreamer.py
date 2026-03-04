@@ -332,8 +332,8 @@ class Dreamer(nn.Module):
             sub = data[start:end]
             yield sub, float(end - start) / float(B)
 
-    def _iter_start_chunks(self, start_stoch, start_deter, imag_carry, imag_mask,
-                           accum_steps):
+    def _iter_start_chunks(self, start_stoch, start_deter, imag_carry,
+                           imag_mask, accum_steps):
         """Yield imagination-start chunks and their batch-fraction weights."""
         N = int(start_stoch.shape[0])
         splits = min(max(1, int(accum_steps)), max(1, N))
@@ -512,15 +512,17 @@ class Dreamer(nn.Module):
                                          dtype=torch.float32,
                                          device=self.device)
                 target[name] = target.get(
-                    name, torch.zeros((), dtype=torch.float32,
-                                      device=self.device))
+                    name,
+                    torch.zeros((), dtype=torch.float32, device=self.device))
                 target[name] = target[name] + value.detach() * float(weight)
 
         # Phase 1: world model (possibly chunked over batch) + backward.
-        for wm_data, wm_weight in self._iter_batch_chunks(data,
-                                                          self.wm_accum_steps):
-            wm_losses, wm_metrics, imag_cache = self._world_model_forward(wm_data)
-            wm_total = sum([self._loss_scales[k] * v for k, v in wm_losses.items()])
+        for wm_data, wm_weight in self._iter_batch_chunks(
+                data, self.wm_accum_steps):
+            wm_losses, wm_metrics, imag_cache = self._world_model_forward(
+                wm_data)
+            wm_total = sum(
+                [self._loss_scales[k] * v for k, v in wm_losses.items()])
             self._scaler.scale(wm_total * wm_weight).backward()
             opt_loss = opt_loss + wm_total.detach() * wm_weight
             _accum(losses, wm_losses, wm_weight)
@@ -544,9 +546,9 @@ class Dreamer(nn.Module):
                         self.ac_accum_steps):
                     ac_losses, ac_metrics = self._actor_critic_forward(
                         s_stoch, s_deter, s_carry, s_mask)
-                    ac_total = (self._loss_scales["policy"] *
-                                ac_losses["policy"] + self._loss_scales["value"] *
-                                ac_losses["value"])
+                    ac_total = (
+                        self._loss_scales["policy"] * ac_losses["policy"] +
+                        self._loss_scales["value"] * ac_losses["value"])
                     grad_weight = wm_weight * s_weight
                     self._scaler.scale(ac_total * grad_weight).backward()
                     opt_loss = opt_loss + ac_total.detach() * grad_weight
@@ -566,16 +568,20 @@ class Dreamer(nn.Module):
         B = post_stoch.shape[0]
         K = min(self.imag_last if self.imag_last > 0 else T, T)
 
-        # Compute max episode length from t_mask to avoid sampling from padding
-        max_eps_len = int(
-            t_mask.sum(dim=1).max().item())  # max valid length in batch
-        s0 = torch.randint(0, max_eps_len - K + 1,
-                           ()).item() if K < max_eps_len else 0
+        # Sample per-episode contiguous starts to increase imagination diversity.
+        # start[b] is uniform in [0, eps_len[b]-K], clamped at 0.
+        eps_len = t_mask.to(torch.int64).sum(dim=1)  # (B,)
+        max_start = torch.clamp(eps_len - K, min=0)  # (B,)
+        start = torch.floor(
+            torch.rand(B, device=t_mask.device) *
+            (max_start.to(torch.float32) + 1.0)).to(torch.int64)  # (B,)
 
-        # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
-            post_stoch, post_deter, kv_k, kv_v, s0, K)
-        imag_mask = t_mask[:, s0:s0 + K].reshape(B * K, 1, 1)
+            post_stoch, post_deter, kv_k, kv_v, start, K)
+        idx = start.unsqueeze(1) + torch.arange(
+            K, device=t_mask.device).unsqueeze(0)  # (B, K)
+        imag_mask = torch.gather(t_mask.to(torch.float32), 1,
+                                 idx).reshape(B * K, 1, 1)
         return start_stoch, start_deter, imag_carry, imag_mask
 
     @torch.no_grad()

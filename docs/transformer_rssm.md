@@ -47,13 +47,12 @@ Training (observe path):
 
 1. `post_logit = _post_head(tokens)` and sample posterior `stoch`.
 2. Build transformer inputs from `(stoch, action)`.
-3. Run windowed-causal transformer (`_fwd`) over the full sequence, where each
-   step attends to at most `window_size` recent steps (including itself).
+3. Run causal transformer (`_fwd`) over the full sequence, where each
+   step attends causally over the full sequence (`window_size == T` mode).
 4. Shift-right to get `h_prev`.
 5. `prior_logit = _prior_head(h_prev)`.
-6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) with `window_size`
-   prepended dummy zero slots for efficient imagination-start construction
-   without replaying history.
+6. Return detached raw trajectory KV tensors (`kv_k`, `kv_v`) for efficient
+   imagination-start construction without replaying history.
 
 Posterior is conditioned on `tokens` only. It does **not** take `h_prev`.
 
@@ -69,9 +68,8 @@ Given current latent `(stoch_t, h_prev_t)` and action `a_t`:
 Carry keeps only `window_size` past steps, matching inference memory behavior.
 During training, starts are built from `observe()`-returned trajectory KV tensors
 for contiguous `K` offsets (`B*K` parallel starts), so no extra history replay is
-needed in `_cal_grad`. `window_size` dummy all-zero KV slots are prepended
-before start-window extraction so imagination uses the same zero-cache style as
-`initial()` in policy inference.
+needed in `_cal_grad`. History windows are zero-left-padded on demand when
+constructing imagination starts.
 
 ### 3. Policy inference: two-phase KV-cache
 
@@ -96,6 +94,7 @@ imag_last: 64
 wm_accum_steps: 1
 ac_accum_steps: 1
 ac_repeats: 1
+enforce_full_history_window: False
 
 transformer:
   stoch: ${model.rssm.stoch}
@@ -131,6 +130,8 @@ python3 train.py model.compile=False batch_length=500 \
 - Training can split world-model and actor-critic gradients across chunks
   (`wm_accum_steps`, `ac_accum_steps`) and repeat actor-critic imagination
   updates with different random starts per replay batch (`ac_repeats`).
+- `enforce_full_history_window=True` enforces
+  `window_size == batch_length == max_env_steps + 1` at startup.
 - Training assumes complete trajectories (no concatenation of different
   trajectories inside one sampled sequence).
 - RoPE uses a modern cached implementation with dynamic cache growth if

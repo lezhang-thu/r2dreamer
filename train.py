@@ -38,13 +38,26 @@ def main(config):
 
     max_env_steps = int(config.env.time_limit // config.env.action_repeat)
     need_batch_length = max_env_steps + 1
-    if int(config.batch_length) < need_batch_length:
+    batch_length = int(config.batch_length)
+    if batch_length < need_batch_length:
         raise AssertionError("config.batch_length must be >= max env steps + 1 "
-                             f"(got batch_length={int(config.batch_length)}, "
+                             f"(got batch_length={batch_length}, "
                              f"max_env_steps={max_env_steps}, "
                              f"required={need_batch_length}, "
                              f"time_limit={int(config.env.time_limit)}, "
                              f"action_repeat={int(config.env.action_repeat)}).")
+    if bool(getattr(config.model, "enforce_full_history_window", False)):
+        window_size = int(config.model.transformer.window_size)
+        if batch_length != need_batch_length:
+            raise AssertionError(
+                "Full-history mode requires batch_length == max env steps + 1 "
+                f"(got batch_length={batch_length}, required={need_batch_length})."
+            )
+        if window_size != batch_length:
+            raise AssertionError(
+                "Full-history mode requires model.transformer.window_size == batch_length "
+                f"(got window_size={window_size}, batch_length={batch_length})."
+            )
 
     replay_buffer = ReplayY(
         length=int(config.batch_length),

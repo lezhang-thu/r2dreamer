@@ -12,6 +12,7 @@ imag_last: 64          # 0 = all T positions; >0 = K contiguous positions
 wm_accum_steps: 1      # split replay batch for world-model grad accumulation
 ac_accum_steps: 1      # split imagination starts for actor-critic grad accumulation
 ac_repeats: 1          # repeated AC imagination updates per world-model pass
+enforce_full_history_window: False  # require window_size == batch_length == max_env_steps+1
 
 lr: 4e-5
 agc: 0.3

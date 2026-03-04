@@ -60,6 +60,7 @@ for task in "${tasks[@]}"; do
 			buffer.storage_device=cpu \
 			model=size12M \
 			model.rep_loss=${METHOD} \
+			model.enforce_full_history_window=True \
 			model.transformer.window_size=$WINDOW_SIZE \
 			model.imag_last=$IMAG_LAST \
 			model.ac_repeats=$AC_REPEATS \

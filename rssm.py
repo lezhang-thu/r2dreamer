@@ -125,7 +125,7 @@ class TransformerRSSM(nn.Module):
     # ------------------------------------------------------------------
 
     def observe(self, tokens, action, reset):
-        """Windowed-causal full-sequence training path.
+        """Causal full-sequence training path.
 
         Args:
             tokens: (B, T, E) encoder embeddings.
@@ -161,30 +161,16 @@ class TransformerRSSM(nn.Module):
         prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
 
         entries = {'deter': h_prev, 'stoch': stoch}
-        B, L, T, D = kv['k'].shape
-        dummy_k = torch.zeros(B,
-                              L,
-                              self._window_size,
-                              D,
-                              dtype=kv['k'].dtype,
-                              device=kv['k'].device)
-        dummy_v = torch.zeros(B,
-                              L,
-                              self._window_size,
-                              D,
-                              dtype=kv['v'].dtype,
-                              device=kv['v'].device)
         feat = {
             'deter': h_prev,
             'stoch': stoch,
             'post_logit': post_logit,
             'prior_logit': prior_logit,
             # Detached to avoid expanding the autograd graph.
-            # Prepend W dummy zero-KV slots to match initial() cache style.
-            'kv_k': torch.cat([dummy_k, kv['k']],
-                              dim=2).detach(),  # (B, L, T+W, D)
-            'kv_v': torch.cat([dummy_v, kv['v']],
-                              dim=2).detach(),  # (B, L, T+W, D)
+            # Keep raw trajectory KV tensors; imagination starts build
+            # zero-left-padded history windows on demand.
+            'kv_k': kv['k'].detach(),  # (B, L, T, D)
+            'kv_v': kv['v'].detach(),  # (B, L, T, D)
         }
         return entries, feat
 
@@ -276,9 +262,9 @@ class TransformerRSSM(nn.Module):
         Args:
             stoch_seq: (B, T, S, Kcat)
             deter_seq: (B, T, D) h_prev sequence
-            kv_k: (B, L, T+W, D) cached keys with W prepended dummy slots
-            kv_v: (B, L, T+W, D) cached values with W prepended dummy slots
-            start: int start index s0
+            kv_k: (B, L, T, D) trajectory cached keys
+            kv_v: (B, L, T, D) trajectory cached values
+            start: int or (B,) int64 start indices s0
             length: int number of contiguous starts K
         Returns:
             start_stoch: (B*K, S, Kcat)
@@ -288,33 +274,59 @@ class TransformerRSSM(nn.Module):
         B, T = stoch_seq.shape[:2]
         L = kv_k.shape[1]
         W = self._window_size
-        start = int(start)
         length = int(length)
-        assert 0 <= start < T
-        assert length >= 1 and start + length <= T
-        assert kv_k.shape == (B, L, T + W, self._deter)
-        assert kv_v.shape == (B, L, T + W, self._deter)
+        assert length >= 1
+        assert kv_k.shape == (B, L, T, self._deter)
+        assert kv_v.shape == (B, L, T, self._deter)
 
-        stoch_list, deter_list, cache_list, pos_list = [], [], [], []
+        if isinstance(start, int):
+            start_idx = torch.full((B,),
+                                   int(start),
+                                   dtype=torch.int64,
+                                   device=stoch_seq.device)
+        else:
+            start_idx = start.to(dtype=torch.int64, device=stoch_seq.device)
+            assert start_idx.shape == (B,)
+        start_idx = start_idx.clamp_(0, T - length)
 
-        for s in range(start, start + length):
-            # Right-aligned window over history [s-W, ..., s-1].
-            # With W leading dummy slots, this is simply [s, ..., s+W-1].
-            k_slice = kv_k[:, :, s:s + W, :]  # (B, L, W, D)
-            v_slice = kv_v[:, :, s:s + W, :]  # (B, L, W, D)
-            kv_cache = torch.stack([k_slice, v_slice], dim=2)  # (B,L,2,W,D)
+        # Per-episode contiguous starts: s[b, j] = start_idx[b] + j.
+        offs = torch.arange(length, device=stoch_seq.device, dtype=torch.int64)
+        s = start_idx.unsqueeze(1) + offs.unsqueeze(0)  # (B, K)
 
-            stoch_list.append(stoch_seq[:, s])
-            deter_list.append(deter_seq[:, s])
-            cache_list.append(kv_cache)
-            pos_list.append(
-                torch.full((B,), s, dtype=torch.int32, device=stoch_seq.device))
+        # Gather start stochastic/deterministic states.
+        idx_stoch = s.unsqueeze(-1).unsqueeze(-1).expand(
+            B, length, stoch_seq.shape[2], stoch_seq.shape[3])
+        idx_deter = s.unsqueeze(-1).expand(B, length, deter_seq.shape[2])
+        start_stoch = torch.gather(stoch_seq, 1, idx_stoch).reshape(
+            B * length, *stoch_seq.shape[2:])  # (B*K,S,Kcat)
+        start_deter = torch.gather(deter_seq, 1, idx_deter).reshape(
+            B * length, deter_seq.shape[2])  # (B*K,D)
 
-        start_stoch = torch.cat(stoch_list, dim=0)  # (B*K, S, Kcat)
-        start_deter = torch.cat(deter_list, dim=0)  # (B*K, D)
+        # Build right-aligned history windows [s-W, ..., s-1] with zero-left
+        # padding for positions < 0.
+        hist_pos = s.unsqueeze(-1) - W + torch.arange(
+            W, device=stoch_seq.device, dtype=torch.int64).view(1, 1, W)
+        valid = (hist_pos >= 0)  # (B, K, W)
+        hist_pos = hist_pos.clamp_(0, T - 1)
+
+        # Gather history K/V for all (B, K) starts at once using advanced
+        # indexing over batch and time: output (B, K, W, L, D).
+        b_idx = torch.arange(B, device=stoch_seq.device).view(B, 1, 1)
+        k_hist = kv_k[b_idx, :, hist_pos, :]
+        v_hist = kv_v[b_idx, :, hist_pos, :]
+        valid_mask = valid.unsqueeze(-1).unsqueeze(-1).to(k_hist.dtype)
+        k_hist = k_hist * valid_mask
+        v_hist = v_hist * valid_mask
+
+        # Reorder then flatten starts: (B, K, W, L, D) -> (B*K, L, W, D)
+        k_hist = k_hist.permute(0, 1, 3, 2, 4).reshape(B * length, L, W,
+                                                       self._deter)
+        v_hist = v_hist.permute(0, 1, 3, 2, 4).reshape(B * length, L, W,
+                                                       self._deter)
+        pos = s.reshape(B * length).to(torch.int32)
         carry = {
-            'kv_cache': torch.cat(cache_list, dim=0),  # (B*K,L,2,W,D)
-            'pos': torch.cat(pos_list, dim=0).to(torch.int32),  # (B*K,)
+            'kv_cache': torch.stack([k_hist, v_hist], dim=2),  # (B*K,L,2,W,D)
+            'pos': pos,  # (B*K,)
             'h_prev': start_deter,
         }
         return start_stoch, start_deter, carry
