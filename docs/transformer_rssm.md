@@ -124,8 +124,8 @@ python3 train.py model.compile=False batch_length=500
   imagination context limits.
 - In imagination/inference, dynamics are rolled with a bounded KV window to
   control memory.
-- Training assumes complete trajectories (no concatenation of different
-  trajectories inside one sampled sequence).
+- Training samples contiguous trajectory segments and never concatenates
+  different trajectories inside one sampled sequence.
 - RoPE uses a modern cached implementation with dynamic cache growth if
   positions exceed `rope_max_seq_len`.
 - `post_head` and `prior_head` are now multi-layer MLP heads (Linear + RMSNorm

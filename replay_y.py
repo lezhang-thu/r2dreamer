@@ -40,7 +40,6 @@ class ReplayY:
             return
         # Stack individual step dicts into a single episode dict of arrays.
         ep = {k: np.stack([s[k] for s in episode]) for k in episode[0]}
-        ep_len = len(episode)
         with self.lock:
             self.eps[self.write_pos] = ep
             self.write_pos = (self.write_pos + 1) % self.capacity
@@ -53,34 +52,43 @@ class ReplayY:
         if not valid:
             raise RuntimeError(
                 "ReplayY.sample() called with no complete episodes.")
-
-        sampled_eps = [
-            valid[self.rng.integers(0, len(valid))] for _ in range(batch)
-        ]
-        ep_lens = [len(next(iter(ep.values()))) for ep in sampled_eps]
-        max_len = max(ep_lens)
-        if max_len > L:
-            raise ValueError(
-                f"ReplayY length={L} is smaller than sampled complete episode "
-                f"length={max_len}. Increase batch_length to avoid truncation.")
+        ep_lens = np.asarray([len(next(iter(ep.values()))) for ep in valid],
+                             dtype=np.int64)
+        segment_counts = np.maximum(ep_lens - L + 1, 1)
+        segment_offsets = np.cumsum(segment_counts)
+        total_segments = int(segment_offsets[-1])
+        sampled_segments = self.rng.integers(0, total_segments, size=batch)
 
         seqs = []
-        for ep, ep_len in zip(sampled_eps, ep_lens):
-            pad_len = L - ep_len
+        valid_lens = []
+        for seg_id in sampled_segments:
+            ep_index = int(np.searchsorted(segment_offsets, seg_id, side="right"))
+            prev_offset = 0 if ep_index == 0 else int(segment_offsets[ep_index -
+                                                                      1])
+            start = int(seg_id - prev_offset)
+            ep = valid[ep_index]
+            ep_len = int(ep_lens[ep_index])
+            stop = min(start + L, ep_len)
+            valid_len = stop - start
+
             item = {}
             for k, v in ep.items():
-                arr = v
-                if pad_len > 0:
-                    pad = np.zeros((pad_len, *v.shape[1:]), dtype=v.dtype)
+                arr = v[start:stop]
+                if valid_len < L:
+                    pad = np.zeros((L - valid_len, *v.shape[1:]), dtype=v.dtype)
                     arr = np.concatenate([arr, pad], axis=0)
                 item[k] = arr
             seqs.append(item)
+            valid_lens.append(valid_len)
 
         data = {k: np.stack([s[k] for s in seqs]) for k in seqs[0]}
 
         # t_mask[i, t] = True iff step t is real (not padding).
         t_mask = np.zeros((batch, L), dtype=bool)
-        for i, ep_len in enumerate(ep_lens):
-            t_mask[i, :ep_len] = True
+        for i, valid_len in enumerate(valid_lens):
+            t_mask[i, :valid_len] = True
         data["t_mask"] = t_mask
+
+        if "is_first" in data:
+            data["is_first"][:, 0] = True
         return data

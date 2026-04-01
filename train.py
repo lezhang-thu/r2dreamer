@@ -36,15 +36,9 @@ def main(config):
     # save config
     logger.log_hydra_config(config)
 
-    max_env_steps = int(config.env.time_limit // config.env.action_repeat)
-    need_batch_length = max_env_steps + 1
-    if int(config.batch_length) < need_batch_length:
-        raise AssertionError("config.batch_length must be >= max env steps + 1 "
-                             f"(got batch_length={int(config.batch_length)}, "
-                             f"max_env_steps={max_env_steps}, "
-                             f"required={need_batch_length}, "
-                             f"time_limit={int(config.env.time_limit)}, "
-                             f"action_repeat={int(config.env.action_repeat)}).")
+    if int(config.batch_length) < 1:
+        raise AssertionError("config.batch_length must be >= 1 "
+                             f"(got batch_length={int(config.batch_length)}).")
 
     replay_buffer = ReplayY(
         length=int(config.batch_length),

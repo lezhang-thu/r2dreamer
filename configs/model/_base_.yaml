@@ -8,7 +8,7 @@ log_grads: False
 device: ${device}
 rep_loss: "r2dreamer"  # r2dreamer/dreamer
 #imag_last: 0          # 0 = all T positions; >0 = K contiguous positions
-imag_last: 64          # 0 = all T positions; >0 = K contiguous positions
+imag_last: 16          # 0 = all T positions; >0 = K contiguous positions
 imag_ac_steps: 1       # actor-critic imagination grad-acc steps per world-model update
 
 lr: 4e-5

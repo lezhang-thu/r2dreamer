@@ -253,8 +253,9 @@ class Dreamer(nn.Module):
     def update(self, replay_buffer, carry_train):
         """Sample a batch from replay and perform one optimization step.
 
-        ReplayY provides complete trajectories (padded, no concatenation across
-        trajectories). carry_train is kept for interface compatibility.
+        ReplayY provides contiguous single-trajectory segments (zero-padded
+        only when the sampled episode is shorter than batch_length).
+        carry_train is kept for interface compatibility.
 
         Args:
             replay_buffer: ReplayY instance.
@@ -314,7 +315,7 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
         metrics.update(mets)
-        # Transformer sees complete episodes; no carry state to propagate.
+        # Replay segments are independent across training batches.
         new_carry = carry_train
         return new_carry, metrics
 
