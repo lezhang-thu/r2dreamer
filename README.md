@@ -4,7 +4,10 @@ This repository provides a PyTorch implementation of [R2-Dreamer][r2dreamer] (IC
 
 ## Instructions
 
-Install dependencies (tested with Ubuntu 24.04 and Python 3.11):
+Install dependencies. This repository is tested with Ubuntu 24.04 and Python 3.11.
+
+If you prefer Docker, follow [`docs/docker.md`](docs/docker.md).
+
 ```bash
 # Installing via a virtual env like uv is recommended.
 pip install -r requirements.txt
@@ -63,7 +66,6 @@ export MUJOCO_EGL_DEVICE_ID=0
 ```
 
 More details: [Working with MuJoCo-based environments](https://docs.pytorch.org/rl/stable/reference/generated/knowledge_base/MUJOCO_INSTALLATION.html)
-
 
 ## Code formatting
 
