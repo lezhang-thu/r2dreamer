@@ -521,22 +521,45 @@ class Dreamer(nn.Module):
         """Prepare transformer imagination starts from trajectory KV tensors."""
         B = post_stoch.shape[0]
         K = min(self.imag_last if self.imag_last > 0 else T, T)
-
-        # Compute max episode length from t_mask to avoid sampling from padding
-        max_eps_len = int(
-            t_mask.sum(dim=1).max().item())  # max valid length in batch
-        max_start = max(max_eps_len - K, 0)
-        if s0 is None:
-            s0 = torch.randint(0, max_start + 1,
-                               ()).item() if max_start > 0 else 0
-        else:
-            s0 = max(0, min(int(s0), max_start))
+        valid_lens = torch.clamp(t_mask.sum(dim=1).to(torch.int64), min=1)
+        starts = self._sample_valid_imag_starts(valid_lens,
+                                                K,
+                                                t_mask.device,
+                                                s0=s0)
 
         # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
-            post_stoch, post_deter, kv_k, kv_v, s0, K)
-        imag_mask = t_mask[:, s0:s0 + K].reshape(B * K, 1, 1)
+            post_stoch, post_deter, kv_k, kv_v, starts)
+        imag_mask = torch.ones((B * K, 1, 1),
+                               dtype=t_mask.dtype,
+                               device=t_mask.device)
         return start_stoch, start_deter, imag_carry, imag_mask
+
+    @torch.no_grad()
+    def _sample_valid_imag_starts(self, valid_lens, K, device, s0=None):
+        """Sample K valid imagination starts independently per episode."""
+        offsets = torch.arange(K, device=device)
+        starts = []
+        base = None if s0 is None else int(s0)
+        for valid_len_t in valid_lens:
+            valid_len = int(valid_len_t.item())
+            if valid_len >= K:
+                if base is None:
+                    start0 = torch.randint(0,
+                                           valid_len - K + 1, (),
+                                           device=device)
+                    starts.append(start0 + offsets)
+                else:
+                    start0 = max(0, min(base, valid_len - K))
+                    starts.append(torch.arange(start0, start0 + K,
+                                               device=device))
+            else:
+                if base is None:
+                    starts.append(
+                        torch.randint(0, valid_len, (K,), device=device))
+                else:
+                    starts.append((offsets + (base % valid_len)) % valid_len)
+        return torch.stack(starts, dim=0)
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon, imag_carry=None):
