@@ -319,6 +319,37 @@ class Dreamer(nn.Module):
         new_carry = carry_train
         return new_carry, metrics
 
+    @staticmethod
+    def _masked_mean(x, mask):
+        """Average over valid elements only, supporting broadcastable masks."""
+        mask = mask.to(dtype=x.dtype)
+        if mask.shape != x.shape:
+            mask = torch.broadcast_to(mask, x.shape)
+        denom = mask.sum().clamp_min(1.0)
+        return (x * mask).sum() / denom
+
+    @staticmethod
+    def _masked_barlow_loss(x1, x2, flat_mask, lambd, eps=1e-8):
+        """Compute Barlow Twins loss using only valid rows."""
+        flat_mask = flat_mask.to(dtype=x1.dtype)
+        count = flat_mask.sum().clamp_min(1.0)
+
+        x1_mean = (x1 * flat_mask).sum(0) / count
+        x2_mean = (x2 * flat_mask).sum(0) / count
+        x1_centered = (x1 - x1_mean) * flat_mask
+        x2_centered = (x2 - x2_mean) * flat_mask
+
+        x1_var = x1_centered.pow(2).sum(0) / count
+        x2_var = x2_centered.pow(2).sum(0) / count
+        x1_norm = x1_centered / torch.sqrt(x1_var + eps)
+        x2_norm = x2_centered / torch.sqrt(x2_var + eps)
+
+        c = torch.mm(x1_norm.T, x2_norm) / count
+        invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
+        off_diag_mask = ~torch.eye(c.shape[0], dtype=torch.bool, device=c.device)
+        redundancy_loss = c[off_diag_mask].pow(2).sum()
+        return invariance_loss + lambd * redundancy_loss
+
     def _cal_grad(self, data, _carry_train):
         """Compute gradients for one batch.
 
@@ -353,8 +384,8 @@ class Dreamer(nn.Module):
         prior_logit = feat_dict['prior_logit']
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
                                                self.kl_free)
-        losses["dyn"] = (dyn_loss * t_mask).mean()
-        losses["rep"] = (rep_loss * t_mask).mean()
+        losses["dyn"] = self._masked_mean(dyn_loss, t_mask)
+        losses["rep"] = self._masked_mean(rep_loss, t_mask)
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
@@ -366,33 +397,24 @@ class Dreamer(nn.Module):
                 # Reduce all dims except (B, T) then mask
                 while per_step.dim() > 2:
                     per_step = per_step.sum(-1)
-                losses[key] = (per_step * t_mask).mean()
+                losses[key] = self._masked_mean(per_step, t_mask)
         elif self.rep_loss == "r2dreamer":
             # R2-Dreamer: Barlow Twins redundancy reduction.
-            # Zero out padded positions to keep static shapes for CUDAGraphs.
             flat_mask = t_mask.reshape(B * T, 1)  # (B*T, 1)
-            x1 = self.prj(feat.reshape(B * T, -1)) * flat_mask
-            x2 = embed.reshape(B * T, -1).detach() * flat_mask
-            x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
-            x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
-
-            c = torch.mm(x1_norm.T, x2_norm) / (B * T)
-            invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
-            off_diag_mask = ~torch.eye(
-                x1.shape[-1], dtype=torch.bool, device=x1.device)
-            redundancy_loss = c[off_diag_mask].pow(2).sum()
-            losses[
-                "barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+            x1 = self.prj(feat.reshape(B * T, -1))
+            x2 = embed.reshape(B * T, -1).detach()
+            losses["barlow"] = self._masked_barlow_loss(
+                x1, x2, flat_mask, self.barlow_lambd)
         else:
             raise NotImplementedError
 
         # reward and continue — masked
         rew_loss = -self.reward(feat).log_prob(
             to_f32(data["reward"]).unsqueeze(-1))  # (B, T)
-        losses["rew"] = (rew_loss * t_mask).mean()
+        losses["rew"] = self._masked_mean(rew_loss, t_mask)
         cont = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         con_loss = -self.cont(feat).log_prob(cont)  # (B, T)
-        losses["con"] = (con_loss * t_mask).mean()
+        losses["con"] = self._masked_mean(con_loss, t_mask)
         # log
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())
@@ -452,7 +474,7 @@ class Dreamer(nn.Module):
             entropy = policy.entropy()[:, :-1].unsqueeze(-1)
             policy_loss = weight[:, :-1].detach() * -(
                 logpi * adv.detach() + self.act_entropy * entropy)
-            policy_loss = (policy_loss * imag_mask).mean()
+            policy_loss = self._masked_mean(policy_loss, imag_mask)
 
             imag_value_dist = self.value(imag_feat)
             tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
@@ -460,7 +482,7 @@ class Dreamer(nn.Module):
                           (-imag_value_dist.log_prob(tar_padded.detach()) -
                            imag_value_dist.log_prob(
                                imag_slow_value.detach()))[:, :-1].unsqueeze(-1))
-            value_loss = (value_loss * imag_mask).mean()
+            value_loss = self._masked_mean(value_loss, imag_mask)
 
             # Average accumulated actor-critic gradients to emulate a larger batch.
             ac_loss = (self._loss_scales["policy"] * policy_loss +
