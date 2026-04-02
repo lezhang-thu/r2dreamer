@@ -50,9 +50,12 @@ transformer:
   post_layers: 1
   prior_layers: 2
   n_heads: 8
-  n_layers: 4
-  d_ff: 4096
-  window_size: 64
+  #n_layers: 4
+  n_layers: 6
+  #d_ff: 4096
+  d_ff: 2048
+  #window_size: 64
+  window_size: 512
   device: ${device}
 
 encoder:

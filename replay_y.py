@@ -25,6 +25,15 @@ class ReplayY:
         # self.length, so every non-None slot is valid).
         return sum(1 for ep in self.eps if ep is not None)
 
+    def num_segments(self):
+        with self.lock:
+            valid = [ep for ep in self.eps if ep is not None]
+        if not valid:
+            return 0
+        ep_lens = np.asarray([len(next(iter(ep.values()))) for ep in valid],
+                             dtype=np.int64)
+        return int(np.maximum(ep_lens - self.length + 1, 1).sum())
+
     def add(self, step, worker=0):
         step = {k: v for k, v in step.items() if not k.startswith('log_')}
         step = {k: np.asarray(v) for k, v in step.items()}
@@ -62,7 +71,8 @@ class ReplayY:
         seqs = []
         valid_lens = []
         for seg_id in sampled_segments:
-            ep_index = int(np.searchsorted(segment_offsets, seg_id, side="right"))
+            ep_index = int(
+                np.searchsorted(segment_offsets, seg_id, side="right"))
             prev_offset = 0 if ep_index == 0 else int(segment_offsets[ep_index -
                                                                       1])
             start = int(seg_id - prev_offset)

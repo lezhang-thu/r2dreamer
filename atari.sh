@@ -49,9 +49,9 @@ for task in "${tasks[@]}"; do
 			model.compile=True \
 			device=cuda:0 \
 			buffer.storage_device=cpu \
-			model=size12M \
+			model=size-transformer \
 			model.rep_loss=${METHOD} \
 			seed=$seed \
-			batch_size=16 batch_length=64
+			batch_size=4 batch_length=512
 	done
 done
