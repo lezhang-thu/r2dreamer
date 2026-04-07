@@ -32,9 +32,6 @@ class Dreamer(nn.Module):
         self.imag_last = int(getattr(config, 'imag_last', 0))
         self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
         self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))
-        self.imag_ac_steps = int(getattr(config, "imag_ac_steps", 1))
-        if self.imag_ac_steps < 1:
-            raise ValueError("imag_ac_steps must be >= 1")
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -238,37 +235,20 @@ class Dreamer(nn.Module):
             },
             batch_size=(B,))
 
-    @torch.no_grad()
-    def get_initial_carry(self, B):
-        """Return initial carry_train state for chunked replay training.
-
-        carry_train is retained only for trainer API compatibility.
-        """
-        stoch = torch.zeros(B, dtype=torch.float32, device=self.device)
-        deter = torch.zeros(B, dtype=torch.float32, device=self.device)
-        prev_action = torch.zeros(B,
-                                  self.act_dim,
-                                  dtype=torch.float32,
-                                  device=self.device)
-        return (stoch, deter, prev_action)
-
-    def update(self, replay_buffer, carry_train):
+    def update(self, replay_buffer, batch_size):
         """Sample a batch from replay and perform one optimization step.
 
         ReplayY provides contiguous single-trajectory segments (zero-padded
         only when the sampled episode is shorter than batch_length).
-        carry_train is kept for interface compatibility.
 
         Args:
             replay_buffer: ReplayY instance.
-            carry_train: Placeholder tuple (unused).
+            batch_size: Number of replay segments to sample.
 
         Returns:
-            carry_train: Unchanged placeholder tuple.
             metrics: Dict of training metrics.
         """
-        B = carry_train[0].shape[0]
-        np_data = replay_buffer.sample(B)
+        np_data = replay_buffer.sample(int(batch_size))
         # Convert numpy data to torch tensors on device.
         data = {}
         for k, v in np_data.items():
@@ -285,7 +265,7 @@ class Dreamer(nn.Module):
         self._update_slow_target()
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            mets = self._cal_grad(p_data, carry_train)
+            mets = self._cal_grad(p_data)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self._log_grads:
             old_params = [
@@ -317,9 +297,7 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
         metrics.update(mets)
-        # Replay segments are independent across training batches.
-        new_carry = carry_train
-        return new_carry, metrics
+        return metrics
 
     @staticmethod
     def _masked_mean(x, mask):
@@ -498,10 +476,9 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(imag_action, "action"))
         return losses, metrics
 
-    def _cal_grad(self, data, _carry_train):
+    def _cal_grad(self, data):
         """Compute gradients for one batch.
 
-        carry_train is unused and kept only for trainer API compatibility.
         t_mask from data masks out zero-padded positions.
 
         Notes
@@ -509,8 +486,8 @@ class Dreamer(nn.Module):
         This function computes:
         1) World model loss (dynamics + representation)
         2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
-        3) Imagination rollouts for actor-critic updates (optionally repeated
-           with gradient accumulation)
+        3) Imagination rollouts for actor-critic updates with start-chunk
+           gradient accumulation
         """
         metrics = {}
         losses = {}
@@ -552,38 +529,36 @@ class Dreamer(nn.Module):
             _accum(losses, wm_losses, wm_loss_weight)
             _accum(metrics, wm_metrics, wm_batch_weight)
 
-            repeat_weight = wm_batch_weight / float(self.imag_ac_steps)
-            for _ in range(self.imag_ac_steps):
-                starts = self._sample_transformer_imag_starts(
-                    imag_source["valid_lens"],
-                    imag_source["T"],
+            starts = self._sample_transformer_imag_starts(
+                imag_source["valid_lens"],
+                imag_source["T"],
+            )
+            ac_losses = {}
+            ac_metrics = {}
+            for start_chunk, s_weight in self._iter_start_chunks(
+                    starts, self.ac_accum_steps):
+                s_weight = torch.tensor(s_weight,
+                                        dtype=torch.float32,
+                                        device=self.device)
+                s_stoch, s_deter, s_carry, s_mask = self._prepare_transformer_imag_start(
+                    imag_source["post_stoch"],
+                    imag_source["post_deter"],
+                    imag_source["kv_k"],
+                    imag_source["kv_v"],
+                    start_chunk,
                 )
-                rep_losses = {}
-                rep_metrics = {}
-                for start_chunk, s_weight in self._iter_start_chunks(
-                        starts, self.ac_accum_steps):
-                    s_weight = torch.tensor(s_weight,
-                                            dtype=torch.float32,
-                                            device=self.device)
-                    s_stoch, s_deter, s_carry, s_mask = self._prepare_transformer_imag_start(
-                        imag_source["post_stoch"],
-                        imag_source["post_deter"],
-                        imag_source["kv_k"],
-                        imag_source["kv_v"],
-                        start_chunk,
-                    )
-                    ac_losses, ac_metrics = self._actor_critic_forward(
-                        s_stoch, s_deter, s_carry, s_mask)
-                    ac_total = (
-                        self._loss_scales["policy"] * ac_losses["policy"] +
-                        self._loss_scales["value"] * ac_losses["value"])
-                    grad_weight = repeat_weight * s_weight
-                    self._scaler.scale(ac_total * grad_weight).backward()
-                    opt_loss = opt_loss + ac_total.detach() * grad_weight
-                    _accum(rep_losses, ac_losses, s_weight)
-                    _accum(rep_metrics, ac_metrics, s_weight)
-                _accum(losses, rep_losses, repeat_weight)
-                _accum(metrics, rep_metrics, repeat_weight)
+                chunk_losses, chunk_metrics = self._actor_critic_forward(
+                    s_stoch, s_deter, s_carry, s_mask)
+                ac_total = (
+                    self._loss_scales["policy"] * chunk_losses["policy"] +
+                    self._loss_scales["value"] * chunk_losses["value"])
+                grad_weight = wm_batch_weight * s_weight
+                self._scaler.scale(ac_total * grad_weight).backward()
+                opt_loss = opt_loss + ac_total.detach() * grad_weight
+                _accum(ac_losses, chunk_losses, s_weight)
+                _accum(ac_metrics, chunk_metrics, s_weight)
+            _accum(losses, ac_losses, wm_batch_weight)
+            _accum(metrics, ac_metrics, wm_batch_weight)
 
         metrics["wm_accum_steps"] = torch.tensor(
             float(self.wm_accum_steps),
@@ -591,10 +566,6 @@ class Dreamer(nn.Module):
         )
         metrics["ac_accum_steps"] = torch.tensor(
             float(self.ac_accum_steps),
-            device=self.device,
-        )
-        metrics["imag_ac_steps"] = torch.tensor(
-            float(self.imag_ac_steps),
             device=self.device,
         )
         metrics.update({
@@ -624,7 +595,7 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def _sample_transformer_imag_starts(self, valid_lens, T):
-        """Sample all imagination start indices for one AC repeat."""
+        """Sample all imagination start indices for one actor-critic update."""
         K = min(self.imag_last if self.imag_last > 0 else T, T)
         return self._sample_valid_imag_starts(valid_lens, K, valid_lens.device)
 

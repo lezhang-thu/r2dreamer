@@ -44,7 +44,6 @@ tensorboard --logdir ./logdir
 ## Key Patterns
 
 - **Tensor shape conventions:** B=batch, T=sequence, E=embedding, F=feature(S*K+D), S=stoch groups, K=categories, D=deter dim. See `docs/tensor_shapes.md`.
-- **Carry state:** `carry_train` is retained as an API-compatible placeholder in the trainer loop.
 - **Data masking:** `t_mask` (B,T) boolean mask handles padding in variable-length sequences; all losses are masked before reduction.
 - **Mixed precision:** BFloat16 compute with Float32 parameters. Optional `torch.compile` for further speedup.
 

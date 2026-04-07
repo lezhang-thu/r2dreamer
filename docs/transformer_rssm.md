@@ -68,7 +68,14 @@ Given current latent `(stoch_t, h_prev_t)` and action `a_t`:
 
 Carry keeps only `window_size` past steps, matching inference memory behavior.
 During training, starts are built from `observe()`-returned trajectory KV tensors
-for contiguous `K` offsets (`B*K` parallel starts), so no extra history replay is
+for `B*K` parallel starts with two sampling modes:
+- if an episode has at least `K` valid steps, one contiguous block of `K`
+  offsets is sampled;
+- if an episode is shorter than `K`, `K` valid indices are sampled
+  independently with replacement, so starts may repeat or be out of order.
+
+`build_imag_starts()` handles both cases by gathering latent state and KV-cache
+windows independently for each sampled start, so no extra history replay is
 needed in `_cal_grad`. `window_size` dummy all-zero KV slots are prepended
 before start-window extraction so imagination uses the same zero-cache style as
 `initial()` in policy inference.

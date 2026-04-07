@@ -124,9 +124,6 @@ class OnlineTrainer:
         # (B, A)
         act = agent_state["prev_action"].clone()
 
-        # Placeholder carry kept for API compatibility with agent.update().
-        carry_train = agent.get_initial_carry(self.batch_size)
-
         while step < self.steps:
             # Evaluation
             # if self._should_eval(step) and self.eval_episode_num > 0:
@@ -197,8 +194,7 @@ class OnlineTrainer:
                 else:
                     update_num = self._updates_needed(step)
                 for _ in range(update_num):
-                    carry_train, _metrics = agent.update(
-                        self.replay_buffer, carry_train)
+                    _metrics = agent.update(self.replay_buffer, self.batch_size)
                     train_metrics = _metrics
                 update_count += update_num
                 # Log training metrics
