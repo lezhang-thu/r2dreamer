@@ -52,6 +52,6 @@ for task in "${tasks[@]}"; do
 			model=size-transformer \
 			model.rep_loss=${METHOD} \
 			seed=$seed \
-			batch_size=4 batch_length=1024
+			batch_size=16 batch_length=2048
 	done
 done

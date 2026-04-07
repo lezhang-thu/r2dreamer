@@ -30,6 +30,8 @@ class Dreamer(nn.Module):
             act_space.shape)
         self.rep_loss = str(config.rep_loss)
         self.imag_last = int(getattr(config, 'imag_last', 0))
+        self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
+        self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))
         self.imag_ac_steps = int(getattr(config, "imag_ac_steps", 1))
         if self.imag_ac_steps < 1:
             raise ValueError("imag_ac_steps must be >= 1")
@@ -283,7 +285,7 @@ class Dreamer(nn.Module):
         self._update_slow_target()
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            _, mets = self._cal_grad(p_data, carry_train)
+            mets = self._cal_grad(p_data, carry_train)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self._log_grads:
             old_params = [
@@ -346,30 +348,43 @@ class Dreamer(nn.Module):
 
         c = torch.mm(x1_norm.T, x2_norm) / count
         invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
-        off_diag_mask = ~torch.eye(c.shape[0], dtype=torch.bool, device=c.device)
+        off_diag_mask = ~torch.eye(
+            c.shape[0], dtype=torch.bool, device=c.device)
         redundancy_loss = c[off_diag_mask].pow(2).sum()
         return invariance_loss + lambd * redundancy_loss
 
-    def _cal_grad(self, data, _carry_train):
-        """Compute gradients for one batch.
+    def _iter_batch_chunks(self, data, accum_steps):
+        """Yield replay batch chunks and their batch-fraction weights."""
+        B = data.shape[0]
+        splits = min(max(1, int(accum_steps)), int(B))
+        if splits <= 1:
+            yield data, 1.0
+            return
+        chunk = (B + splits - 1) // splits
+        for start in range(0, B, chunk):
+            end = min(start + chunk, B)
+            yield data[start:end], float(end - start) / float(B)
 
-        carry_train is unused and kept only for trainer API compatibility.
-        t_mask from data masks out zero-padded positions.
+    def _iter_start_chunks(self, starts, accum_steps):
+        """Yield sampled imagination-start index chunks and their weights."""
+        K = int(starts.shape[1])
+        splits = min(max(1, int(accum_steps)), max(1, K))
+        if splits <= 1:
+            yield starts, 1.0
+            return
+        chunk = (K + splits - 1) // splits
+        for start in range(0, K, chunk):
+            end = min(start + chunk, K)
+            yield starts[:, start:end], float(end - start) / float(K)
 
-        Notes
-        -----
-        This function computes:
-        1) World model loss (dynamics + representation)
-        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
-        3) Imagination rollouts for actor-critic updates (optionally repeated
-           with gradient accumulation)
-        """
+    def _world_model_forward(self, data):
+        """World-model losses and detached cache for imagination updates."""
         # t_mask: (B, T) bool — True for real data, False for padding
         t_mask = data["t_mask"].float()  # (B, T)
+        B, T = data.shape
 
         losses = {}
         metrics = {}
-        B, T = data.shape
 
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
@@ -394,193 +409,237 @@ class Dreamer(nn.Module):
             recon_dists = self.decoder(post_stoch, post_deter)
             for key, dist in recon_dists.items():
                 per_step = -dist.log_prob(data[key])  # (B, T, ...)
-                # Reduce all dims except (B, T) then mask
                 while per_step.dim() > 2:
                     per_step = per_step.sum(-1)
                 losses[key] = self._masked_mean(per_step, t_mask)
         elif self.rep_loss == "r2dreamer":
-            # R2-Dreamer: Barlow Twins redundancy reduction.
             flat_mask = t_mask.reshape(B * T, 1)  # (B*T, 1)
             x1 = self.prj(feat.reshape(B * T, -1))
             x2 = embed.reshape(B * T, -1).detach()
-            losses["barlow"] = self._masked_barlow_loss(
-                x1, x2, flat_mask, self.barlow_lambd)
+            losses["barlow"] = self._masked_barlow_loss(x1, x2, flat_mask,
+                                                        self.barlow_lambd)
         else:
             raise NotImplementedError
 
-        # reward and continue — masked
         rew_loss = -self.reward(feat).log_prob(
             to_f32(data["reward"]).unsqueeze(-1))  # (B, T)
         losses["rew"] = self._masked_mean(rew_loss, t_mask)
         cont = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         con_loss = -self.cont(feat).log_prob(cont)  # (B, T)
         losses["con"] = self._masked_mean(con_loss, t_mask)
-        # log
+
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(
             self.rssm.get_dist(post_logit).entropy())
 
-        # Keep static trajectory memory for repeated imagination updates.
         imag_source = {
             "post_stoch": post_stoch.detach(),
             "post_deter": post_deter.detach(),
             "kv_k": feat_dict["kv_k"].detach(),
             "kv_v": feat_dict["kv_v"].detach(),
+            "valid_lens": torch.clamp(t_mask.sum(dim=1).to(torch.int64), min=1),
+            "T": T,
         }
+        return losses, metrics, imag_source
 
-        # Backprop world model first and release its graph early.
-        world_model_loss = sum(
-            v * self._loss_scales[k] for k, v in losses.items())
-        self._scaler.scale(world_model_loss).backward()
+    def _actor_critic_forward(self, start_stoch, start_deter, imag_carry,
+                              imag_mask):
+        """Single actor-critic forward pass from imagination starts."""
+        losses = {}
+        metrics = {}
 
-        # === Imagination rollout for actor-critic (gradient accumulation) ===
-        ac_steps = self.imag_ac_steps
+        imag_feat, imag_action = self._imagine(
+            (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
+        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
-        policy_loss_acc = torch.zeros((), device=self.device)
-        value_loss_acc = torch.zeros((), device=self.device)
-        imag_metric_sums = {}
+        imag_reward = self._frozen_reward(imag_feat).mode()
+        imag_cont = self._frozen_cont(imag_feat).mean
+        imag_value = self._frozen_value(imag_feat).mode()
+        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+        disc = 1 - 1 / self.horizon
+        weight = torch.cumprod(imag_cont * disc, dim=1)
+        last = torch.zeros_like(imag_cont)
+        term = 1 - imag_cont
+        ret = self._lambda_return(last, term, imag_reward, imag_value,
+                                  imag_value, disc,
+                                  self.lamb)  # (N, T_imag-1, 1)
+        ret_offset, ret_scale = self.return_ema(ret)
+        adv = (ret - imag_value[:, :-1]) / ret_scale
 
-        for _ in range(ac_steps):
-            start_stoch, start_deter, imag_carry, imag_mask = self._prepare_transformer_imag_start(
-                imag_source["post_stoch"],
-                imag_source["post_deter"],
-                imag_source["kv_k"],
-                imag_source["kv_v"],
-                t_mask,
-                T,
-            )
-            imag_feat, imag_action = self._imagine(
-                (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
-            imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+        policy = self.actor(imag_feat)
+        logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
+        entropy = policy.entropy()[:, :-1].unsqueeze(-1)
+        policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() +
+                                                  self.act_entropy * entropy)
+        losses["policy"] = self._masked_mean(policy_loss, imag_mask)
 
-            # (N, T_imag, 1) where N = B*K sampled imagination starts.
-            imag_reward = self._frozen_reward(imag_feat).mode()
-            imag_cont = self._frozen_cont(imag_feat).mean
-            imag_value = self._frozen_value(imag_feat).mode()
-            imag_slow_value = self._frozen_slow_value(imag_feat).mode()
-            disc = 1 - 1 / self.horizon
-            weight = torch.cumprod(imag_cont * disc, dim=1)
-            last = torch.zeros_like(imag_cont)
-            term = 1 - imag_cont
-            ret = self._lambda_return(last, term, imag_reward, imag_value,
-                                      imag_value, disc,
-                                      self.lamb)  # (N, T_imag-1, 1)
-            ret_offset, ret_scale = self.return_ema(ret)
-            adv = (ret - imag_value[:, :-1]) / ret_scale
+        imag_value_dist = self.value(imag_feat)
+        tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+        value_loss = (weight[:, :-1].detach() *
+                      (-imag_value_dist.log_prob(tar_padded.detach()) -
+                       imag_value_dist.log_prob(
+                           imag_slow_value.detach()))[:, :-1].unsqueeze(-1))
+        losses["value"] = self._masked_mean(value_loss, imag_mask)
 
-            policy = self.actor(imag_feat)
-            logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
-            entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-            policy_loss = weight[:, :-1].detach() * -(
-                logpi * adv.detach() + self.act_entropy * entropy)
-            policy_loss = self._masked_mean(policy_loss, imag_mask)
+        ret_normed = (ret - ret_offset) / ret_scale
+        metrics["ret"] = torch.mean(ret_normed)
+        metrics["ret_005"] = self.return_ema.ema_vals[0]
+        metrics["ret_095"] = self.return_ema.ema_vals[1]
+        metrics["adv"] = torch.mean(adv)
+        metrics["adv_std"] = torch.std(adv)
+        metrics["con"] = torch.mean(imag_cont)
+        metrics["rew"] = torch.mean(imag_reward)
+        metrics["val"] = torch.mean(imag_value)
+        metrics["tar"] = torch.mean(ret)
+        metrics["slowval"] = torch.mean(imag_slow_value)
+        metrics["weight"] = torch.mean(weight)
+        metrics["action_entropy"] = torch.mean(entropy)
+        metrics.update(tools.tensorstats(imag_action, "action"))
+        return losses, metrics
 
-            imag_value_dist = self.value(imag_feat)
-            tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
-            value_loss = (weight[:, :-1].detach() *
-                          (-imag_value_dist.log_prob(tar_padded.detach()) -
-                           imag_value_dist.log_prob(
-                               imag_slow_value.detach()))[:, :-1].unsqueeze(-1))
-            value_loss = self._masked_mean(value_loss, imag_mask)
+    def _cal_grad(self, data, _carry_train):
+        """Compute gradients for one batch.
 
-            # Average accumulated actor-critic gradients to emulate a larger batch.
-            ac_loss = (self._loss_scales["policy"] * policy_loss +
-                       self._loss_scales["value"] * value_loss) / ac_steps
-            self._scaler.scale(ac_loss).backward()
+        carry_train is unused and kept only for trainer API compatibility.
+        t_mask from data masks out zero-padded positions.
 
-            policy_loss_acc = policy_loss_acc + policy_loss.detach()
-            value_loss_acc = value_loss_acc + value_loss.detach()
+        Notes
+        -----
+        This function computes:
+        1) World model loss (dynamics + representation)
+        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
+        3) Imagination rollouts for actor-critic updates (optionally repeated
+           with gradient accumulation)
+        """
+        metrics = {}
+        losses = {}
+        opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        total_valid = data["t_mask"].float().sum().clamp_min(1.0)
 
-            ret_normed = (ret - ret_offset) / ret_scale
-            imag_step_metrics = {
-                "ret": torch.mean(ret_normed),
-                "ret_005": self.return_ema.ema_vals[0],
-                "ret_095": self.return_ema.ema_vals[1],
-                "adv": torch.mean(adv),
-                "adv_std": torch.std(adv),
-                "con": torch.mean(imag_cont),
-                "rew": torch.mean(imag_reward),
-                "val": torch.mean(imag_value),
-                "tar": torch.mean(ret),
-                "slowval": torch.mean(imag_slow_value),
-                "weight": torch.mean(weight),
-                "action_entropy": torch.mean(entropy),
-            }
-            imag_step_metrics.update(tools.tensorstats(imag_action, "action"))
-            for name, value in imag_step_metrics.items():
-                value = value.detach()
-                if name in imag_metric_sums:
-                    imag_metric_sums[name] = imag_metric_sums[name] + value
-                else:
-                    imag_metric_sums[name] = value
+        def _accum(target, source, weight):
+            if not isinstance(weight, torch.Tensor):
+                weight = torch.tensor(weight,
+                                      dtype=torch.float32,
+                                      device=self.device)
+            else:
+                weight = weight.to(dtype=torch.float32, device=self.device)
+            for name, value in source.items():
+                if not isinstance(value, torch.Tensor):
+                    value = torch.tensor(value,
+                                         dtype=torch.float32,
+                                         device=self.device)
+                target[name] = target.get(
+                    name,
+                    torch.zeros((), dtype=torch.float32, device=self.device),
+                )
+                target[name] = target[name] + value.detach() * weight
 
-        losses["policy"] = policy_loss_acc / ac_steps
-        losses["value"] = value_loss_acc / ac_steps
-        metrics["imag_ac_steps"] = torch.tensor(float(ac_steps),
-                                                device=self.device)
-        for name, value in imag_metric_sums.items():
-            metrics[name] = value / ac_steps
+        for wm_data, wm_batch_weight in self._iter_batch_chunks(
+                data, self.wm_accum_steps):
+            wm_losses, wm_metrics, imag_source = self._world_model_forward(
+                wm_data)
+            wm_valid = wm_data["t_mask"].float().sum()
+            wm_loss_weight = wm_valid / total_valid
+            wm_batch_weight = torch.tensor(wm_batch_weight,
+                                           dtype=torch.float32,
+                                           device=self.device)
 
-        total_loss = (world_model_loss.detach() +
-                      self._loss_scales["policy"] * losses["policy"] +
-                      self._loss_scales["value"] * losses["value"])
+            world_model_loss = sum(self._loss_scales[name] * value
+                                   for name, value in wm_losses.items())
+            self._scaler.scale(world_model_loss * wm_loss_weight).backward()
+            opt_loss = opt_loss + world_model_loss.detach() * wm_loss_weight
+            _accum(losses, wm_losses, wm_loss_weight)
+            _accum(metrics, wm_metrics, wm_batch_weight)
+
+            repeat_weight = wm_batch_weight / float(self.imag_ac_steps)
+            for _ in range(self.imag_ac_steps):
+                starts = self._sample_transformer_imag_starts(
+                    imag_source["valid_lens"],
+                    imag_source["T"],
+                )
+                rep_losses = {}
+                rep_metrics = {}
+                for start_chunk, s_weight in self._iter_start_chunks(
+                        starts, self.ac_accum_steps):
+                    s_weight = torch.tensor(s_weight,
+                                            dtype=torch.float32,
+                                            device=self.device)
+                    s_stoch, s_deter, s_carry, s_mask = self._prepare_transformer_imag_start(
+                        imag_source["post_stoch"],
+                        imag_source["post_deter"],
+                        imag_source["kv_k"],
+                        imag_source["kv_v"],
+                        start_chunk,
+                    )
+                    ac_losses, ac_metrics = self._actor_critic_forward(
+                        s_stoch, s_deter, s_carry, s_mask)
+                    ac_total = (
+                        self._loss_scales["policy"] * ac_losses["policy"] +
+                        self._loss_scales["value"] * ac_losses["value"])
+                    grad_weight = repeat_weight * s_weight
+                    self._scaler.scale(ac_total * grad_weight).backward()
+                    opt_loss = opt_loss + ac_total.detach() * grad_weight
+                    _accum(rep_losses, ac_losses, s_weight)
+                    _accum(rep_metrics, ac_metrics, s_weight)
+                _accum(losses, rep_losses, repeat_weight)
+                _accum(metrics, rep_metrics, repeat_weight)
+
+        metrics["wm_accum_steps"] = torch.tensor(
+            float(self.wm_accum_steps),
+            device=self.device,
+        )
+        metrics["ac_accum_steps"] = torch.tensor(
+            float(self.ac_accum_steps),
+            device=self.device,
+        )
+        metrics["imag_ac_steps"] = torch.tensor(
+            float(self.imag_ac_steps),
+            device=self.device,
+        )
         metrics.update({
             f"loss/{name}": loss.detach() for name, loss in losses.items()
         })
-        metrics.update({"opt/loss": total_loss.detach()})
-        return (post_stoch.detach(), post_deter.detach()), metrics
+        metrics.update({"opt/loss": opt_loss.detach()})
+        return metrics
 
     @torch.no_grad()
-    def _prepare_transformer_imag_start(self,
-                                        post_stoch,
-                                        post_deter,
-                                        kv_k,
-                                        kv_v,
-                                        t_mask,
-                                        T,
-                                        s0=None):
+    def _prepare_transformer_imag_start(
+        self,
+        post_stoch,
+        post_deter,
+        kv_k,
+        kv_v,
+        starts,
+    ):
         """Prepare transformer imagination starts from trajectory KV tensors."""
         B = post_stoch.shape[0]
-        K = min(self.imag_last if self.imag_last > 0 else T, T)
-        valid_lens = torch.clamp(t_mask.sum(dim=1).to(torch.int64), min=1)
-        starts = self._sample_valid_imag_starts(valid_lens,
-                                                K,
-                                                t_mask.device,
-                                                s0=s0)
+        K = starts.shape[1]
 
         # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
             post_stoch, post_deter, kv_k, kv_v, starts)
-        imag_mask = torch.ones((B * K, 1, 1),
-                               dtype=t_mask.dtype,
-                               device=t_mask.device)
+        imag_mask = torch.ones((B * K, 1, 1), device=starts.device)
         return start_stoch, start_deter, imag_carry, imag_mask
 
     @torch.no_grad()
-    def _sample_valid_imag_starts(self, valid_lens, K, device, s0=None):
+    def _sample_transformer_imag_starts(self, valid_lens, T):
+        """Sample all imagination start indices for one AC repeat."""
+        K = min(self.imag_last if self.imag_last > 0 else T, T)
+        return self._sample_valid_imag_starts(valid_lens, K, valid_lens.device)
+
+    @torch.no_grad()
+    def _sample_valid_imag_starts(self, valid_lens, K, device):
         """Sample K valid imagination starts independently per episode."""
         offsets = torch.arange(K, device=device)
         starts = []
-        base = None if s0 is None else int(s0)
         for valid_len_t in valid_lens:
             valid_len = int(valid_len_t.item())
             if valid_len >= K:
-                if base is None:
-                    start0 = torch.randint(0,
-                                           valid_len - K + 1, (),
-                                           device=device)
-                    starts.append(start0 + offsets)
-                else:
-                    start0 = max(0, min(base, valid_len - K))
-                    starts.append(torch.arange(start0, start0 + K,
-                                               device=device))
+                start0 = torch.randint(0, valid_len - K + 1, (), device=device)
+                starts.append(start0 + offsets)
             else:
-                if base is None:
-                    starts.append(
-                        torch.randint(0, valid_len, (K,), device=device))
-                else:
-                    starts.append((offsets + (base % valid_len)) % valid_len)
+                starts.append(torch.randint(0, valid_len, (K,), device=device))
         return torch.stack(starts, dim=0)
 
     @torch.no_grad()

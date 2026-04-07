@@ -5,7 +5,7 @@ env_num: 1
 #eval_episode_num: 100
 eval_episode_num: 10
 action_repeat: 4
-train_ratio: 128
+train_ratio: 256
 #time_limit: 108000
 time_limit: 20476
 

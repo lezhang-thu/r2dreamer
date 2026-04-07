@@ -8,7 +8,9 @@ log_grads: False
 device: ${device}
 rep_loss: "r2dreamer"  # r2dreamer/dreamer
 #imag_last: 0          # 0 = all T positions; >0 = K valid starts per episode
-imag_last: 16          # 0 = all T positions; >0 = K valid starts per episode
+imag_last: 64          # 0 = all T positions; >0 = K valid starts per episode
+wm_accum_steps: 16     # split replay batch for world-model grad accumulation
+ac_accum_steps: 8      # split imagination starts for actor-critic grad accumulation
 imag_ac_steps: 1       # actor-critic imagination grad-acc steps per world-model update
 
 lr: 4e-5
@@ -55,7 +57,7 @@ transformer:
   #d_ff: 4096
   d_ff: 2048
   #window_size: 64
-  window_size: 1024
+  window_size: 2048
   device: ${device}
 
 encoder:
