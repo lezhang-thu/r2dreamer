@@ -28,7 +28,10 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
-        self.rep_loss = str(config.rep_loss)
+        if str(config.rep_loss) != "r2dreamer":
+            raise AssertionError(
+                "config.rep_loss must be 'r2dreamer' "
+                f"(got {str(config.rep_loss)!r}).")
         self.imag_last = int(getattr(config, 'imag_last', 0))
         self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
         self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))
@@ -79,21 +82,10 @@ class Dreamer(nn.Module):
             "encoder": self.encoder,
         }
 
-        if self.rep_loss == "dreamer":
-            self.decoder = networks.MultiDecoder(
-                config.decoder,
-                self.rssm._deter,
-                self.rssm.flat_stoch,
-                shapes,
-            )
-            recon = self._loss_scales.pop("recon")
-            self._loss_scales.update({k: recon for k in self.decoder.all_keys})
-            modules.update({"decoder": self.decoder})
-        elif self.rep_loss == "r2dreamer":
-            # add projector for latent to embedding
-            self.prj = Projector(self.rssm.feat_size, self.embed_size)
-            modules.update({"projector": self.prj})
-            self.barlow_lambd = float(config.r2dreamer.lambd)
+        # R2-Dreamer redundancy-reduction head.
+        self.prj = Projector(self.rssm.feat_size, self.embed_size)
+        modules.update({"projector": self.prj})
+        self.barlow_lambd = float(config.r2dreamer.lambd)
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -383,21 +375,11 @@ class Dreamer(nn.Module):
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
-        if self.rep_loss == "dreamer":
-            recon_dists = self.decoder(post_stoch, post_deter)
-            for key, dist in recon_dists.items():
-                per_step = -dist.log_prob(data[key])  # (B, T, ...)
-                while per_step.dim() > 2:
-                    per_step = per_step.sum(-1)
-                losses[key] = self._masked_mean(per_step, t_mask)
-        elif self.rep_loss == "r2dreamer":
-            flat_mask = t_mask.reshape(B * T, 1)  # (B*T, 1)
-            x1 = self.prj(feat.reshape(B * T, -1))
-            x2 = embed.reshape(B * T, -1).detach()
-            losses["barlow"] = self._masked_barlow_loss(x1, x2, flat_mask,
-                                                        self.barlow_lambd)
-        else:
-            raise NotImplementedError
+        flat_mask = t_mask.reshape(B * T, 1)  # (B*T, 1)
+        x1 = self.prj(feat.reshape(B * T, -1))
+        x2 = embed.reshape(B * T, -1).detach()
+        losses["barlow"] = self._masked_barlow_loss(x1, x2, flat_mask,
+                                                    self.barlow_lambd)
 
         rew_loss = -self.reward(feat).log_prob(
             to_f32(data["reward"]).unsqueeze(-1))  # (B, T)

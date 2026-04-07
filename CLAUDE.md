@@ -4,14 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-R2-Dreamer is a PyTorch implementation of redundancy-reduced world models for reinforcement learning (ICLR 2026). It provides an efficient DreamerV3 reproduction (~5x faster than reference implementations) with pluggable representation learning objectives: `r2dreamer` (default, Barlow Twins-style), `dreamer` (standard reconstruction), `infonce` (contrastive), and `dreamerpro` (prototype-based).
+R2-Dreamer is a PyTorch implementation of redundancy-reduced world models for reinforcement learning (ICLR 2026). The current training code supports the `r2dreamer` representation loss only.
 
 ## Commands
 
 ### Training
 ```bash
 python3 train.py logdir=./logdir/test                          # default (DMC Vision, 12M params)
-python3 train.py model.rep_loss=r2dreamer                      # switch algorithm
 python3 train.py env=atari100k env.task=atari_pong             # switch environment
 python3 train.py model=size50M                                 # switch model size
 ```
@@ -33,7 +32,7 @@ tensorboard --logdir ./logdir
 **Core components:**
 - `dreamer.py` — Agent class with world model, actor-critic, and loss computation (`_cal_grad` method). Uses `TransformerRSSM` dynamics and supports frozen network clones for R2-Dreamer rep loss.
 - `rssm.py` — Transformer-based RSSM with KV-cache dynamics. States are `(stoch, deter)` tuples where stoch is S×K categorical, deter is D-dimensional.
-- `networks.py` — MultiEncoder (CNN+MLP), MultiDecoder, MLPHead, BlockLinear layers.
+- `networks.py` — MultiEncoder (CNN+MLP), MLPHead, BlockLinear layers.
 - `distributions.py` — OneHot, TwoHot distributions; symlog/symexp transforms.
 - `replay_y.py` — Episode-based cyclic replay buffer (RAM-only, chunked sampling).
 - `envs/` — ParallelEnv wrapper + environment-specific modules (DMC, Atari, Crafter, Meta-World, Memory Maze).

@@ -1,4 +1,3 @@
-import math
 import re
 from functools import partial
 
@@ -107,6 +106,45 @@ class RMSNorm2D(nn.RMSNorm):
         return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
 
+class ResidualConvBlock(nn.Module):
+    """ResNet-style residual block for image observations."""
+
+    def __init__(self,
+                 in_ch: int,
+                 out_ch: int,
+                 kernel_size: int,
+                 act,
+                 use_norm: bool):
+        super().__init__()
+        self.conv1 = Conv2dSamePad(in_ch,
+                                   out_ch,
+                                   kernel_size,
+                                   stride=1,
+                                   bias=True)
+        self.norm1 = (RMSNorm2D(out_ch, eps=1e-04, dtype=torch.float32)
+                      if use_norm else nn.Identity())
+        self.act1 = act()
+        self.conv2 = Conv2dSamePad(out_ch,
+                                   out_ch,
+                                   kernel_size,
+                                   stride=1,
+                                   bias=True)
+        self.norm2 = (RMSNorm2D(out_ch, eps=1e-04, dtype=torch.float32)
+                      if use_norm else nn.Identity())
+        self.skip = (Conv2dSamePad(in_ch, out_ch, 1, stride=1, bias=True)
+                     if in_ch != out_ch else nn.Identity())
+        self.out_act = act()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.skip(x)
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.act1(x)
+        x = self.conv2(x)
+        x = self.norm2(x)
+        return self.out_act(x + residual)
+
+
 class MultiEncoder(nn.Module):
 
     def __init__(
@@ -168,102 +206,35 @@ class MultiEncoder(nn.Module):
             [enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
 
 
-class MultiDecoder(nn.Module):
-
-    def __init__(self, config, deter, flat_stoch, shapes):
-        super().__init__()
-        excluded = ("is_first", "is_last", "is_terminal")
-        shapes = {k: v for k, v in shapes.items() if k not in excluded}
-        self.cnn_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) == 3 and re.match(config.cnn_keys, k)
-        }
-        self.mlp_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) in (1, 2) and re.match(config.mlp_keys, k)
-        }
-        print("Decoder CNN shapes:", self.cnn_shapes)
-        print("Decoder MLP shapes:", self.mlp_shapes)
-        self.all_keys = list(self.mlp_shapes.keys()) + list(
-            self.cnn_shapes.keys())
-
-        # Unlike the encoder, each decoder is initialized independently.
-        if self.cnn_shapes:
-            some_shape = list(self.cnn_shapes.values())[0]
-            shape = (sum(
-                x[-1] for x in self.cnn_shapes.values()),) + some_shape[:-1]
-            self._cnn = ConvDecoder(
-                config.cnn,
-                deter,
-                flat_stoch,
-                shape,
-            )
-            self._image_dist = partial(
-                getattr(dists, str(config.cnn_dist.name)), **config.cnn_dist)
-        if self.mlp_shapes:
-            shape = (sum(sum(x) for x in self.mlp_shapes.values()),)
-            config.mlp.shape = shape
-            self._mlp = MLPHead(config.mlp, deter + flat_stoch)
-            self._mlp_dist = partial(getattr(dists, str(config.mlp_dist.name)),
-                                     **config.mlp_dist)
-
-    def forward(self, stoch, deter):
-        """Decode latent states into observation distributions."""
-        # (B, T, S, K), (B, T, D)
-        dists = {}
-        if self.cnn_shapes:
-            split_sizes = [v[-1] for v in self.cnn_shapes.values()]
-            # (B, T, H, W, C_sum)
-            outputs = self._cnn(stoch, deter)
-            outputs = torch.split(outputs, split_sizes, -1)
-            dists.update({
-                key: self._image_dist(output)
-                for key, output in zip(self.cnn_shapes.keys(), outputs)
-            })
-        if self.mlp_shapes:
-            split_sizes = [v[0] for v in self.mlp_shapes.values()]
-            # (B, T, S*K + D)
-            feat = torch.cat([stoch.reshape(*deter.shape[:-1], -1), deter], -1)
-            outputs = self._mlp(feat)
-            outputs = torch.split(outputs, split_sizes, -1)
-            dists.update({
-                key: self._mlp_dist(output)
-                for key, output in zip(self.mlp_shapes.keys(), outputs)
-            })
-        return dists
-
-
 class ConvEncoder(nn.Module):
 
     def __init__(self, config, input_shape):
         super().__init__()
         act = getattr(torch.nn, config.act)
         h, w, input_ch = input_shape
+        self._minres = int(config.minres)
         self.depths = tuple(
             int(config.depth) * int(mult) for mult in list(config.mults))
-        self.kernel_size = int(config.kernel_size)
+        kernel_size = int(config.kernel_size)
+        use_norm = bool(config.norm)
         in_dim = input_ch
-        layers = []
-        for i, depth in enumerate(self.depths):
-            layers.append(
-                Conv2dSamePad(
-                    in_channels=in_dim,
-                    out_channels=depth,
-                    kernel_size=self.kernel_size,
-                    stride=1,
-                    bias=True,
+        stages = []
+        for depth in self.depths:
+            stages.append(
+                nn.Sequential(
+                    ResidualConvBlock(in_dim, depth, kernel_size, act,
+                                      use_norm),
+                    nn.AvgPool2d(2, 2),
                 ))
-            layers.append(nn.MaxPool2d(2, 2))
-            if config.norm:
-                layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
-            layers.append(act())
             in_dim = depth
             h, w = h // 2, w // 2
+        if h < self._minres or w < self._minres:
+            raise AssertionError(
+                "ConvEncoder output resolution fell below config.minres "
+                f"(got {(h, w)}, minres={self._minres}).")
 
         self.out_dim = self.depths[-1] * h * w
-        self.layers = nn.Sequential(*layers)
+        self.layers = nn.Sequential(*stages)
 
     def forward(self, obs):
         """Encode image-like observations with a CNN."""
@@ -279,96 +250,6 @@ class ConvEncoder(nn.Module):
         x = x.reshape(x.shape[0], -1)
         # (B, T, C_feat*H_feat*W_feat)
         return x.reshape(*obs.shape[:-3], x.shape[-1])
-
-
-class ConvDecoder(nn.Module):
-
-    def __init__(self, config, deter, flat_stoch, shape=(3, 64, 64)):
-        super().__init__()
-        act = getattr(torch.nn, config.act)
-        self._shape = shape
-        self.depths = tuple(
-            int(config.depth) * int(mult) for mult in list(config.mults))
-        factor = 2**(len(self.depths))
-        minres = [int(x // factor) for x in shape[1:]]
-        self.min_shape = (*minres, self.depths[-1])
-        self.bspace = int(config.bspace)
-        self.kernel_size = int(config.kernel_size)
-        self.units = int(config.units)
-        u, g = math.prod(self.min_shape), self.bspace
-        self.sp0 = BlockLinear(deter, u, g)
-        self.sp1 = nn.Sequential(
-            nn.Linear(flat_stoch, 2 * self.units),
-            nn.RMSNorm(2 * self.units, eps=1e-04, dtype=torch.float32), act())
-        self.sp2 = nn.Linear(2 * self.units, math.prod(self.min_shape))
-        self.sp_norm = nn.Sequential(
-            nn.RMSNorm(self.depths[-1], eps=1e-04, dtype=torch.float32), act())
-        layers = []
-        in_dim = self.depths[-1]
-        for depth in reversed(self.depths[:-1]):
-            layers.append(nn.Upsample(scale_factor=2, mode="nearest"))
-            layers.append(
-                Conv2dSamePad(in_dim,
-                              depth,
-                              self.kernel_size,
-                              stride=1,
-                              bias=True))
-            layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
-            layers.append(act())
-            in_dim = depth
-        layers.append(nn.Upsample(scale_factor=2, mode="nearest"))
-        layers.append(
-            Conv2dSamePad(in_dim,
-                          self._shape[0],
-                          self.kernel_size,
-                          stride=1,
-                          bias=True))
-        self.layers = nn.Sequential(*layers)
-        self.apply(weight_init_)
-
-    def forward(self, stoch, deter):
-        """Decode latent states into images.
-
-        Notes
-        -----
-        The decoder first constructs a low-resolution spatial feature map from
-        the deterministic state (block-linear projection) and from the stochastic
-        state (MLP projection), concats them, then upsamples back to the target
-        resolution.
-        """
-        # (B, T, S, K), (B, T, D)
-        B_T = deter.shape[:-1]
-        # (B*T, D), (B*T, S*K)
-        x0, x1 = deter.reshape(B_T.numel(),
-                               deter.shape[-1]), stoch.reshape(B_T.numel(), -1)
-
-        # Spatial features from deterministic state
-        # (H_feat, W_feat, C_feat)
-        H_feat, W_feat, C_feat = self.min_shape
-        # (B*T, H_feat*W_feat*C_feat)
-        x0 = self.sp0(x0)
-        # (B*T, G, H_feat, W_feat, C_feat/G)
-        x0 = x0.reshape(-1, self.bspace, H_feat, W_feat, C_feat // self.bspace)
-        # (B*T, H_feat, W_feat, C_feat)
-        x0 = x0.permute(0, 2, 3, 1, 4).reshape(-1, H_feat, W_feat, C_feat)
-
-        # Spatial features from stochastic state
-        # (B*T, 2*U)
-        x1 = self.sp1(x1)
-        # (B*T, H_feat, W_feat, C_feat)
-        x1 = self.sp2(x1).reshape(-1, H_feat, W_feat, C_feat)
-
-        # Combine and upsample
-        # (B*T, H_feat, W_feat, C_feat)
-        x = self.sp_norm(x0 + x1)
-        # (B*T, C_feat, H_feat, W_feat)
-        x = x.permute(0, 3, 1, 2)
-        x = self.layers(x)  # Upsamples to original H, W
-        # (B*T, H, W, C)
-        x = x.permute(0, 2, 3, 1)
-        x = torch.sigmoid(x)
-        # (B, T, H, W, C)
-        return x.reshape(*B_T, *x.shape[1:])
 
 
 class MLP(nn.Module):

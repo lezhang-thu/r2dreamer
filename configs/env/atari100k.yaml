@@ -1,11 +1,11 @@
 task: atari_alien
 #steps: 4.1e5
-steps: 4.1e6
+steps: 4.1e7
 env_num: 1
 #eval_episode_num: 100
 eval_episode_num: 10
 action_repeat: 4
-train_ratio: 256
+train_ratio: 128
 #time_limit: 108000
 time_limit: 20476
 
@@ -14,9 +14,6 @@ device: ${device}
 
 size: [64, 64]
 encoder:
-  mlp_keys: '$^'
-  cnn_keys: 'image'
-decoder:
   mlp_keys: '$^'
   cnn_keys: 'image'
 

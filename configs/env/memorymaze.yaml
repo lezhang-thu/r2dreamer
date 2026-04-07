@@ -12,6 +12,3 @@ device: ${device}
 encoder:
   mlp_keys: '$^'
   cnn_keys: 'image'
-decoder:
-  mlp_keys: '$^'
-  cnn_keys: 'image'

@@ -39,6 +39,11 @@ def main(config):
     if int(config.batch_length) < 1:
         raise AssertionError("config.batch_length must be >= 1 "
                              f"(got batch_length={int(config.batch_length)}).")
+    if int(config.model.transformer.window_size) != int(config.batch_length):
+        raise AssertionError(
+            "config.model.transformer.window_size must equal config.batch_length "
+            f"(got window_size={int(config.model.transformer.window_size)}, "
+            f"batch_length={int(config.batch_length)}).")
 
     replay_buffer = ReplayY(
         length=int(config.batch_length),
