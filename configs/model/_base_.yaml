@@ -74,10 +74,12 @@ encoder:
   cnn:
     act: ${model.act}
     norm: ${model.norm}
-    kernel_size: 5
+    kernel_size: 3
+    stem_stride: 2
     minres: 4
     depth: ${model.depth}  # base channel width; stage widths are depth * mults
     mults: [2, 3, 4, 4]
+    blocks: [1, 1, 1, 1]  # one BasicBlock per stage = 8 main-path convs
 
 reward:
   shape: [255,]

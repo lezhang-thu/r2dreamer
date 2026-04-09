@@ -106,33 +106,46 @@ class RMSNorm2D(nn.RMSNorm):
         return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
 
-class ResidualConvBlock(nn.Module):
-    """ResNet-style residual block for image observations."""
+def _maybe_norm_2d(ch: int, use_norm: bool) -> nn.Module:
+    if use_norm:
+        return RMSNorm2D(ch, eps=1e-04, dtype=torch.float32)
+    return nn.Identity()
+
+
+class ResNetBasicBlock(nn.Module):
+    """Small-image ResNet basic block with stride-based downsampling."""
 
     def __init__(self,
                  in_ch: int,
                  out_ch: int,
                  kernel_size: int,
                  act,
-                 use_norm: bool):
+                 use_norm: bool,
+                 stride: int = 1):
         super().__init__()
+        bias = not use_norm
         self.conv1 = Conv2dSamePad(in_ch,
                                    out_ch,
                                    kernel_size,
-                                   stride=1,
-                                   bias=True)
-        self.norm1 = (RMSNorm2D(out_ch, eps=1e-04, dtype=torch.float32)
-                      if use_norm else nn.Identity())
+                                   stride=stride,
+                                   bias=bias)
+        self.norm1 = _maybe_norm_2d(out_ch, use_norm)
         self.act1 = act()
         self.conv2 = Conv2dSamePad(out_ch,
                                    out_ch,
                                    kernel_size,
                                    stride=1,
-                                   bias=True)
-        self.norm2 = (RMSNorm2D(out_ch, eps=1e-04, dtype=torch.float32)
-                      if use_norm else nn.Identity())
-        self.skip = (Conv2dSamePad(in_ch, out_ch, 1, stride=1, bias=True)
-                     if in_ch != out_ch else nn.Identity())
+                                   bias=bias)
+        self.norm2 = _maybe_norm_2d(out_ch, use_norm)
+        if stride != 1 or in_ch != out_ch:
+            skip_layers = [
+                Conv2dSamePad(in_ch, out_ch, 1, stride=stride, bias=bias)
+            ]
+            if use_norm:
+                skip_layers.append(_maybe_norm_2d(out_ch, use_norm))
+            self.skip = nn.Sequential(*skip_layers)
+        else:
+            self.skip = nn.Identity()
         self.out_act = act()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -215,19 +228,49 @@ class ConvEncoder(nn.Module):
         self._minres = int(config.minres)
         self.depths = tuple(
             int(config.depth) * int(mult) for mult in list(config.mults))
+        self.blocks = tuple(
+            int(blocks)
+            for blocks in getattr(config, "blocks", [1] * len(self.depths)))
+        if len(self.blocks) != len(self.depths):
+            raise AssertionError(
+                "ConvEncoder config.blocks must match config.mults length "
+                f"(got {len(self.blocks)} blocks for {len(self.depths)} stages)."
+            )
+        if any(blocks < 1 for blocks in self.blocks):
+            raise AssertionError("ConvEncoder config.blocks must be >= 1.")
         kernel_size = int(config.kernel_size)
+        stem_stride = int(getattr(config, "stem_stride", 2))
+        if stem_stride < 1:
+            raise AssertionError("ConvEncoder config.stem_stride must be >= 1.")
         use_norm = bool(config.norm)
-        in_dim = input_ch
+        bias = not use_norm
+        self.stem = nn.Sequential(
+            Conv2dSamePad(input_ch,
+                          self.depths[0],
+                          kernel_size,
+                          stride=stem_stride,
+                          bias=bias),
+            _maybe_norm_2d(self.depths[0], use_norm),
+            act(),
+        )
+        h, w = self._downsample_dims(h, w, stem_stride)
+        in_dim = self.depths[0]
         stages = []
-        for depth in self.depths:
-            stages.append(
-                nn.Sequential(
-                    ResidualConvBlock(in_dim, depth, kernel_size, act,
-                                      use_norm),
-                    nn.AvgPool2d(2, 2),
-                ))
-            in_dim = depth
-            h, w = h // 2, w // 2
+        for stage_idx, (depth, block_count) in enumerate(
+                zip(self.depths, self.blocks)):
+            blocks = []
+            for block_idx in range(block_count):
+                stride = 1 if stage_idx == 0 or block_idx > 0 else 2
+                blocks.append(
+                    ResNetBasicBlock(in_dim,
+                                     depth,
+                                     kernel_size,
+                                     act,
+                                     use_norm,
+                                     stride=stride))
+                in_dim = depth
+                h, w = self._downsample_dims(h, w, stride)
+            stages.append(nn.Sequential(*blocks))
         if h < self._minres or w < self._minres:
             raise AssertionError(
                 "ConvEncoder output resolution fell below config.minres "
@@ -235,6 +278,12 @@ class ConvEncoder(nn.Module):
 
         self.out_dim = self.depths[-1] * h * w
         self.layers = nn.Sequential(*stages)
+
+    @staticmethod
+    def _downsample_dims(h: int, w: int, stride: int):
+        if stride == 1:
+            return h, w
+        return (h + stride - 1) // stride, (w + stride - 1) // stride
 
     def forward(self, obs):
         """Encode image-like observations with a CNN."""
@@ -244,6 +293,7 @@ class ConvEncoder(nn.Module):
         x = obs.reshape(-1, *obs.shape[-3:])
         # (B*T, C, H, W)
         x = x.permute(0, 3, 1, 2)
+        x = self.stem(x)
         # (B*T, C_feat, H_feat, W_feat)
         x = self.layers(x)
         # (B*T, C_feat*H_feat*W_feat)
