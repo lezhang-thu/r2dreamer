@@ -2,10 +2,11 @@ import collections
 import os
 
 import ale_py
-import ale_py.roms as roms
 import gymnasium as gym
 import numpy as np
 from PIL import Image
+
+gym.register_envs(ale_py)
 
 
 class Atari(gym.Env):
@@ -32,6 +33,12 @@ class Atari(gym.Env):
         "DOWNLEFTFIRE",
     )
     WEIGHTS = np.array([0.299, 0.587, 1 - (0.299 + 0.587)])
+
+    @staticmethod
+    def _gym_env_name(name):
+        if name == "james_bond":
+            name = "jamesbond"
+        return "".join(part.capitalize() for part in name.split("_"))
 
     def __init__(
         self,
@@ -71,8 +78,7 @@ class Atari(gym.Env):
 
             self._cv2 = cv2
 
-        if name == "james_bond":
-            name = "jamesbond"
+        env_name = self._gym_env_name(name)
 
         self._repeat = action_repeat
         self._size = size
@@ -86,21 +92,32 @@ class Atari(gym.Env):
         self._clip_reward = clip_reward
         self._rng = np.random.default_rng(seed)
 
-        with self.LOCK:
-            self.ale = ale_py.ALEInterface()
-            self.ale.setLoggerMode(ale_py.LoggerMode.Error)
-            self.ale.setInt(b"random_seed", self._rng.integers(0, 2**31))
-            path = os.environ.get("ALE_ROM_PATH")
-            if path:
-                self.ale.loadROM(os.path.join(path, f"{name}.bin"))
-            else:
-                self.ale.loadROM(roms.get_rom_path(name))
+        roms_dir = os.environ.get("ALE_ROM_PATH")
+        if roms_dir and "ALE_ROMS_DIR" not in os.environ:
+            os.environ["ALE_ROMS_DIR"] = roms_dir
 
-        self.ale.setFloat("repeat_action_probability", 0.25 if sticky else 0.0)
+        with self.LOCK:
+            self._env = gym.make(
+                f"ALE/{env_name}-v5",
+                obs_type="rgb",
+                frameskip=1,
+                mode=None,
+                difficulty=None,
+                repeat_action_probability=0.25 if sticky else 0.0,
+                full_action_space=(actions == "all"),
+                render_mode=None,
+            )
+            if seed is not None:
+                self._env.unwrapped.seed_game(int(seed))
+                self._env.unwrapped.load_game()
+
+        self.ale = self._env.unwrapped.ale
         self.actionset = {
             "all": self.ale.getLegalActionSet,
             "needed": self.ale.getMinimalActionSet,
         }[actions]()
+        self._action_meanings = tuple(self._env.unwrapped.get_action_meanings())
+        assert self._action_meanings[0] == "NOOP"
 
         H, W = self.ale.getScreenDims()
         self._buffers = collections.deque(
@@ -127,53 +144,59 @@ class Atari(gym.Env):
         return gym.spaces.Discrete(len(self.actionset))
 
     def step(self, action):
+        if isinstance(action, np.ndarray) and action.ndim >= 1:
+            action = int(np.argmax(action))
+        else:
+            action = int(action)
+
         total_reward = 0.0
         dead = False
+        game_over = False
 
         for repeat in range(self._repeat):
-            reward = self.ale.act(self.actionset[action])
+            _, reward, terminated, truncated, _ = self._env.step(action)
             self._step += 1
             total_reward += reward
+            game_over = terminated or truncated
 
             if repeat >= self._repeat - self._pooling:
                 self._render()
 
-            if self.ale.game_over():
-                dead = True
+            if game_over:
                 break
 
             current_lives = self.ale.lives()
             if self._lives != "unused" and current_lives < self._last_lives:
                 dead = True
+                self._last_lives = current_lives
                 break
             self._last_lives = current_lives
 
-        self._done = self.ale.game_over() or (self._length and
-                                              self._step >= self._length)
+        self._done = game_over or (self._length and self._step >= self._length)
 
         return self._obs(
             total_reward,
             is_last=self._done or (dead and self._lives == "reset"),
-            is_terminal=dead or self.ale.game_over(),
+            is_terminal=dead or game_over,
         )
 
-    def reset(self):
+    def reset(self, seed=None):
         with self.LOCK:
-            self.ale.reset_game()
+            self._env.reset(seed=seed)
 
         if self._noops:
             for _ in range(self._rng.integers(self._noops + 1)):
-                self.ale.act(self.ACTION_MEANING.index("NOOP"))
-                if self.ale.game_over():
+                _, _, terminated, truncated, _ = self._env.step(0)
+                if terminated or truncated:
                     with self.LOCK:
-                        self.ale.reset_game()
+                        self._env.reset()
 
-        if self._autostart and self.ACTION_MEANING.index(
-                "FIRE") in self.actionset:
-            self.ale.act(self.ACTION_MEANING.index("FIRE"))
-            if self.ale.game_over():
+        if self._autostart and "FIRE" in self._action_meanings:
+            fire = self._action_meanings.index("FIRE")
+            _, _, terminated, truncated, _ = self._env.step(fire)
+            if terminated or truncated:
                 with self.LOCK:
-                    self.ale.reset_game()
+                    self._env.reset()
 
         self._last_lives = self.ale.lives()
         self._render()
@@ -222,4 +245,4 @@ class Atari(gym.Env):
         self.ale.getScreenRGB(self._buffers[0])
 
     def close(self):
-        pass
+        self._env.close()
