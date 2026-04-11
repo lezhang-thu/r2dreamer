@@ -124,13 +124,16 @@ class TransformerRSSM(nn.Module):
     # Training path
     # ------------------------------------------------------------------
 
-    def observe(self, tokens, action, reset):
+    def observe(self, tokens, action, reset, sample=True):
         """Windowed-causal full-sequence training path.
 
         Args:
             tokens: (B, T, E) encoder embeddings.
             action: (B, T, A) current actions a_t (not prev_action).
             reset: (B, T) boolean, True at episode start.
+            sample: Whether to sample posterior stochastics. When False,
+                uses the posterior mode, which is useful for deterministic
+                cached reference trajectories.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
             feat: dict with deter, stoch, post_logit, prior_logit, and
@@ -141,7 +144,11 @@ class TransformerRSSM(nn.Module):
 
         # Posterior: conditioned on tokens only
         post_logit = self._post_head(tokens)  # (B, T, S, K)
-        stoch = self.get_dist(post_logit).rsample()  # (B, T, S, K)
+        post_dist = self.get_dist(post_logit)
+        if sample:
+            stoch = post_dist.rsample()  # (B, T, S, K)
+        else:
+            stoch = post_dist.base_dist.mode
 
         # Input projection: cat(stoch, action) -> d_model
         stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)

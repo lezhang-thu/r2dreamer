@@ -197,6 +197,8 @@ class OnlineTrainer:
                 for _ in range(update_num):
                     _metrics = agent.update(self.replay_buffer, self.batch_size)
                     train_metrics = _metrics
+                if update_num > 0:
+                    agent.refresh_memory_context()
                 update_count += update_num
                 # Log training metrics
                 if self._should_log(step):

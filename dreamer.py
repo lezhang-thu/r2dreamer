@@ -61,14 +61,24 @@ class Dreamer(nn.Module):
             config.actor.dist = config.actor.dist.cont
 
         # Actor-critic components
-        self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
-        self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
+        self.rl_feat_size = self.rssm.flat_stoch + 2 * int(
+            config.transformer.deter)
+        self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
+        self.value = networks.MLPHead(config.critic, self.rl_feat_size)
+        self.memory_attention = nn.MultiheadAttention(
+            int(config.transformer.deter),
+            int(config.transformer.n_heads),
+            dropout=0.0,
+            batch_first=True,
+        )
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
         for param in self._slow_value.parameters():
             param.requires_grad = False
         self._slow_value_updates = 0
+        self._memory_context = None
+        self._memory_context_stale = self.memory is not None
 
         self._loss_scales = dict(config.loss_scales)
         self._log_grads = bool(config.log_grads)
@@ -77,6 +87,7 @@ class Dreamer(nn.Module):
             "rssm": self.rssm,
             "actor": self.actor,
             "value": self.value,
+            "memory_attention": self.memory_attention,
             "reward": self.reward,
             "cont": self.cont,
             "encoder": self.encoder,
@@ -163,7 +174,7 @@ class Dreamer(nn.Module):
 
     def clone_and_freeze(self):
         for name in ("encoder", "rssm", "reward", "cont", "actor", "value",
-                     "slow_value"):
+                     "slow_value", "memory_attention"):
             setattr(
                 self, f"_frozen_{name}",
                 self._freeze_copy(
@@ -174,7 +185,97 @@ class Dreamer(nn.Module):
         super().to(*args, **kwargs)
         # Re-establish shared memory after moving the model to a new device
         self.clone_and_freeze()
+        self.refresh_memory_context()
         return self
+
+    def _memory_episode_tensordict(self):
+        if self.memory is None:
+            return None
+        if "reward" not in self.memory:
+            raise KeyError("self.memory must contain a 'reward' field.")
+        T = int(len(self.memory["reward"]))
+        data = {}
+        for key, value in self.memory.items():
+            tensor = value if isinstance(
+                value, torch.Tensor) else torch.as_tensor(value)
+            if tensor.is_floating_point():
+                tensor = tensor.to(self.device, non_blocking=True)
+            else:
+                tensor = tensor.to(self.device)
+            data[key] = tensor.unsqueeze(0)
+        if "is_first" not in data:
+            data["is_first"] = torch.zeros(1,
+                                           T,
+                                           dtype=torch.bool,
+                                           device=self.device)
+        data["is_first"] = data["is_first"].to(torch.bool)
+        data["is_first"][:, 0] = True
+        return TensorDict(data, batch_size=(1, T))
+
+    @torch.no_grad()
+    def refresh_memory_context(self):
+        if self.memory is None:
+            self._memory_context = None
+            self._memory_context_stale = False
+            return None
+        data = self.preprocess(self._memory_episode_tensordict())
+        embed = self._frozen_encoder(data)
+        _, feat_dict = self._frozen_rssm.observe(embed,
+                                                 data["action"],
+                                                 data["is_first"],
+                                                 sample=False)
+        self._memory_context = {
+            "deter": feat_dict["deter"].squeeze(0).detach(),
+        }
+        self._memory_context_stale = False
+        return self._memory_context
+
+    def _get_memory_context(self, require_fresh=False):
+        if self.memory is None:
+            return None
+        if self._memory_context is None or (require_fresh and
+                                            self._memory_context_stale):
+            return self.refresh_memory_context()
+        return self._memory_context
+
+    def _apply_memory_attention(self,
+                                deter,
+                                frozen=False,
+                                require_fresh_memory=False):
+        memory_context = self._get_memory_context(
+            require_fresh=require_fresh_memory)
+        if memory_context is None:
+            return torch.zeros_like(deter)
+        if deter.ndim not in (2, 3):
+            raise ValueError("Memory attention expects deter with rank 2 or 3 "
+                             f"(got shape {tuple(deter.shape)}).")
+        query = deter.unsqueeze(1) if deter.ndim == 2 else deter
+        memory_deter = memory_context["deter"].detach().to(
+            device=query.device,
+            dtype=query.dtype,
+        ).unsqueeze(0).expand(query.shape[0], -1, -1)
+        attention = (self._frozen_memory_attention
+                     if frozen else self.memory_attention)
+        attended, _ = attention(query,
+                                memory_deter,
+                                memory_deter,
+                                need_weights=False)
+        if deter.ndim == 2:
+            attended = attended[:, 0]
+        return attended
+
+    def _get_rl_feat(self,
+                     stoch,
+                     deter,
+                     frozen=False,
+                     require_fresh_memory=False):
+        attended_deter = self._apply_memory_attention(
+            deter,
+            frozen=frozen,
+            require_fresh_memory=require_fresh_memory,
+        )
+        stoch_flat = stoch.reshape(*stoch.shape[:-2], self.rssm.flat_stoch)
+        return torch.cat([stoch_flat, deter, attended_deter], dim=-1)
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
@@ -196,8 +297,11 @@ class Dreamer(nn.Module):
         # Phase 1: posterior from tokens
         carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
             carry, embed_sq, is_first)
-        feat = self._frozen_rssm.get_feat(stoch, h_prev)
-        action_dist = self._frozen_actor(feat)
+        rl_feat = self._get_rl_feat(stoch,
+                                    h_prev,
+                                    frozen=True,
+                                    require_fresh_memory=True)
+        action_dist = self._frozen_actor(rl_feat)
         action = action_dist.mode if eval else action_dist.rsample()
         # Phase 2: update KV-cache with (stoch, action)
         carry = self._frozen_rssm.update_carry(carry, stoch, action, is_first)
@@ -277,6 +381,7 @@ class Dreamer(nn.Module):
         self._scaler.update()  # adjust scale
         self._scheduler.step()  # increment scheduler
         self._optimizer.zero_grad(set_to_none=True)  # reset grads
+        self._memory_context_stale = self.memory is not None
         mets["opt/lr"] = self._scheduler.get_lr()[0]
         mets["opt/grad_scale"] = self._scaler.get_scale()
         if self._log_grads:
@@ -409,14 +514,18 @@ class Dreamer(nn.Module):
         losses = {}
         metrics = {}
 
-        imag_feat, imag_action = self._imagine(
+        imag_feat, imag_action, imag_stoch, imag_deter = self._imagine(
             (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
-        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+        imag_feat = imag_feat.detach()
+        imag_action = imag_action.detach()
+        imag_stoch = imag_stoch.detach()
+        imag_deter = imag_deter.detach()
+        imag_rl_feat = self._get_rl_feat(imag_stoch, imag_deter)
 
         imag_reward = self._frozen_reward(imag_feat).mode()
         imag_cont = self._frozen_cont(imag_feat).mean
-        imag_value = self._frozen_value(imag_feat).mode()
-        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+        imag_value = self._frozen_value(imag_rl_feat).mode()
+        imag_slow_value = self._frozen_slow_value(imag_rl_feat).mode()
         disc = 1 - 1 / self.horizon
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
@@ -427,14 +536,14 @@ class Dreamer(nn.Module):
         ret_offset, ret_scale = self.return_ema(ret)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
-        policy = self.actor(imag_feat)
+        policy = self.actor(imag_rl_feat)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() +
                                                   self.act_entropy * entropy)
         losses["policy"] = self._masked_mean(policy_loss, imag_mask)
 
-        imag_value_dist = self.value(imag_feat)
+        imag_value_dist = self.value(imag_rl_feat)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
         value_loss = (weight[:, :-1].detach() *
                       (-imag_value_dist.log_prob(tar_padded.detach()) -
@@ -602,21 +711,27 @@ class Dreamer(nn.Module):
         # (B, S, K), (B, D)
         feats = []
         actions = []
+        stoch_seq = []
+        deter_seq = []
         stoch, deter = start
         for _ in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
+            rl_feat = self._get_rl_feat(stoch, deter, frozen=True)
             # (B, A)
-            action = self._frozen_actor(feat).rsample()
+            action = self._frozen_actor(rl_feat).rsample()
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
+            stoch_seq.append(stoch)
+            deter_seq.append(deter)
             stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(
                 stoch, imag_carry, action)
 
         # Stack along sequence dim T_imag.
-        # (B, T_imag, F), (B, T_imag, A)
-        return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
+        # (B, T_imag, F), (B, T_imag, A), (B, T_imag, S, K), (B, T_imag, D)
+        return (torch.stack(feats, dim=1), torch.stack(actions, dim=1),
+                torch.stack(stoch_seq, dim=1), torch.stack(deter_seq, dim=1))
 
     @torch.no_grad()
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):

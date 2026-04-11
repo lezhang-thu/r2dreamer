@@ -9,8 +9,8 @@ device: ${device}
 rep_loss: "r2dreamer"  # only supported rep loss
 #imag_last: 0          # 0 = all T positions; >0 = K valid starts per episode
 imag_last: 64          # 0 = all T positions; >0 = K valid starts per episode
-wm_accum_steps: 16     # split replay batch for world-model grad accumulation
-ac_accum_steps: 8      # split imagination starts for actor-critic grad accumulation
+wm_accum_steps: 1      # split replay batch for world-model grad accumulation
+ac_accum_steps: 1      # split imagination starts for actor-critic grad accumulation
 
 lr: 4e-5
 agc: 0.3
