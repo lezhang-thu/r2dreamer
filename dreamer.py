@@ -17,8 +17,9 @@ from tools import to_f32
 
 class Dreamer(nn.Module):
 
-    def __init__(self, config, obs_space, act_space):
+    def __init__(self, config, obs_space, act_space, memory=None):
         super().__init__()
+        self.memory = memory
         self.device = torch.device(config.device)
         self.act_entropy = float(config.act_entropy)
         self.kl_free = float(config.kl_free)
@@ -29,9 +30,8 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
         if str(config.rep_loss) != "r2dreamer":
-            raise AssertionError(
-                "config.rep_loss must be 'r2dreamer' "
-                f"(got {str(config.rep_loss)!r}).")
+            raise AssertionError("config.rep_loss must be 'r2dreamer' "
+                                 f"(got {str(config.rep_loss)!r}).")
         self.imag_last = int(getattr(config, 'imag_last', 0))
         self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
         self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))

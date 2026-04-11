@@ -256,8 +256,9 @@ class ConvEncoder(nn.Module):
         h, w = self._downsample_dims(h, w, stem_stride)
         in_dim = self.depths[0]
         stages = []
-        for stage_idx, (depth, block_count) in enumerate(
-                zip(self.depths, self.blocks)):
+        for stage_idx, (depth,
+                        block_count) in enumerate(zip(self.depths,
+                                                      self.blocks)):
             blocks = []
             for block_idx in range(block_count):
                 stride = 1 if stage_idx == 0 or block_idx > 0 else 2

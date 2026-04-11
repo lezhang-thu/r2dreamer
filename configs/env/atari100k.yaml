@@ -18,10 +18,13 @@ encoder:
   cnn_keys: 'image'
 
 gray: False
-noops: 30
+#noops: 30
+noops: 0
 lives: unused
-sticky: False
-actions: needed
+#sticky: False
+sticky: True 
+#actions: needed
+actions: all
 pooling: 2
 aggregate: max
 resize: pillow

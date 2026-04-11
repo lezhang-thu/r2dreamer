@@ -7,9 +7,10 @@ import hydra
 import torch
 
 import tools
-from replay_y import ReplayY
 from dreamer import Dreamer
+from episode_memory import load_atari_memory_episode
 from envs import make_envs
+from replay_y import ReplayY
 from trainer import OnlineTrainer
 
 warnings.filterwarnings("ignore")
@@ -53,11 +54,32 @@ def main(config):
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
+    memory_path = pathlib.Path(__file__).with_name("ge.json")
+    memory = None
+    if memory_path.exists():
+        print(f"Load memory from {memory_path}.")
+        env_task = str(config.env.task)
+        memory_env_name = "montezuma_revenge"
+        memory_env_config = None
+        if env_task.startswith("atari_"):
+            memory_env_name = env_task.split("_", 1)[1]
+            memory_env_config = config.env
+        memory = load_atari_memory_episode(
+            memory_path,
+            env_name=memory_env_name,
+            env_config=memory_env_config,
+        )
+        print("Recovered memory episode with "
+              f"{len(memory['reward'])} replay-style steps.")
+    else:
+        print(f"Memory file {memory_path} not found; agent.memory=None.")
+
     print("Simulate agent.")
     agent = Dreamer(
         config.model,
         obs_space,
         act_space,
+        memory=memory,
     ).to(config.device)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
