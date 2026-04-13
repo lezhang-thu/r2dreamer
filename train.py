@@ -46,11 +46,6 @@ def main(config):
             f"(got window_size={int(config.model.transformer.window_size)}, "
             f"batch_length={int(config.batch_length)}).")
 
-    replay_buffer = ReplayY(
-        length=int(config.batch_length),
-        seed=config.seed,
-    )
-
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
@@ -73,6 +68,13 @@ def main(config):
               f"{len(memory['reward'])} replay-style steps.")
     else:
         print(f"Memory file {memory_path} not found; agent.memory=None.")
+
+    replay_buffer = ReplayY(
+        length=int(config.batch_length),
+        seed=config.seed,
+        memory=memory,
+        memory_sample_frac=float(config.buffer.memory_sample_frac),
+    )
 
     print("Simulate agent.")
     agent = Dreamer(
