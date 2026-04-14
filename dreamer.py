@@ -60,17 +60,11 @@ class Dreamer(nn.Module):
         else:
             config.actor.dist = config.actor.dist.cont
 
-        # Actor-critic components
-        self.rl_feat_size = self.rssm.flat_stoch + 2 * int(
-            config.transformer.deter)
+        # Actor-critic components — expert information is injected into RSSM
+        # via KV-cache prefix, so rl_feat = concat(flat_stoch, deter).
+        self.rl_feat_size = self.rssm.feat_size
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
-        self.memory_attention = nn.MultiheadAttention(
-            int(config.transformer.deter),
-            int(config.transformer.n_heads),
-            dropout=0.0,
-            batch_first=True,
-        )
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -87,7 +81,6 @@ class Dreamer(nn.Module):
             "rssm": self.rssm,
             "actor": self.actor,
             "value": self.value,
-            "memory_attention": self.memory_attention,
             "reward": self.reward,
             "cont": self.cont,
             "encoder": self.encoder,
@@ -174,7 +167,7 @@ class Dreamer(nn.Module):
 
     def clone_and_freeze(self):
         for name in ("encoder", "rssm", "reward", "cont", "actor", "value",
-                     "slow_value", "memory_attention"):
+                     "slow_value"):
             setattr(
                 self, f"_frozen_{name}",
                 self._freeze_copy(
@@ -224,8 +217,11 @@ class Dreamer(nn.Module):
                                                  data["action"],
                                                  data["is_first"],
                                                  sample=False)
+        # Store both deter and KV-cache for expert trajectory
         self._memory_context = {
             "deter": feat_dict["deter"].squeeze(0).detach(),
+            "kv_k": feat_dict["kv_k"].squeeze(0).detach(),  # (L, T+W, D)
+            "kv_v": feat_dict["kv_v"].squeeze(0).detach(),  # (L, T+W, D)
         }
         self._memory_context_stale = False
         return self._memory_context
@@ -238,44 +234,31 @@ class Dreamer(nn.Module):
             return self.refresh_memory_context()
         return self._memory_context
 
-    def _apply_memory_attention(self,
-                                deter,
-                                frozen=False,
-                                require_fresh_memory=False):
-        memory_context = self._get_memory_context(
-            require_fresh=require_fresh_memory)
+    def _get_expert_kv_prefix(self, require_fresh=False):
+        """Extract expert KV prefix from memory context for RSSM injection."""
+        memory_context = self._get_memory_context(require_fresh=require_fresh)
         if memory_context is None:
-            return torch.zeros_like(deter)
-        if deter.ndim not in (2, 3):
-            raise ValueError("Memory attention expects deter with rank 2 or 3 "
-                             f"(got shape {tuple(deter.shape)}).")
-        query = deter.unsqueeze(1) if deter.ndim == 2 else deter
-        memory_deter = memory_context["deter"].detach().to(
-            device=query.device,
-            dtype=query.dtype,
-        ).unsqueeze(0).expand(query.shape[0], -1, -1)
-        attention = (self._frozen_memory_attention
-                     if frozen else self.memory_attention)
-        attended, _ = attention(query,
-                                memory_deter,
-                                memory_deter,
-                                need_weights=False)
-        if deter.ndim == 2:
-            attended = attended[:, 0]
-        return attended
+            return None
+        # Extract only the actual expert trajectory KV (skip the W dummy prefix slots)
+        # memory_context has kv_k/kv_v with shape (L, T+W, D)
+        # We want to skip the first W positions which are dummy zeros
+        W = self.rssm._window_size
+        kv_k = memory_context["kv_k"][:, W:, :]  # (L, T, D)
+        kv_v = memory_context["kv_v"][:, W:, :]  # (L, T, D)
+        return {'k': kv_k, 'v': kv_v}
 
     def _get_rl_feat(self,
                      stoch,
                      deter,
                      frozen=False,
                      require_fresh_memory=False):
-        attended_deter = self._apply_memory_attention(
-            deter,
-            frozen=frozen,
-            require_fresh_memory=require_fresh_memory,
-        )
+        """Get RL feature for actor-critic.
+
+        Expert information is now injected directly into the RSSM via KV-cache
+        prefix, so we just use the standard feat = concat(flat_stoch, deter).
+        """
         stoch_flat = stoch.reshape(*stoch.shape[:-2], self.rssm.flat_stoch)
-        return torch.cat([stoch_flat, deter, attended_deter], dim=-1)
+        return torch.cat([stoch_flat, deter], dim=-1)
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
@@ -284,6 +267,9 @@ class Dreamer(nn.Module):
         p_obs = self.preprocess(obs)
         # (B, E)
         embed = self._frozen_encoder(p_obs)
+
+        # Get expert KV prefix for injection
+        expert_kv_prefix = self._get_expert_kv_prefix(require_fresh=True)
 
         # Two-phase KV-cache inference
         carry = {
@@ -304,7 +290,8 @@ class Dreamer(nn.Module):
         action_dist = self._frozen_actor(rl_feat)
         action = action_dist.mode if eval else action_dist.rsample()
         # Phase 2: update KV-cache with (stoch, action)
-        carry = self._frozen_rssm.update_carry(carry, stoch, action, is_first)
+        carry = self._frozen_rssm.update_carry(carry, stoch, action, is_first,
+                                               expert_kv_prefix=expert_kv_prefix)
         return action, TensorDict(
             {
                 "kv_cache": carry['kv_cache'],
@@ -461,13 +448,16 @@ class Dreamer(nn.Module):
         losses = {}
         metrics = {}
 
+        # Get expert KV prefix for injection into RSSM
+        expert_kv_prefix = self._get_expert_kv_prefix(require_fresh=False)
+
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
         embed = self.encoder(data)
 
         # Transformer path: posterior from tokens, transition on (stoch, a_t)
         action = data["action"]  # (B, T, A) — current action a_t
-        _, feat_dict = self.rssm.observe(embed, action, data["is_first"])
+        _, feat_dict = self.rssm.observe(embed, action, data["is_first"], expert_kv_prefix=expert_kv_prefix)
         post_stoch = feat_dict['stoch']  # (B, T, S, K)
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
@@ -708,6 +698,8 @@ class Dreamer(nn.Module):
     def _imagine(self, start, imag_horizon, imag_carry=None):
         """Roll out the policy in latent space."""
         assert imag_carry is not None
+        # Get expert KV prefix for frozen RSSM imagination
+        expert_kv_prefix = self._get_expert_kv_prefix(require_fresh=False)
         # (B, S, K), (B, D)
         feats = []
         actions = []
@@ -726,7 +718,7 @@ class Dreamer(nn.Module):
             stoch_seq.append(stoch)
             deter_seq.append(deter)
             stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(
-                stoch, imag_carry, action)
+                stoch, imag_carry, action, expert_kv_prefix=expert_kv_prefix)
 
         # Stack along sequence dim T_imag.
         # (B, T_imag, F), (B, T_imag, A), (B, T_imag, S, K), (B, T_imag, D)

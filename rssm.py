@@ -124,7 +124,7 @@ class TransformerRSSM(nn.Module):
     # Training path
     # ------------------------------------------------------------------
 
-    def observe(self, tokens, action, reset, sample=True):
+    def observe(self, tokens, action, reset, sample=True, expert_kv_prefix=None):
         """Windowed-causal full-sequence training path.
 
         Args:
@@ -134,6 +134,8 @@ class TransformerRSSM(nn.Module):
             sample: Whether to sample posterior stochastics. When False,
                 uses the posterior mode, which is useful for deterministic
                 cached reference trajectories.
+            expert_kv_prefix: Optional dict with 'k' (L, T_exp, D) and 'v' (L, T_exp, D)
+                expert KV-cache to prepend as prefix for cross-attention.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
             feat: dict with deter, stoch, post_logit, prior_logit, and
@@ -154,8 +156,8 @@ class TransformerRSSM(nn.Module):
         stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)
         x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
 
-        # Causal Transformer forward
-        h, kv = self._fwd(x, return_kv=True)  # (B, T, D)
+        # Causal Transformer forward with optional expert prefix
+        h, kv = self._fwd(x, return_kv=True, expert_kv_prefix=expert_kv_prefix)  # (B, T, D)
 
         # Shift right: h_prev[t] = h[t-1], h_prev[0] = 0
         h_prev = torch.cat([torch.zeros_like(h[:, :1]), h[:, :-1]], dim=1)
@@ -207,11 +209,14 @@ class TransformerRSSM(nn.Module):
             x_t = self._rope(x_t, input_pos=positions.to(torch.long))
         return x_t.transpose(1, 2)
 
-    def _fwd(self, x, return_kv=False):
+    def _fwd(self, x, return_kv=False, expert_kv_prefix=None):
         """Pre-norm causal Transformer with RoPE.
 
         Args:
             x: (B, T, D) input sequence.
+            return_kv: Whether to return KV cache.
+            expert_kv_prefix: Optional dict with 'k' (L, T_exp, D) and 'v' (L, T_exp, D)
+                expert KV-cache to prepend as prefix for cross-attention.
         Returns:
             (B, T, D) transformed sequence.
         """
@@ -219,14 +224,33 @@ class TransformerRSSM(nn.Module):
         H = self._n_heads
         D_head = self._d_head
         W = self._window_size
+
+        # Determine if we have expert prefix
+        has_expert = expert_kv_prefix is not None
+        T_exp = 0
+        if has_expert:
+            T_exp = expert_kv_prefix['k'].shape[1]
+            # Expand expert prefix to batch size
+            expert_k = expert_kv_prefix['k'].unsqueeze(0).expand(B, -1, -1, -1)  # (B, L, T_exp, D)
+            expert_v = expert_kv_prefix['v'].unsqueeze(0).expand(B, -1, -1, -1)
+
         # Windowed causal mask: each query can attend to at most W recent keys
         # (including itself), matching inference/imagination transition scope.
+        # If expert prefix exists, queries can attend to all expert keys + causal agent keys.
         causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
         if W < T:
             local = torch.triu(causal, diagonal=-(W - 1))
         else:
             local = causal
-        attn_mask = local.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+
+        if has_expert:
+            # Mask shape: (T_query, T_exp + T_key)
+            # All queries can attend to all expert prefix positions
+            expert_mask = torch.ones(T, T_exp, dtype=torch.bool, device=x.device)
+            attn_mask = torch.cat([expert_mask, local], dim=1).unsqueeze(0).unsqueeze(0)  # (1, 1, T, T_exp+T)
+        else:
+            attn_mask = local.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+
         if return_kv:
             k_layers = []
             v_layers = []
@@ -241,10 +265,21 @@ class TransformerRSSM(nn.Module):
             V = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
             Q = self._apply_rope(Q, positions=None)
             K = self._apply_rope(K, positions=None)
+
             if return_kv:
                 # Match cache storage layout used by update_carry.
                 k_layers.append(K.transpose(1, 2).reshape(B, T, D))
                 v_layers.append(V.transpose(1, 2).reshape(B, T, D))
+
+            # Prepend expert KV if available
+            if has_expert:
+                # Get expert KV for this layer — already has RoPE applied
+                K_exp = expert_k[:, i].reshape(B, T_exp, H, D_head).transpose(1, 2)  # (B, H, T_exp, D_head)
+                V_exp = expert_v[:, i].reshape(B, T_exp, H, D_head).transpose(1, 2)
+                # Concatenate expert and agent KV
+                K = torch.cat([K_exp, K], dim=2)  # (B, H, T_exp+T, D_head)
+                V = torch.cat([V_exp, V], dim=2)
+
             x = F.scaled_dot_product_attention(
                 Q, K, V, attn_mask=attn_mask)  # (B, H, T, D_head)
             x = x.transpose(1, 2).reshape(B, T, D)
@@ -275,12 +310,12 @@ class TransformerRSSM(nn.Module):
         stoch, deter, _ = self.img_step_with_carry(stoch, carry, action)
         return stoch, deter
 
-    def img_step_with_carry(self, stoch, carry, action):
+    def img_step_with_carry(self, stoch, carry, action, expert_kv_prefix=None):
         """Single prior step with KV-cache carry."""
         reset = torch.zeros(stoch.shape[0],
                             dtype=torch.bool,
                             device=stoch.device)
-        carry = self.update_carry(carry, stoch, action, reset)
+        carry = self.update_carry(carry, stoch, action, reset, expert_kv_prefix=expert_kv_prefix)
         deter = carry['h_prev']
         stoch, _ = self.prior(deter)
         return stoch, deter, carry
@@ -337,7 +372,7 @@ class TransformerRSSM(nn.Module):
         }
         return start_stoch, start_deter, carry
 
-    def imagine_with_action(self, stoch, deter, actions, carry=None):
+    def imagine_with_action(self, stoch, deter, actions, carry=None, expert_kv_prefix=None):
         """Roll out prior dynamics given a sequence of actions.
 
         If carry is provided, rolling context is preserved with KV-cache.
@@ -349,7 +384,7 @@ class TransformerRSSM(nn.Module):
             carry['h_prev'] = deter
         for i in range(L):
             stoch, deter, carry = self.img_step_with_carry(
-                stoch, carry, actions[:, i])
+                stoch, carry, actions[:, i], expert_kv_prefix=expert_kv_prefix)
             stochs.append(stoch)
             deters.append(deter)
         # (B, T, S, K), (B, T, D)
@@ -411,7 +446,7 @@ class TransformerRSSM(nn.Module):
         pos = carry['pos'] * (~reset).int()
         return {'kv_cache': kv_cache, 'pos': pos, 'h_prev': h_prev}
 
-    def update_carry(self, carry, stoch, action, reset):
+    def update_carry(self, carry, stoch, action, reset, expert_kv_prefix=None):
         """Phase 2: KV-cache Transformer step with (stoch, action) -> h_t.
 
         Args:
@@ -419,6 +454,8 @@ class TransformerRSSM(nn.Module):
             stoch: (B, S, K) posterior/imagined stochastic state.
             action: (B, A) action taken at current step.
             reset: (B,) boolean.
+            expert_kv_prefix: Optional dict with 'k' (L, T_exp, D) and 'v' (L, T_exp, D)
+                expert KV-cache to prepend as prefix for cross-attention.
         Returns:
             Updated carry dict with new h_prev = h_t.
         """
@@ -429,6 +466,15 @@ class TransformerRSSM(nn.Module):
         H = self._n_heads
         D_head = self._d_head
         W = self._window_size
+
+        # Determine if we have expert prefix
+        has_expert = expert_kv_prefix is not None
+        T_exp = 0
+        if has_expert:
+            T_exp = expert_kv_prefix['k'].shape[1]
+            # Expand expert prefix to batch size
+            expert_k = expert_kv_prefix['k'].unsqueeze(0).expand(B, -1, -1, -1)  # (B, L, T_exp, D)
+            expert_v = expert_kv_prefix['v'].unsqueeze(0).expand(B, -1, -1, -1)
 
         # Normalize action
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
@@ -447,8 +493,14 @@ class TransformerRSSM(nn.Module):
         j = torch.arange(W, device=x_t.device)
         # (B, W) bool — True = can attend
         valid_mask = (j.unsqueeze(0) >= (W - n_valid).unsqueeze(1))
-        # (B, 1, 1, W) for scaled_dot_product_attention
-        attn_mask = valid_mask.unsqueeze(1).unsqueeze(2)
+
+        if has_expert:
+            # Query can attend to all expert positions + valid agent cache positions
+            expert_mask = torch.ones(B, T_exp, dtype=torch.bool, device=x_t.device)
+            attn_mask = torch.cat([expert_mask, valid_mask], dim=1).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T_exp+W)
+        else:
+            # (B, 1, 1, W) for scaled_dot_product_attention
+            attn_mask = valid_mask.unsqueeze(1).unsqueeze(2)
 
         new_kv_cache_layers = []
         for i in range(self._n_layers):
@@ -480,6 +532,15 @@ class TransformerRSSM(nn.Module):
             # Reshape cached K/V for attention: (B, W, D) -> (B, H, W, D_head)
             K_cached = k_cache.reshape(B, W, H, D_head).transpose(1, 2)
             V_cached = v_cache.reshape(B, W, H, D_head).transpose(1, 2)
+
+            # Prepend expert KV if available
+            if has_expert:
+                # Get expert KV for this layer — already has RoPE applied
+                K_exp = expert_k[:, i].reshape(B, T_exp, H, D_head).transpose(1, 2)  # (B, H, T_exp, D_head)
+                V_exp = expert_v[:, i].reshape(B, T_exp, H, D_head).transpose(1, 2)
+                # Concatenate expert and agent KV
+                K_cached = torch.cat([K_exp, K_cached], dim=2)  # (B, H, T_exp+W, D_head)
+                V_cached = torch.cat([V_exp, V_cached], dim=2)
 
             # Cross-attend Q to cached K/V
             x_t = F.scaled_dot_product_attention(Q,

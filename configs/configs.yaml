@@ -21,7 +21,7 @@ buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   max_size: 5e5
-  memory_sample_frac: 0.5
+  memory_sample_frac: 0.1
   device: ${device}
   storage_device: 'cuda:0'
 
