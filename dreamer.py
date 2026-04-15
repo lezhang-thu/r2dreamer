@@ -10,9 +10,21 @@ from torch.optim.lr_scheduler import LambdaLR
 import networks
 import rssm
 import tools
+from distributions import symlog
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
+
+
+class ExpertTag(nn.Module):
+    """Wraps a learned expert-source embedding as a Module so it can be cloned/frozen."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.tag = nn.Parameter(torch.zeros(dim))
+
+    def forward(self):
+        return self.tag
 
 
 class Dreamer(nn.Module):
@@ -65,12 +77,26 @@ class Dreamer(nn.Module):
             config.transformer.deter)
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
+        deter_dim = int(config.transformer.deter)
         self.memory_attention = nn.MultiheadAttention(
-            int(config.transformer.deter),
+            deter_dim,
             int(config.transformer.n_heads),
             dropout=0.0,
             batch_first=True,
         )
+        # Memory token MLP: [deter, stoch_flat, action, rtg_emb] -> deter.
+        rtg_emb_dim = 16
+        self.rtg_proj = nn.Linear(1, rtg_emb_dim)
+        mem_in_dim = (deter_dim + self.rssm.flat_stoch + self.act_dim +
+                      rtg_emb_dim)
+        self.mem_proj = nn.Sequential(
+            nn.Linear(mem_in_dim, deter_dim),
+            nn.SiLU(),
+            nn.Linear(deter_dim, deter_dim),
+        )
+        self.expert_tag = ExpertTag(deter_dim)
+        self._mem_pos_emb = None  # cached sinusoidal table, shape (T, deter_dim)
+        self._mem_disc = 1.0 - 1.0 / float(self.horizon)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -88,6 +114,9 @@ class Dreamer(nn.Module):
             "actor": self.actor,
             "value": self.value,
             "memory_attention": self.memory_attention,
+            "mem_proj": self.mem_proj,
+            "rtg_proj": self.rtg_proj,
+            "expert_tag": self.expert_tag,
             "reward": self.reward,
             "cont": self.cont,
             "encoder": self.encoder,
@@ -174,7 +203,8 @@ class Dreamer(nn.Module):
 
     def clone_and_freeze(self):
         for name in ("encoder", "rssm", "reward", "cont", "actor", "value",
-                     "slow_value", "memory_attention"):
+                     "slow_value", "memory_attention", "mem_proj", "rtg_proj",
+                     "expert_tag"):
             setattr(
                 self, f"_frozen_{name}",
                 self._freeze_copy(
@@ -224,8 +254,24 @@ class Dreamer(nn.Module):
                                                  data["action"],
                                                  data["is_first"],
                                                  sample=False)
+        deter = feat_dict["deter"].squeeze(0).detach()  # (T, D)
+        stoch = feat_dict["stoch"].squeeze(0).detach()  # (T, S, K)
+        stoch_flat = stoch.reshape(stoch.shape[0], -1)  # (T, flat_stoch)
+        action = data["action"].squeeze(0).to(dtype=deter.dtype)  # (T, A)
+        reward = data["reward"].squeeze(0).to(dtype=torch.float32)  # (T,)
+        # Discounted return-to-go: G_t = sum_{k>=t} disc^(k-t) * r_k.
+        T = reward.shape[0]
+        G = torch.zeros_like(reward)
+        running = torch.zeros((), dtype=torch.float32, device=reward.device)
+        for t in range(T - 1, -1, -1):
+            running = reward[t] + self._mem_disc * running
+            G[t] = running
+        rtg = symlog(G).to(dtype=deter.dtype).unsqueeze(-1)  # (T, 1)
         self._memory_context = {
-            "deter": feat_dict["deter"].squeeze(0).detach(),
+            "deter": deter,
+            "stoch_flat": stoch_flat.to(dtype=deter.dtype),
+            "action": action,
+            "rtg": rtg,
         }
         self._memory_context_stale = False
         return self._memory_context
@@ -237,6 +283,20 @@ class Dreamer(nn.Module):
                                             self._memory_context_stale):
             return self.refresh_memory_context()
         return self._memory_context
+
+    def _build_memory_tokens(self, memory_context, dtype, device, frozen):
+        """Build memory K/V tokens from cached raw features (with grad)."""
+        deter = memory_context["deter"].to(device=device, dtype=dtype)
+        stoch_flat = memory_context["stoch_flat"].to(device=device, dtype=dtype)
+        action = memory_context["action"].to(device=device, dtype=dtype)
+        rtg = memory_context["rtg"].to(device=device, dtype=dtype)
+        rtg_proj = self._frozen_rtg_proj if frozen else self.rtg_proj
+        proj = self._frozen_mem_proj if frozen else self.mem_proj
+        tag_module = self._frozen_expert_tag if frozen else self.expert_tag
+        rtg_emb = rtg_proj(rtg)  # (T, d_rtg)
+        feats = torch.cat([deter, stoch_flat, action, rtg_emb], dim=-1)
+        tokens = proj(feats) + tag_module()  # (T, D)
+        return tokens
 
     def _apply_memory_attention(self,
                                 deter,
@@ -250,15 +310,16 @@ class Dreamer(nn.Module):
             raise ValueError("Memory attention expects deter with rank 2 or 3 "
                              f"(got shape {tuple(deter.shape)}).")
         query = deter.unsqueeze(1) if deter.ndim == 2 else deter
-        memory_deter = memory_context["deter"].detach().to(
-            device=query.device,
-            dtype=query.dtype,
-        ).unsqueeze(0).expand(query.shape[0], -1, -1)
+        mem_tokens = self._build_memory_tokens(memory_context,
+                                               dtype=query.dtype,
+                                               device=query.device,
+                                               frozen=frozen)
+        mem_tokens = mem_tokens.unsqueeze(0).expand(query.shape[0], -1, -1)
         attention = (self._frozen_memory_attention
                      if frozen else self.memory_attention)
         attended, _ = attention(query,
-                                memory_deter,
-                                memory_deter,
+                                mem_tokens,
+                                mem_tokens,
                                 need_weights=False)
         if deter.ndim == 2:
             attended = attended[:, 0]
