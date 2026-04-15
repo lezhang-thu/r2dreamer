@@ -10,9 +10,21 @@ from torch.optim.lr_scheduler import LambdaLR
 import networks
 import rssm
 import tools
+from distributions import symlog
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
+
+
+class ExpertTag(nn.Module):
+    """Marks retrieved memory tokens as expert context."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.tag = nn.Parameter(torch.zeros(int(dim), dtype=torch.float32))
+
+    def forward(self, x):
+        return x + self.tag.to(device=x.device, dtype=x.dtype)
 
 
 class Dreamer(nn.Module):
@@ -27,6 +39,8 @@ class Dreamer(nn.Module):
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
         self.return_ema = networks.ReturnEMA(device=self.device)
+        self._mem_disc = 1.0 - 1.0 / self.horizon
+        self._memory_waypoint_offset = max(1, min(self.imag_horizon, 8))
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
         if str(config.rep_loss) != "r2dreamer":
@@ -61,15 +75,32 @@ class Dreamer(nn.Module):
             config.actor.dist = config.actor.dist.cont
 
         # Actor-critic components
-        self.rl_feat_size = self.rssm.flat_stoch + 2 * int(
-            config.transformer.deter)
+        deter_dim = int(config.transformer.deter)
+        act_fn = getattr(torch.nn, config.transformer.act)
+        self._memory_scalar_dim = 3  # reward, return-to-go, progress
+        self._memory_rtg_embed_dim = 16
+        self.rtg_proj = nn.Linear(1, self._memory_rtg_embed_dim, bias=True)
+        self.mem_proj = nn.Sequential(
+            nn.Linear(self.rssm.feat_size + self.act_dim +
+                      self._memory_rtg_embed_dim, deter_dim, bias=True),
+            act_fn(),
+            nn.Linear(deter_dim, deter_dim, bias=True),
+        )
+        self.expert_tag = ExpertTag(deter_dim)
+        self.rl_feat_size = (self.rssm.flat_stoch + 3 * deter_dim +
+                             self.act_dim + self._memory_scalar_dim)
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
         self.memory_attention = nn.MultiheadAttention(
-            int(config.transformer.deter),
+            deter_dim,
             int(config.transformer.n_heads),
             dropout=0.0,
             batch_first=True,
+        )
+        self.memory_progress = nn.Sequential(
+            nn.Linear(deter_dim, deter_dim, bias=True),
+            act_fn(),
+            nn.Linear(deter_dim, 1, bias=True),
         )
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
@@ -87,7 +118,11 @@ class Dreamer(nn.Module):
             "rssm": self.rssm,
             "actor": self.actor,
             "value": self.value,
+            "rtg_proj": self.rtg_proj,
+            "mem_proj": self.mem_proj,
+            "expert_tag": self.expert_tag,
             "memory_attention": self.memory_attention,
+            "memory_progress": self.memory_progress,
             "reward": self.reward,
             "cont": self.cont,
             "encoder": self.encoder,
@@ -174,7 +209,8 @@ class Dreamer(nn.Module):
 
     def clone_and_freeze(self):
         for name in ("encoder", "rssm", "reward", "cont", "actor", "value",
-                     "slow_value", "memory_attention"):
+                     "slow_value", "rtg_proj", "mem_proj", "expert_tag",
+                     "memory_attention", "memory_progress"):
             setattr(
                 self, f"_frozen_{name}",
                 self._freeze_copy(
@@ -212,6 +248,33 @@ class Dreamer(nn.Module):
         data["is_first"][:, 0] = True
         return TensorDict(data, batch_size=(1, T))
 
+    def _compute_memory_return_to_go(self, reward):
+        reward = reward.reshape(-1).to(device=self.device, dtype=torch.float32)
+        rtg = torch.zeros_like(reward)
+        running = torch.zeros((), dtype=torch.float32, device=reward.device)
+        disc = float(getattr(self, "_mem_disc", 1.0))
+        for idx in reversed(range(int(reward.shape[0]))):
+            running = reward[idx] + disc * running
+            rtg[idx] = running
+        return rtg.unsqueeze(-1)
+
+    def _compute_memory_progress(self, length, device):
+        length = int(length)
+        if length <= 1:
+            return torch.zeros(length, 1, dtype=torch.float32, device=device)
+        return torch.linspace(0.0,
+                              1.0,
+                              steps=length,
+                              dtype=torch.float32,
+                              device=device).unsqueeze(-1)
+
+    def _compute_memory_waypoint(self, deter):
+        T = int(deter.shape[0])
+        offset = min(int(self._memory_waypoint_offset), max(T - 1, 0))
+        index = torch.arange(T, device=deter.device) + offset
+        index = torch.clamp(index, max=max(T - 1, 0))
+        return deter[index]
+
     @torch.no_grad()
     def refresh_memory_context(self):
         if self.memory is None:
@@ -224,8 +287,21 @@ class Dreamer(nn.Module):
                                                  data["action"],
                                                  data["is_first"],
                                                  sample=False)
+        deter = feat_dict["deter"].squeeze(0).detach()
+        stoch_flat = feat_dict["stoch"].squeeze(0).reshape(
+            deter.shape[0], self.rssm.flat_stoch).detach()
+        reward = data["reward"].squeeze(0).to(torch.float32).unsqueeze(-1)
+        raw_rtg = self._compute_memory_return_to_go(reward).detach()
         self._memory_context = {
-            "deter": feat_dict["deter"].squeeze(0).detach(),
+            "deter": deter,
+            "stoch_flat": stoch_flat,
+            "action": data["action"].squeeze(0).detach(),
+            "reward": reward.detach(),
+            "rtg": symlog(raw_rtg).detach(),
+            "raw_rtg": raw_rtg,
+            "progress": self._compute_memory_progress(deter.shape[0],
+                                                       deter.device).detach(),
+            "waypoint": self._compute_memory_waypoint(deter).detach(),
         }
         self._memory_context_stale = False
         return self._memory_context
@@ -238,44 +314,129 @@ class Dreamer(nn.Module):
             return self.refresh_memory_context()
         return self._memory_context
 
+    def _build_memory_tokens(self, memory_context, dtype, device, frozen=False):
+        if memory_context is None:
+            return None
+        rtg_proj = self._frozen_rtg_proj if frozen else self.rtg_proj
+        mem_proj = self._frozen_mem_proj if frozen else self.mem_proj
+        expert_tag = self._frozen_expert_tag if frozen else self.expert_tag
+        deter = memory_context["deter"].to(device=device, dtype=dtype)
+        stoch_flat = memory_context["stoch_flat"].to(device=device, dtype=dtype)
+        action = memory_context["action"].to(device=device, dtype=dtype)
+        rtg = memory_context["rtg"].to(device=device, dtype=dtype)
+        token_feat = torch.cat([deter, stoch_flat, action, rtg_proj(rtg)], dim=-1)
+        return expert_tag(mem_proj(token_feat))
+
+    def _zero_memory_readout(self, query):
+        zeros_d = torch.zeros_like(query)
+        return {
+            "token": zeros_d,
+            "waypoint": zeros_d,
+            "action": torch.zeros(*query.shape[:-1],
+                                   self.act_dim,
+                                   dtype=query.dtype,
+                                   device=query.device),
+            "reward": torch.zeros(*query.shape[:-1],
+                                   1,
+                                   dtype=query.dtype,
+                                   device=query.device),
+            "rtg": torch.zeros(*query.shape[:-1],
+                                1,
+                                dtype=query.dtype,
+                                device=query.device),
+            "progress": torch.zeros(*query.shape[:-1],
+                                     1,
+                                     dtype=query.dtype,
+                                     device=query.device),
+            "weights": None,
+        }
+
+    def _read_memory(self, deter, frozen=False, require_fresh_memory=False):
+        memory_context = self._get_memory_context(
+            require_fresh=require_fresh_memory)
+        if deter.ndim not in (2, 3):
+            raise ValueError("Memory attention expects deter with rank 2 or 3 "
+                             f"(got shape {tuple(deter.shape)}).")
+        squeeze_time = deter.ndim == 2
+        query = deter.unsqueeze(1) if squeeze_time else deter
+        if memory_context is None:
+            readout = self._zero_memory_readout(query)
+        else:
+            memory_tokens = self._build_memory_tokens(memory_context,
+                                                      dtype=query.dtype,
+                                                      device=query.device,
+                                                      frozen=frozen)
+            memory_tokens = memory_tokens.unsqueeze(0).expand(query.shape[0], -1,
+                                                              -1)
+            attention = (self._frozen_memory_attention
+                         if frozen else self.memory_attention)
+            attended, weights = attention(query,
+                                          memory_tokens,
+                                          memory_tokens,
+                                          need_weights=True)
+            readout = {
+                "token": attended,
+                "weights": weights,
+            }
+            for key in ("waypoint", "action", "reward", "rtg", "progress"):
+                value = memory_context[key].to(device=query.device,
+                                               dtype=query.dtype)
+                value = value.unsqueeze(0).expand(query.shape[0], -1, -1)
+                readout[key] = torch.matmul(weights, value)
+        if squeeze_time:
+            for key, value in tuple(readout.items()):
+                if value is not None:
+                    readout[key] = value[:, 0]
+        return readout
+
     def _apply_memory_attention(self,
                                 deter,
                                 frozen=False,
                                 require_fresh_memory=False):
-        memory_context = self._get_memory_context(
-            require_fresh=require_fresh_memory)
+        return self._read_memory(deter,
+                                 frozen=frozen,
+                                 require_fresh_memory=require_fresh_memory)["token"]
+
+    def _memory_targets(self, memory_index, dtype, device, require_fresh=False):
+        memory_context = self._get_memory_context(require_fresh=require_fresh)
         if memory_context is None:
-            return torch.zeros_like(deter)
-        if deter.ndim not in (2, 3):
-            raise ValueError("Memory attention expects deter with rank 2 or 3 "
-                             f"(got shape {tuple(deter.shape)}).")
-        query = deter.unsqueeze(1) if deter.ndim == 2 else deter
-        memory_deter = memory_context["deter"].detach().to(
-            device=query.device,
-            dtype=query.dtype,
-        ).unsqueeze(0).expand(query.shape[0], -1, -1)
-        attention = (self._frozen_memory_attention
-                     if frozen else self.memory_attention)
-        attended, _ = attention(query,
-                                memory_deter,
-                                memory_deter,
-                                need_weights=False)
-        if deter.ndim == 2:
-            attended = attended[:, 0]
-        return attended
+            return None
+        memory_index = memory_index.to(device=device, dtype=torch.long)
+        gather_index = torch.clamp(memory_index, min=0)
+        targets = {}
+        for key in ("reward", "rtg", "raw_rtg", "progress", "waypoint"):
+            value = memory_context[key].to(device=device, dtype=dtype)
+            picked = value[gather_index.reshape(-1)]
+            targets[key] = picked.reshape(*gather_index.shape, value.shape[-1])
+        return targets
 
     def _get_rl_feat(self,
                      stoch,
                      deter,
                      frozen=False,
-                     require_fresh_memory=False):
-        attended_deter = self._apply_memory_attention(
+                     require_fresh_memory=False,
+                     return_aux=False):
+        memory_readout = self._read_memory(
             deter,
             frozen=frozen,
             require_fresh_memory=require_fresh_memory,
         )
         stoch_flat = stoch.reshape(*stoch.shape[:-2], self.rssm.flat_stoch)
-        return torch.cat([stoch_flat, deter, attended_deter], dim=-1)
+        reward_feat = symlog(memory_readout["reward"])
+        rl_feat = torch.cat([
+            stoch_flat,
+            deter,
+            memory_readout["token"],
+            memory_readout["waypoint"],
+            memory_readout["action"],
+            reward_feat,
+            memory_readout["rtg"],
+            memory_readout["progress"],
+        ],
+                            dim=-1)
+        if return_aux:
+            return rl_feat, memory_readout
+        return rl_feat
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
@@ -492,6 +653,46 @@ class Dreamer(nn.Module):
         cont = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         con_loss = -self.cont(feat).log_prob(cont)  # (B, T)
         losses["con"] = self._masked_mean(con_loss, t_mask)
+
+        memory_mask = data["is_memory"] & data["t_mask"]
+        memory_targets = self._memory_targets(data["memory_index"],
+                                              dtype=torch.float32,
+                                              device=post_deter.device,
+                                              require_fresh=False)
+        if memory_targets is not None and bool(memory_mask.any().item()):
+            expert_rl_feat, memory_readout = self._get_rl_feat(
+                post_stoch.detach(),
+                post_deter.detach(),
+                frozen=False,
+                require_fresh_memory=False,
+                return_aux=True,
+            )
+            progress_pred = torch.sigmoid(self.memory_progress(post_deter.detach()))
+            progress_loss = (progress_pred - memory_targets["progress"]).pow(2)
+            losses["memory_progress"] = self._masked_mean(
+                progress_loss, memory_mask.unsqueeze(-1))
+
+            align_log_prob = torch.log(memory_readout["weights"].clamp_min(1e-6))
+            target_index = data["memory_index"].clamp(min=0).to(torch.long)
+            align_loss = -align_log_prob.gather(-1,
+                                                target_index.unsqueeze(-1))
+            losses["memory_align"] = self._masked_mean(align_loss,
+                                                       memory_mask.unsqueeze(-1))
+
+            expert_value = self.value(expert_rl_feat)
+            value_prior_loss = -expert_value.log_prob(
+                memory_targets["raw_rtg"].to(torch.float32))
+            losses["memory_value"] = self._masked_mean(value_prior_loss,
+                                                       memory_mask)
+
+            pred_index = memory_readout["weights"].argmax(dim=-1)
+            metrics["memory_progress_mae"] = self._masked_mean(
+                (progress_pred - memory_targets["progress"]).abs(),
+                memory_mask.unsqueeze(-1))
+            metrics["memory_align_acc"] = self._masked_mean(
+                (pred_index == target_index).to(torch.float32), memory_mask)
+            metrics["memory_rtg"] = self._masked_mean(memory_targets["raw_rtg"],
+                                                      memory_mask.unsqueeze(-1))
 
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())

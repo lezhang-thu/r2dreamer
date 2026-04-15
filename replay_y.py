@@ -86,7 +86,7 @@ class ReplayY:
             self.write_pos = (self.write_pos + 1) % self.capacity
             self.num_eps = min(self.num_eps + 1, self.capacity)
 
-    def _sample_episode_segments(self, episodes, batch):
+    def _sample_episode_segments(self, episodes, batch, from_memory=False):
         if batch <= 0:
             return [], []
         if not episodes:
@@ -120,6 +120,13 @@ class ReplayY:
                     pad = np.zeros((L - valid_len, *v.shape[1:]), dtype=v.dtype)
                     arr = np.concatenate([arr, pad], axis=0)
                 item[k] = arr
+            item["is_memory"] = np.zeros(L, dtype=bool)
+            item["memory_index"] = np.full(L, -1, dtype=np.int32)
+            if from_memory:
+                item["is_memory"][:valid_len] = True
+                item["memory_index"][:valid_len] = np.arange(start,
+                                                              stop,
+                                                              dtype=np.int32)
             seqs.append(item)
             valid_lens.append(valid_len)
         return seqs, valid_lens
@@ -152,12 +159,12 @@ class ReplayY:
         valid_lens = []
         if replay_batch > 0:
             replay_seqs, replay_valid_lens = self._sample_episode_segments(
-                valid, replay_batch)
+                valid, replay_batch, from_memory=False)
             seqs.extend(replay_seqs)
             valid_lens.extend(replay_valid_lens)
         if memory_batch > 0:
             memory_seqs, memory_valid_lens = self._sample_episode_segments(
-                [self.memory], memory_batch)
+                [self.memory], memory_batch, from_memory=True)
             seqs.extend(memory_seqs)
             valid_lens.extend(memory_valid_lens)
 
