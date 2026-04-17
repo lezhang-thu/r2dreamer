@@ -34,6 +34,8 @@ loss_scales:
   policy: 1.0
   value: 1.0
 
+expert_shaping_scale: 0.1
+
 r2dreamer:
   lambd: 5e-4
 
