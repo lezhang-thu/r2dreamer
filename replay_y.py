@@ -125,8 +125,8 @@ class ReplayY:
             if from_memory:
                 item["is_memory"][:valid_len] = True
                 item["memory_index"][:valid_len] = np.arange(start,
-                                                              stop,
-                                                              dtype=np.int32)
+                                                             stop,
+                                                             dtype=np.int32)
             seqs.append(item)
             valid_lens.append(valid_len)
         return seqs, valid_lens

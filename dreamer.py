@@ -41,10 +41,14 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)
         self._mem_disc = 1.0 - 1.0 / self.horizon
         self._memory_waypoint_offset = max(1, min(self.imag_horizon, 8))
-        self.expert_shaping_scale = float(getattr(config, "expert_shaping_scale", 0.0))
-        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
+        self.expert_shaping_scale = float(
+            getattr(config, "expert_shaping_scale", 0.0))
+        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
+            act_space.shape)
         if str(config.rep_loss) != "r2dreamer":
-            raise AssertionError(f"config.rep_loss must be 'r2dreamer' (got {str(config.rep_loss)!r}).")
+            raise AssertionError(
+                f"config.rep_loss must be 'r2dreamer' (got {str(config.rep_loss)!r})."
+            )
         self.imag_last = int(getattr(config, "imag_last", 0))
         self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
         self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))
@@ -61,7 +65,8 @@ class Dreamer(nn.Module):
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
-        config.actor.shape = (act_space.n,) if hasattr(act_space, "n") else tuple(map(int, act_space.shape))
+        config.actor.shape = (act_space.n,) if hasattr(
+            act_space, "n") else tuple(map(int, act_space.shape))
         self.act_discrete = False
         if hasattr(act_space, "multi_discrete"):
             config.actor.dist = config.actor.dist.multi_disc
@@ -79,7 +84,10 @@ class Dreamer(nn.Module):
         self._memory_rtg_embed_dim = 16
         self.rtg_proj = nn.Linear(1, self._memory_rtg_embed_dim, bias=True)
         self.mem_proj = nn.Sequential(
-            nn.Linear(self.rssm.feat_size + self.act_dim + self._memory_rtg_embed_dim, deter_dim, bias=True),
+            nn.Linear(self.rssm.feat_size + self.act_dim +
+                      self._memory_rtg_embed_dim,
+                      deter_dim,
+                      bias=True),
             act_fn(),
             nn.Linear(deter_dim, deter_dim, bias=True),
         )
@@ -133,7 +141,9 @@ class Dreamer(nn.Module):
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
             else:
-                print(f"{sum(p.numel() for p in module.parameters()):>14,}: {key}")
+                print(
+                    f"{sum(p.numel() for p in module.parameters()):>14,}: {key}"
+                )
         self._named_params = OrderedDict()
         for name, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -141,10 +151,15 @@ class Dreamer(nn.Module):
             else:
                 for param_name, param in module.named_parameters():
                     self._named_params[f"{name}.{param_name}"] = param
-        print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
+        print(
+            f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters."
+        )
 
         def _agc(params):
-            clip_grad_agc_(params, float(config.agc), float(config.pmin), foreach=True)
+            clip_grad_agc_(params,
+                           float(config.agc),
+                           float(config.pmin),
+                           foreach=True)
 
         self._agc = _agc
         self._optimizer = LaProp(
@@ -173,7 +188,8 @@ class Dreamer(nn.Module):
         if self._slow_value_updates % self.slow_target_update == 0:
             with torch.no_grad():
                 mix = self.slow_target_fraction
-                for v, s in zip(self.value.parameters(), self._slow_value.parameters()):
+                for v, s in zip(self.value.parameters(),
+                                self._slow_value.parameters()):
                     s.data.copy_(mix * v.data + (1 - mix) * s.data)
         self._slow_value_updates += 1
 
@@ -197,22 +213,24 @@ class Dreamer(nn.Module):
 
     def clone_and_freeze(self):
         for name in (
-            "encoder",
-            "rssm",
-            "reward",
-            "cont",
-            "actor",
-            "value",
-            "slow_value",
-            "rtg_proj",
-            "mem_proj",
-            "expert_tag",
-            "memory_attention",
-            "memory_progress",
+                "encoder",
+                "rssm",
+                "reward",
+                "cont",
+                "actor",
+                "value",
+                "slow_value",
+                "rtg_proj",
+                "mem_proj",
+                "expert_tag",
+                "memory_attention",
+                "memory_progress",
         ):
             setattr(
-                self, f"_frozen_{name}", self._freeze_copy(getattr(self, f"_{name}" if name == "slow_value" else name))
-            )
+                self, f"_frozen_{name}",
+                self._freeze_copy(
+                    getattr(self,
+                            f"_{name}" if name == "slow_value" else name)))
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -229,14 +247,18 @@ class Dreamer(nn.Module):
         T = int(len(self.memory["reward"]))
         data = {}
         for key, value in self.memory.items():
-            tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+            tensor = value if isinstance(
+                value, torch.Tensor) else torch.as_tensor(value)
             if tensor.is_floating_point():
                 tensor = tensor.to(self.device, non_blocking=True)
             else:
                 tensor = tensor.to(self.device)
             data[key] = tensor.unsqueeze(0)
         if "is_first" not in data:
-            data["is_first"] = torch.zeros(1, T, dtype=torch.bool, device=self.device)
+            data["is_first"] = torch.zeros(1,
+                                           T,
+                                           dtype=torch.bool,
+                                           device=self.device)
         data["is_first"] = data["is_first"].to(torch.bool)
         data["is_first"][:, 0] = True
         return TensorDict(data, batch_size=(1, T))
@@ -255,7 +277,11 @@ class Dreamer(nn.Module):
         length = int(length)
         if length <= 1:
             return torch.zeros(length, 1, dtype=torch.float32, device=device)
-        return torch.linspace(0.0, 1.0, steps=length, dtype=torch.float32, device=device).unsqueeze(-1)
+        return torch.linspace(0.0,
+                              1.0,
+                              steps=length,
+                              dtype=torch.float32,
+                              device=device).unsqueeze(-1)
 
     def _compute_memory_waypoint(self, deter):
         T = int(deter.shape[0])
@@ -272,20 +298,33 @@ class Dreamer(nn.Module):
             return None
         data = self.preprocess(self._memory_episode_tensordict())
         embed = self._frozen_encoder(data)
-        _, feat_dict = self._frozen_rssm.observe(embed, data["action"], data["is_first"], sample=False)
+        _, feat_dict = self._frozen_rssm.observe(embed,
+                                                 data["action"],
+                                                 data["is_first"],
+                                                 sample=False)
         deter = feat_dict["deter"].squeeze(0).detach()
-        stoch_flat = feat_dict["stoch"].squeeze(0).reshape(deter.shape[0], self.rssm.flat_stoch).detach()
+        stoch_flat = feat_dict["stoch"].squeeze(0).reshape(
+            deter.shape[0], self.rssm.flat_stoch).detach()
         reward = data["reward"].squeeze(0).to(torch.float32).unsqueeze(-1)
         raw_rtg = self._compute_memory_return_to_go(reward).detach()
         self._memory_context = {
-            "deter": deter,
-            "stoch_flat": stoch_flat,
-            "action": data["action"].squeeze(0).detach(),
-            "reward": reward.detach(),
-            "rtg": symlog(raw_rtg).detach(),
-            "raw_rtg": raw_rtg,
-            "progress": self._compute_memory_progress(deter.shape[0], deter.device).detach(),
-            "waypoint": self._compute_memory_waypoint(deter).detach(),
+            "deter":
+                deter,
+            "stoch_flat":
+                stoch_flat,
+            "action":
+                data["action"].squeeze(0).detach(),
+            "reward":
+                reward.detach(),
+            "rtg":
+                symlog(raw_rtg).detach(),
+            "raw_rtg":
+                raw_rtg,
+            "progress":
+                self._compute_memory_progress(deter.shape[0],
+                                              deter.device).detach(),
+            "waypoint":
+                self._compute_memory_waypoint(deter).detach(),
         }
         self._memory_context_stale = False
         return self._memory_context
@@ -293,7 +332,8 @@ class Dreamer(nn.Module):
     def _get_memory_context(self, require_fresh=False):
         if self.memory is None:
             return None
-        if self._memory_context is None or (require_fresh and self._memory_context_stale):
+        if self._memory_context is None or (require_fresh and
+                                            self._memory_context_stale):
             return self.refresh_memory_context()
         return self._memory_context
 
@@ -307,43 +347,78 @@ class Dreamer(nn.Module):
         stoch_flat = memory_context["stoch_flat"].to(device=device, dtype=dtype)
         action = memory_context["action"].to(device=device, dtype=dtype)
         rtg = memory_context["rtg"].to(device=device, dtype=dtype)
-        token_feat = torch.cat([deter, stoch_flat, action, rtg_proj(rtg)], dim=-1)
+        token_feat = torch.cat([deter, stoch_flat, action,
+                                rtg_proj(rtg)],
+                               dim=-1)
         return expert_tag(mem_proj(token_feat))
 
     def _zero_memory_readout(self, query):
         zeros_d = torch.zeros_like(query)
         return {
-            "token": zeros_d,
-            "waypoint": zeros_d,
-            "action": torch.zeros(*query.shape[:-1], self.act_dim, dtype=query.dtype, device=query.device),
-            "reward": torch.zeros(*query.shape[:-1], 1, dtype=query.dtype, device=query.device),
-            "rtg": torch.zeros(*query.shape[:-1], 1, dtype=query.dtype, device=query.device),
-            "raw_rtg": torch.zeros(*query.shape[:-1], 1, dtype=query.dtype, device=query.device),
-            "progress": torch.zeros(*query.shape[:-1], 1, dtype=query.dtype, device=query.device),
-            "weights": None,
+            "token":
+                zeros_d,
+            "waypoint":
+                zeros_d,
+            "action":
+                torch.zeros(*query.shape[:-1],
+                            self.act_dim,
+                            dtype=query.dtype,
+                            device=query.device),
+            "reward":
+                torch.zeros(*query.shape[:-1],
+                            1,
+                            dtype=query.dtype,
+                            device=query.device),
+            "rtg":
+                torch.zeros(*query.shape[:-1],
+                            1,
+                            dtype=query.dtype,
+                            device=query.device),
+            "raw_rtg":
+                torch.zeros(*query.shape[:-1],
+                            1,
+                            dtype=query.dtype,
+                            device=query.device),
+            "progress":
+                torch.zeros(*query.shape[:-1],
+                            1,
+                            dtype=query.dtype,
+                            device=query.device),
+            "weights":
+                None,
         }
 
     def _read_memory(self, deter, frozen=False, require_fresh_memory=False):
-        memory_context = self._get_memory_context(require_fresh=require_fresh_memory)
+        memory_context = self._get_memory_context(
+            require_fresh=require_fresh_memory)
         if deter.ndim not in (2, 3):
-            raise ValueError(f"Memory attention expects deter with rank 2 or 3 (got shape {tuple(deter.shape)}).")
+            raise ValueError(
+                f"Memory attention expects deter with rank 2 or 3 (got shape {tuple(deter.shape)})."
+            )
         squeeze_time = deter.ndim == 2
         query = deter.unsqueeze(1) if squeeze_time else deter
         if memory_context is None:
             readout = self._zero_memory_readout(query)
         else:
-            memory_tokens = self._build_memory_tokens(
-                memory_context, dtype=query.dtype, device=query.device, frozen=frozen
-            )
-            memory_tokens = memory_tokens.unsqueeze(0).expand(query.shape[0], -1, -1)
+            memory_tokens = self._build_memory_tokens(memory_context,
+                                                      dtype=query.dtype,
+                                                      device=query.device,
+                                                      frozen=frozen)
+            memory_tokens = memory_tokens.unsqueeze(0).expand(
+                query.shape[0], -1, -1)
             attention = self._frozen_memory_attention if frozen else self.memory_attention
-            attended, weights = attention(query, memory_tokens, memory_tokens, need_weights=True)
+            attended, weights = attention(query,
+                                          memory_tokens,
+                                          memory_tokens,
+                                          need_weights=True)
             readout = {
                 "token": attended,
                 "weights": weights,
             }
-            for key in ("waypoint", "action", "reward", "rtg", "raw_rtg", "progress"):
-                value = memory_context[key].to(device=query.device, dtype=query.dtype)
+            for key in ("waypoint", "action", "reward", "rtg", "raw_rtg",
+                        "progress"):
+                value = memory_context[key].to(device=query.device,
+                                               dtype=query.dtype)
                 value = value.unsqueeze(0).expand(query.shape[0], -1, -1)
                 readout[key] = torch.matmul(weights, value)
         if squeeze_time:
@@ -352,8 +427,13 @@ class Dreamer(nn.Module):
                     readout[key] = value[:, 0]
         return readout
 
-    def _apply_memory_attention(self, deter, frozen=False, require_fresh_memory=False):
-        return self._read_memory(deter, frozen=frozen, require_fresh_memory=require_fresh_memory)["token"]
+    def _apply_memory_attention(self,
+                                deter,
+                                frozen=False,
+                                require_fresh_memory=False):
+        return self._read_memory(
+            deter, frozen=frozen,
+            require_fresh_memory=require_fresh_memory)["token"]
 
     def _memory_targets(self, memory_index, dtype, device, require_fresh=False):
         memory_context = self._get_memory_context(require_fresh=require_fresh)
@@ -368,7 +448,12 @@ class Dreamer(nn.Module):
             targets[key] = picked.reshape(*gather_index.shape, value.shape[-1])
         return targets
 
-    def _get_rl_feat(self, stoch, deter, frozen=False, require_fresh_memory=False, return_aux=False):
+    def _get_rl_feat(self,
+                     stoch,
+                     deter,
+                     frozen=False,
+                     require_fresh_memory=False,
+                     return_aux=False):
         memory_readout = self._read_memory(
             deter,
             frozen=frozen,
@@ -411,8 +496,12 @@ class Dreamer(nn.Module):
         embed_sq = embed.squeeze(1)  # (B, E)
         is_first = obs["is_first"].squeeze(1)  # (B,)
         # Phase 1: posterior from tokens
-        carry, stoch, h_prev = self._frozen_rssm.get_feat_step(carry, embed_sq, is_first)
-        rl_feat = self._get_rl_feat(stoch, h_prev, frozen=True, require_fresh_memory=True)
+        carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
+            carry, embed_sq, is_first)
+        rl_feat = self._get_rl_feat(stoch,
+                                    h_prev,
+                                    frozen=True,
+                                    require_fresh_memory=True)
         action_dist = self._frozen_actor(rl_feat)
         action = action_dist.mode if eval else action_dist.rsample()
         # Phase 2: update KV-cache with (stoch, action)
@@ -430,7 +519,10 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def get_initial_state(self, B):
         carry = self.rssm.initial(B)
-        action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
+        action = torch.zeros(B,
+                             self.act_dim,
+                             dtype=torch.float32,
+                             device=self.device)
         return TensorDict(
             {
                 "kv_cache": carry["kv_cache"],
@@ -474,8 +566,14 @@ class Dreamer(nn.Module):
             mets = self._cal_grad(p_data)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self._log_grads:
-            old_params = [p.data.clone().detach() for p in self._named_params.values()]
-            grads = [p.grad for p in self._named_params.values() if p.grad is not None]  # log grads before clipping
+            old_params = [
+                p.data.clone().detach() for p in self._named_params.values()
+            ]
+            grads = [
+                p.grad
+                for p in self._named_params.values()
+                if p.grad is not None
+            ]  # log grads before clipping
             grad_norm = tools.compute_global_norm(grads)
             grad_rms = tools.compute_rms(grads)
             mets["opt/grad_norm"] = grad_norm
@@ -489,7 +587,10 @@ class Dreamer(nn.Module):
         mets["opt/lr"] = self._scheduler.get_lr()[0]
         mets["opt/grad_scale"] = self._scaler.get_scale()
         if self._log_grads:
-            updates = [(new - old) for (new, old) in zip(self._named_params.values(), old_params)]
+            updates = [
+                (new - old)
+                for (new, old) in zip(self._named_params.values(), old_params)
+            ]
             update_rms = tools.compute_rms(updates)
             params_rms = tools.compute_rms(self._named_params.values())
             mets["opt/param_rms"] = params_rms
@@ -524,7 +625,8 @@ class Dreamer(nn.Module):
 
         c = torch.mm(x1_norm.T, x2_norm) / count
         invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
-        off_diag_mask = ~torch.eye(c.shape[0], dtype=torch.bool, device=c.device)
+        off_diag_mask = ~torch.eye(
+            c.shape[0], dtype=torch.bool, device=c.device)
         redundancy_loss = c[off_diag_mask].pow(2).sum()
         return invariance_loss + lambd * redundancy_loss
 
@@ -572,7 +674,8 @@ class Dreamer(nn.Module):
         post_deter = feat_dict["deter"]  # (B, T, D) = h_prev
         post_logit = feat_dict["post_logit"]  # (B, T, S, K)
         prior_logit = feat_dict["prior_logit"]
-        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
+                                               self.kl_free)
         losses["dyn"] = self._masked_mean(dyn_loss, t_mask)
         losses["rep"] = self._masked_mean(rep_loss, t_mask)
 
@@ -582,18 +685,21 @@ class Dreamer(nn.Module):
         flat_mask = t_mask.reshape(B * T, 1)  # (B*T, 1)
         x1 = self.prj(feat.reshape(B * T, -1))
         x2 = embed.reshape(B * T, -1).detach()
-        losses["barlow"] = self._masked_barlow_loss(x1, x2, flat_mask, self.barlow_lambd)
+        losses["barlow"] = self._masked_barlow_loss(x1, x2, flat_mask,
+                                                    self.barlow_lambd)
 
-        rew_loss = -self.reward(feat).log_prob(to_f32(data["reward"]).unsqueeze(-1))  # (B, T)
+        rew_loss = -self.reward(feat).log_prob(
+            to_f32(data["reward"]).unsqueeze(-1))  # (B, T)
         losses["rew"] = self._masked_mean(rew_loss, t_mask)
         cont = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         con_loss = -self.cont(feat).log_prob(cont)  # (B, T)
         losses["con"] = self._masked_mean(con_loss, t_mask)
 
         memory_mask = data["is_memory"] & data["t_mask"]
-        memory_targets = self._memory_targets(
-            data["memory_index"], dtype=torch.float32, device=post_deter.device, require_fresh=False
-        )
+        memory_targets = self._memory_targets(data["memory_index"],
+                                              dtype=torch.float32,
+                                              device=post_deter.device,
+                                              require_fresh=False)
         if memory_targets is not None and bool(memory_mask.any().item()):
             expert_rl_feat, memory_readout = self._get_rl_feat(
                 post_stoch.detach(),
@@ -602,28 +708,32 @@ class Dreamer(nn.Module):
                 require_fresh_memory=False,
                 return_aux=True,
             )
-            progress_pred = torch.sigmoid(self.memory_progress(post_deter.detach()))
+            progress_pred = torch.sigmoid(
+                self.memory_progress(post_deter.detach()))
             progress_loss = (progress_pred - memory_targets["progress"]).pow(2)
-            losses["memory_progress"] = self._masked_mean(progress_loss, memory_mask.unsqueeze(-1))
+            losses["memory_progress"] = self._masked_mean(
+                progress_loss, memory_mask.unsqueeze(-1))
 
-            align_log_prob = torch.log(memory_readout["weights"].clamp_min(1e-6))
+            align_log_prob = torch.log(
+                memory_readout["weights"].clamp_min(1e-6))
             target_index = data["memory_index"].clamp(min=0).to(torch.long)
             align_loss = -align_log_prob.gather(-1, target_index.unsqueeze(-1))
-            losses["memory_align"] = self._masked_mean(align_loss, memory_mask.unsqueeze(-1))
-
-            expert_value = self.value(expert_rl_feat)
-            value_prior_loss = -expert_value.log_prob(memory_targets["raw_rtg"].to(torch.float32))
-            losses["memory_value"] = self._masked_mean(value_prior_loss, memory_mask)
+            losses["memory_align"] = self._masked_mean(
+                align_loss, memory_mask.unsqueeze(-1))
 
             pred_index = memory_readout["weights"].argmax(dim=-1)
             metrics["memory_progress_mae"] = self._masked_mean(
-                (progress_pred - memory_targets["progress"]).abs(), memory_mask.unsqueeze(-1)
-            )
-            metrics["memory_align_acc"] = self._masked_mean((pred_index == target_index).to(torch.float32), memory_mask)
-            metrics["memory_rtg"] = self._masked_mean(memory_targets["raw_rtg"], memory_mask.unsqueeze(-1))
+                (progress_pred - memory_targets["progress"]).abs(),
+                memory_mask.unsqueeze(-1))
+            metrics["memory_align_acc"] = self._masked_mean(
+                (pred_index == target_index).to(torch.float32), memory_mask)
+            metrics["memory_rtg"] = self._masked_mean(memory_targets["raw_rtg"],
+                                                      memory_mask.unsqueeze(-1))
 
-        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
-        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        metrics["dyn_entropy"] = torch.mean(
+            self.rssm.get_dist(prior_logit).entropy())
+        metrics["rep_entropy"] = torch.mean(
+            self.rssm.get_dist(post_logit).entropy())
 
         imag_source = {
             "post_stoch": post_stoch.detach(),
@@ -635,14 +745,14 @@ class Dreamer(nn.Module):
         }
         return losses, metrics, imag_source
 
-    def _actor_critic_forward(self, start_stoch, start_deter, imag_carry, imag_mask):
+    def _actor_critic_forward(self, start_stoch, start_deter, imag_carry,
+                              imag_mask):
         """Single actor-critic forward pass from imagination starts."""
         losses = {}
         metrics = {}
 
         imag_feat, imag_action, imag_stoch, imag_deter = self._imagine(
-            (start_stoch, start_deter), self.imag_horizon + 1, imag_carry
-        )
+            (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
         imag_feat = imag_feat.detach()
         imag_action = imag_action.detach()
         imag_stoch = imag_stoch.detach()
@@ -675,21 +785,25 @@ class Dreamer(nn.Module):
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
-        ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)  # (N, T_imag-1, 1)
+        ret = self._lambda_return(last, term, imag_reward, imag_value,
+                                  imag_value, disc,
+                                  self.lamb)  # (N, T_imag-1, 1)
         ret_offset, ret_scale = self.return_ema(ret)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
         policy = self.actor(imag_rl_feat)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy)
+        policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() +
+                                                  self.act_entropy * entropy)
         losses["policy"] = self._masked_mean(policy_loss, imag_mask)
 
         imag_value_dist = self.value(imag_rl_feat)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
         value_loss = weight[:, :-1].detach() * (
-            -imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach())
-        )[:, :-1].unsqueeze(-1)
+            -imag_value_dist.log_prob(tar_padded.detach()) -
+            imag_value_dist.log_prob(
+                imag_slow_value.detach()))[:, :-1].unsqueeze(-1)
         losses["value"] = self._masked_mean(value_loss, imag_mask)
 
         ret_normed = (ret - ret_offset) / ret_scale
@@ -730,25 +844,34 @@ class Dreamer(nn.Module):
 
         def _accum(target, source, weight):
             if not isinstance(weight, torch.Tensor):
-                weight = torch.tensor(weight, dtype=torch.float32, device=self.device)
+                weight = torch.tensor(weight,
+                                      dtype=torch.float32,
+                                      device=self.device)
             else:
                 weight = weight.to(dtype=torch.float32, device=self.device)
             for name, value in source.items():
                 if not isinstance(value, torch.Tensor):
-                    value = torch.tensor(value, dtype=torch.float32, device=self.device)
+                    value = torch.tensor(value,
+                                         dtype=torch.float32,
+                                         device=self.device)
                 target[name] = target.get(
                     name,
                     torch.zeros((), dtype=torch.float32, device=self.device),
                 )
                 target[name] = target[name] + value.detach() * weight
 
-        for wm_data, wm_batch_weight in self._iter_batch_chunks(data, self.wm_accum_steps):
-            wm_losses, wm_metrics, imag_source = self._world_model_forward(wm_data)
+        for wm_data, wm_batch_weight in self._iter_batch_chunks(
+                data, self.wm_accum_steps):
+            wm_losses, wm_metrics, imag_source = self._world_model_forward(
+                wm_data)
             wm_valid = wm_data["t_mask"].float().sum()
             wm_loss_weight = wm_valid / total_valid
-            wm_batch_weight = torch.tensor(wm_batch_weight, dtype=torch.float32, device=self.device)
+            wm_batch_weight = torch.tensor(wm_batch_weight,
+                                           dtype=torch.float32,
+                                           device=self.device)
 
-            world_model_loss = sum(self._loss_scales[name] * value for name, value in wm_losses.items())
+            world_model_loss = sum(self._loss_scales[name] * value
+                                   for name, value in wm_losses.items())
             self._scaler.scale(world_model_loss * wm_loss_weight).backward()
             opt_loss = opt_loss + world_model_loss.detach() * wm_loss_weight
             _accum(losses, wm_losses, wm_loss_weight)
@@ -760,8 +883,11 @@ class Dreamer(nn.Module):
             )
             ac_losses = {}
             ac_metrics = {}
-            for start_chunk, s_weight in self._iter_start_chunks(starts, self.ac_accum_steps):
-                s_weight = torch.tensor(s_weight, dtype=torch.float32, device=self.device)
+            for start_chunk, s_weight in self._iter_start_chunks(
+                    starts, self.ac_accum_steps):
+                s_weight = torch.tensor(s_weight,
+                                        dtype=torch.float32,
+                                        device=self.device)
                 s_stoch, s_deter, s_carry, s_mask = self._prepare_transformer_imag_start(
                     imag_source["post_stoch"],
                     imag_source["post_deter"],
@@ -769,11 +895,11 @@ class Dreamer(nn.Module):
                     imag_source["kv_v"],
                     start_chunk,
                 )
-                chunk_losses, chunk_metrics = self._actor_critic_forward(s_stoch, s_deter, s_carry, s_mask)
+                chunk_losses, chunk_metrics = self._actor_critic_forward(
+                    s_stoch, s_deter, s_carry, s_mask)
                 ac_total = (
-                    self._loss_scales["policy"] * chunk_losses["policy"]
-                    + self._loss_scales["value"] * chunk_losses["value"]
-                )
+                    self._loss_scales["policy"] * chunk_losses["policy"] +
+                    self._loss_scales["value"] * chunk_losses["value"])
                 grad_weight = wm_batch_weight * s_weight
                 self._scaler.scale(ac_total * grad_weight).backward()
                 opt_loss = opt_loss + ac_total.detach() * grad_weight
@@ -790,7 +916,9 @@ class Dreamer(nn.Module):
             float(self.ac_accum_steps),
             device=self.device,
         )
-        metrics.update({f"loss/{name}": loss.detach() for name, loss in losses.items()})
+        metrics.update({
+            f"loss/{name}": loss.detach() for name, loss in losses.items()
+        })
         metrics.update({"opt/loss": opt_loss.detach()})
         return metrics
 
@@ -809,8 +937,7 @@ class Dreamer(nn.Module):
 
         # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
-            post_stoch, post_deter, kv_k, kv_v, starts
-        )
+            post_stoch, post_deter, kv_k, kv_v, starts)
         imag_mask = torch.ones((B * K, 1, 1), device=starts.device)
         return start_stoch, start_deter, imag_carry, imag_mask
 
@@ -855,7 +982,8 @@ class Dreamer(nn.Module):
             actions.append(action)
             stoch_seq.append(stoch)
             deter_seq.append(deter)
-            stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(stoch, imag_carry, action)
+            stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(
+                stoch, imag_carry, action)
 
         # Stack along sequence dim T_imag.
         # (B, T_imag, F), (B, T_imag, A), (B, T_imag, S, K), (B, T_imag, D)

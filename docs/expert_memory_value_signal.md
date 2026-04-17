@@ -75,7 +75,7 @@ What we really want to tell the agent is:
 
 > if you reach a state like this, the future from here can be very good
 
-That is a **value prior**, and `G_t` is the right signal for it.
+That is a value signal, and `G_t` is the right signal for it.
 
 So:
 
@@ -85,12 +85,12 @@ So:
 This is why expert return-to-go is more useful than simply concatenating raw
 rewards into attention.
 
-## What supervision is still needed
+## What training signals are still needed
 
-Attention alone is not enough. The model still needs a supervised signal on
-expert replay segments.
+Attention alone is not enough. The model still needs explicit learning signals
+that tell it how expert memory should be used.
 
-The most important auxiliary targets are:
+The most important ones are:
 
 ### 1. Localization / alignment supervision
 
@@ -111,15 +111,26 @@ This gives the model an explicit notion of:
 - where it is on the expert path
 - whether it is moving forward
 
-### 3. Value prior supervision
+### 3. Potential-based shaping during imagination
 
-On expert replay segments, train the critic to predict expert return-to-go
-`G_t`.
+Do not train the shared critic directly to predict expert return-to-go `G_t`.
+That target belongs to the expert policy, not necessarily to the agent's
+current policy.
+
+Instead, use the retrieved expert return-to-go as a potential during imagined
+rollouts:
+
+```text
+F(s, s') = γ_eff · Φ(s') - Φ(s)
+```
+
+with `Φ(s)` taken from retrieved expert `G_t`.
 
 This teaches:
 
-- "states like this are valuable"
-- without forcing exact imitation of expert actions
+- "moving toward expert-valued regions should increase return"
+- without forcing the critic to equal expert return on those states
+- while keeping the critic target tied to the current policy's imagined return
 
 ## Why this is better than pure behavior cloning
 
@@ -180,11 +191,13 @@ The actor and critic consume an RL feature that includes:
 
 ### Auxiliary losses
 
-Three expert-only auxiliary losses are added:
+Two expert-only auxiliary losses are added:
 
 - `memory_align`: attend to the correct expert index
 - `memory_progress`: predict where we are on the expert path
-- `memory_value`: teach the critic the expert return-to-go
+
+In addition, actor-critic imagination uses potential-based reward shaping from
+retrieved expert `raw_rtg` rather than a direct expert-value regression loss.
 
 ## Practical takeaway
 
@@ -200,7 +213,7 @@ the answer is:
 2. give aligned expert tuples
 3. include return-to-go, not just reward
 4. supervise which expert position is being matched
-5. supervise that matched expert states have high future value
+5. use return-to-go as a shaping potential, not as a direct critic target
 
 That combination is what turns expert memory from a vague retrieval mechanism
-into a usable value- and progress-aware guide.
+into a usable progress-aware guide with a value-informed shaping signal.

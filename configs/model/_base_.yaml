@@ -30,7 +30,8 @@ loss_scales:
   rep: 0.1
   memory_align: 0.1
   memory_progress: 1.0
-  memory_value: 0.2
+  # memory_value removed: the value head should track the current policy's
+  # return, not expert RTG. Expert value enters via potential-based shaping.
   policy: 1.0
   value: 1.0
 
