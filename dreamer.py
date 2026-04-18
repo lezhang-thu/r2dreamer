@@ -419,8 +419,8 @@ class Dreamer(nn.Module):
                                                       dtype=query.dtype,
                                                       device=query.device,
                                                       frozen=frozen)
-            memory_tokens = memory_tokens.unsqueeze(0).expand(query.shape[0],
-                                                              -1, -1)
+            memory_tokens = memory_tokens.unsqueeze(0).expand(
+                query.shape[0], -1, -1)
             null_token = self._get_null_memory_token(query.dtype,
                                                      query.device,
                                                      frozen=frozen)

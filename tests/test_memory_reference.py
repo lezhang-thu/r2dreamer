@@ -223,7 +223,8 @@ class MemoryAttentionTest(unittest.TestCase):
         out3 = dummy._apply_memory_attention(q3)
         self.assertEqual(out3.shape, (3, 7, D))
 
-    def test_read_memory_returns_zero_valued_fields_when_null_slot_selected(self):
+    def test_read_memory_returns_zero_valued_fields_when_null_slot_selected(
+            self):
         T, D, A = 2, 4, 2
         raw_rtg = torch.tensor([[3.0], [5.0]])
         ctx = {
