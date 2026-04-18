@@ -17,9 +17,8 @@ from tools import to_f32
 
 class Dreamer(nn.Module):
 
-    def __init__(self, config, obs_space, act_space, memory=None):
+    def __init__(self, config, obs_space, act_space):
         super().__init__()
-        self.memory = memory
         self.device = torch.device(config.device)
         self.act_entropy = float(config.act_entropy)
         self.kl_free = float(config.kl_free)
@@ -61,24 +60,15 @@ class Dreamer(nn.Module):
             config.actor.dist = config.actor.dist.cont
 
         # Actor-critic components
-        self.rl_feat_size = self.rssm.flat_stoch + 2 * int(
-            config.transformer.deter)
+        self.rl_feat_size = self.rssm.flat_stoch + int(config.transformer.deter)
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
-        self.memory_attention = nn.MultiheadAttention(
-            int(config.transformer.deter),
-            int(config.transformer.n_heads),
-            dropout=0.0,
-            batch_first=True,
-        )
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
         for param in self._slow_value.parameters():
             param.requires_grad = False
         self._slow_value_updates = 0
-        self._memory_context = None
-        self._memory_context_stale = self.memory is not None
 
         self._loss_scales = dict(config.loss_scales)
         self._log_grads = bool(config.log_grads)
@@ -87,7 +77,6 @@ class Dreamer(nn.Module):
             "rssm": self.rssm,
             "actor": self.actor,
             "value": self.value,
-            "memory_attention": self.memory_attention,
             "reward": self.reward,
             "cont": self.cont,
             "encoder": self.encoder,
@@ -174,7 +163,7 @@ class Dreamer(nn.Module):
 
     def clone_and_freeze(self):
         for name in ("encoder", "rssm", "reward", "cont", "actor", "value",
-                     "slow_value", "memory_attention"):
+                     "slow_value"):
             setattr(
                 self, f"_frozen_{name}",
                 self._freeze_copy(
@@ -183,99 +172,13 @@ class Dreamer(nn.Module):
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
-        # Re-establish shared memory after moving the model to a new device
+        # Re-establish shared frozen weights after moving the model to a new device
         self.clone_and_freeze()
-        self.refresh_memory_context()
         return self
 
-    def _memory_episode_tensordict(self):
-        if self.memory is None:
-            return None
-        if "reward" not in self.memory:
-            raise KeyError("self.memory must contain a 'reward' field.")
-        T = int(len(self.memory["reward"]))
-        data = {}
-        for key, value in self.memory.items():
-            tensor = value if isinstance(
-                value, torch.Tensor) else torch.as_tensor(value)
-            if tensor.is_floating_point():
-                tensor = tensor.to(self.device, non_blocking=True)
-            else:
-                tensor = tensor.to(self.device)
-            data[key] = tensor.unsqueeze(0)
-        if "is_first" not in data:
-            data["is_first"] = torch.zeros(1,
-                                           T,
-                                           dtype=torch.bool,
-                                           device=self.device)
-        data["is_first"] = data["is_first"].to(torch.bool)
-        data["is_first"][:, 0] = True
-        return TensorDict(data, batch_size=(1, T))
-
-    @torch.no_grad()
-    def refresh_memory_context(self):
-        if self.memory is None:
-            self._memory_context = None
-            self._memory_context_stale = False
-            return None
-        data = self.preprocess(self._memory_episode_tensordict())
-        embed = self._frozen_encoder(data)
-        _, feat_dict = self._frozen_rssm.observe(embed,
-                                                 data["action"],
-                                                 data["is_first"],
-                                                 sample=False)
-        self._memory_context = {
-            "deter": feat_dict["deter"].squeeze(0).detach(),
-        }
-        self._memory_context_stale = False
-        return self._memory_context
-
-    def _get_memory_context(self, require_fresh=False):
-        if self.memory is None:
-            return None
-        if self._memory_context is None or (require_fresh and
-                                            self._memory_context_stale):
-            return self.refresh_memory_context()
-        return self._memory_context
-
-    def _apply_memory_attention(self,
-                                deter,
-                                frozen=False,
-                                require_fresh_memory=False):
-        memory_context = self._get_memory_context(
-            require_fresh=require_fresh_memory)
-        if memory_context is None:
-            return torch.zeros_like(deter)
-        if deter.ndim not in (2, 3):
-            raise ValueError("Memory attention expects deter with rank 2 or 3 "
-                             f"(got shape {tuple(deter.shape)}).")
-        query = deter.unsqueeze(1) if deter.ndim == 2 else deter
-        memory_deter = memory_context["deter"].detach().to(
-            device=query.device,
-            dtype=query.dtype,
-        ).unsqueeze(0).expand(query.shape[0], -1, -1)
-        attention = (self._frozen_memory_attention
-                     if frozen else self.memory_attention)
-        attended, _ = attention(query,
-                                memory_deter,
-                                memory_deter,
-                                need_weights=False)
-        if deter.ndim == 2:
-            attended = attended[:, 0]
-        return attended
-
-    def _get_rl_feat(self,
-                     stoch,
-                     deter,
-                     frozen=False,
-                     require_fresh_memory=False):
-        attended_deter = self._apply_memory_attention(
-            deter,
-            frozen=frozen,
-            require_fresh_memory=require_fresh_memory,
-        )
+    def _get_rl_feat(self, stoch, deter):
         stoch_flat = stoch.reshape(*stoch.shape[:-2], self.rssm.flat_stoch)
-        return torch.cat([stoch_flat, deter, attended_deter], dim=-1)
+        return torch.cat([stoch_flat, deter], dim=-1)
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
@@ -297,10 +200,7 @@ class Dreamer(nn.Module):
         # Phase 1: posterior from tokens
         carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
             carry, embed_sq, is_first)
-        rl_feat = self._get_rl_feat(stoch,
-                                    h_prev,
-                                    frozen=True,
-                                    require_fresh_memory=True)
+        rl_feat = self._get_rl_feat(stoch, h_prev)
         action_dist = self._frozen_actor(rl_feat)
         action = action_dist.mode if eval else action_dist.rsample()
         # Phase 2: update KV-cache with (stoch, action)
@@ -381,7 +281,6 @@ class Dreamer(nn.Module):
         self._scaler.update()  # adjust scale
         self._scheduler.step()  # increment scheduler
         self._optimizer.zero_grad(set_to_none=True)  # reset grads
-        self._memory_context_stale = self.memory is not None
         mets["opt/lr"] = self._scheduler.get_lr()[0]
         mets["opt/grad_scale"] = self._scaler.get_scale()
         if self._log_grads:
@@ -717,7 +616,7 @@ class Dreamer(nn.Module):
         for _ in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
-            rl_feat = self._get_rl_feat(stoch, deter, frozen=True)
+            rl_feat = self._get_rl_feat(stoch, deter)
             # (B, A)
             action = self._frozen_actor(rl_feat).rsample()
             # Append feat and its corresponding sampled action at the same time step.

@@ -67,7 +67,7 @@ def main(config):
         print("Recovered memory episode with "
               f"{len(memory['reward'])} replay-style steps.")
     else:
-        print(f"Memory file {memory_path} not found; agent.memory=None.")
+        print(f"Memory file {memory_path} not found; replay.memory=None.")
 
     replay_buffer = ReplayY(
         length=int(config.batch_length),
@@ -81,7 +81,6 @@ def main(config):
         config.model,
         obs_space,
         act_space,
-        memory=memory,
     ).to(config.device)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
