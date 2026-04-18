@@ -67,6 +67,11 @@ Without this, the model may receive expert state information and reward
 information, but it still does not know that they correspond to the same expert
 time step.
 
+In practice, the attention also needs an explicit null / abstain option. If
+the current state is not meaningfully related to the expert trajectory, the
+model should be able to route attention to a zero-valued null slot rather than
+being forced to average over unrelated expert positions.
+
 ## Why return-to-go matters more than raw reward
 
 For sparse-reward problems, immediate reward `r_t` is often too weak by itself.
@@ -178,6 +183,7 @@ The memory context stores:
 - expert discounted return-to-go
 - expert progress
 - expert future waypoint
+- a learned null memory slot for abstention
 
 ### Retrieved RL context
 

@@ -31,6 +31,12 @@ gradient. Note that `_imagine()` and `_lambda_return()` are both
 REINFORCE-style advantage, biasing credit assignment toward expert-valued
 regions.
 
+To avoid assigning expert value to obviously unrelated imagined states, memory
+retrieval includes an explicit null / abstain slot whose expert-valued fields
+are zero. If no expert state matches well, attention can route mass to that
+slot so `Φ(s)` shrinks toward zero instead of becoming an arbitrary weighted
+average over the expert trajectory.
+
 ### Why γ_eff, not disc alone
 
 The return operator in `_lambda_return` discounts future values by
@@ -69,6 +75,7 @@ expert_shaping_scale: 0.1   # 0.0 disables shaping
 In `_actor_critic_forward` of `dreamer.py`:
 
 - Query expert memory with `imag_deter` (frozen) to retrieve `raw_rtg`
+- Include a learned null memory slot with zero-valued expert fields
 - Compute `gamma_eff = imag_cont[:, 1:] * disc`
 - Compute `shaping = gamma_eff * phi[:, 1:] - phi[:, :-1]`
 - Add to `imag_reward` at interior timesteps

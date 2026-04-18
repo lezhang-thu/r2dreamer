@@ -27,6 +27,14 @@ class ExpertTag(nn.Module):
         return x + self.tag.to(device=x.device, dtype=x.dtype)
 
 
+class NullMemorySlot(nn.Module):
+    """Learned attention slot representing 'no expert match'."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.token = nn.Parameter(torch.zeros(int(dim), dtype=torch.float32))
+
+
 class Dreamer(nn.Module):
 
     def __init__(self, config, obs_space, act_space, memory=None):
@@ -92,6 +100,7 @@ class Dreamer(nn.Module):
             nn.Linear(deter_dim, deter_dim, bias=True),
         )
         self.expert_tag = ExpertTag(deter_dim)
+        self.null_memory = NullMemorySlot(deter_dim)
         self.rl_feat_size = self.rssm.flat_stoch + 3 * deter_dim + self.act_dim + self._memory_scalar_dim
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
@@ -125,6 +134,7 @@ class Dreamer(nn.Module):
             "rtg_proj": self.rtg_proj,
             "mem_proj": self.mem_proj,
             "expert_tag": self.expert_tag,
+            "null_memory": self.null_memory,
             "memory_attention": self.memory_attention,
             "memory_progress": self.memory_progress,
             "reward": self.reward,
@@ -223,6 +233,7 @@ class Dreamer(nn.Module):
                 "rtg_proj",
                 "mem_proj",
                 "expert_tag",
+                "null_memory",
                 "memory_attention",
                 "memory_progress",
         ):
@@ -352,6 +363,10 @@ class Dreamer(nn.Module):
                                dim=-1)
         return expert_tag(mem_proj(token_feat))
 
+    def _get_null_memory_token(self, dtype, device, frozen=False):
+        null_memory = self._frozen_null_memory if frozen else self.null_memory
+        return null_memory.token.to(device=device, dtype=dtype).unsqueeze(0)
+
     def _zero_memory_readout(self, query):
         zeros_d = torch.zeros_like(query)
         return {
@@ -404,8 +419,13 @@ class Dreamer(nn.Module):
                                                       dtype=query.dtype,
                                                       device=query.device,
                                                       frozen=frozen)
-            memory_tokens = memory_tokens.unsqueeze(0).expand(
-                query.shape[0], -1, -1)
+            memory_tokens = memory_tokens.unsqueeze(0).expand(query.shape[0],
+                                                              -1, -1)
+            null_token = self._get_null_memory_token(query.dtype,
+                                                     query.device,
+                                                     frozen=frozen)
+            null_token = null_token.unsqueeze(0).expand(query.shape[0], -1, -1)
+            memory_tokens = torch.cat([memory_tokens, null_token], dim=1)
             attention = self._frozen_memory_attention if frozen else self.memory_attention
             attended, weights = attention(query,
                                           memory_tokens,
@@ -420,6 +440,12 @@ class Dreamer(nn.Module):
                 value = memory_context[key].to(device=query.device,
                                                dtype=query.dtype)
                 value = value.unsqueeze(0).expand(query.shape[0], -1, -1)
+                null_value = torch.zeros(query.shape[0],
+                                         1,
+                                         value.shape[-1],
+                                         dtype=query.dtype,
+                                         device=query.device)
+                value = torch.cat([value, null_value], dim=1)
                 readout[key] = torch.matmul(weights, value)
         if squeeze_time:
             for key, value in tuple(readout.items()):
