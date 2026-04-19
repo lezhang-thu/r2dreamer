@@ -367,6 +367,7 @@ class Dreamer(nn.Module):
                               1,
                               dtype=query.dtype,
                               device=query.device)
+        closed_gate_logits = torch.full_like(zeros_1, -30.0)
         return {
             "token":
                 zeros_d,
@@ -398,6 +399,8 @@ class Dreamer(nn.Module):
                 None,
             "effective_weights":
                 None,
+            "use_gate_logits":
+                closed_gate_logits,
             "use_gate":
                 zeros_1,
             "abstain":
@@ -428,12 +431,13 @@ class Dreamer(nn.Module):
                                           memory_tokens,
                                           need_weights=True)
             gate_module = self._frozen_memory_use_gate if frozen else self.memory_use_gate
-            use_gate = torch.sigmoid(
-                gate_module(torch.cat([query, attended], dim=-1)))
+            gate_logits = gate_module(torch.cat([query, attended], dim=-1))
+            use_gate = torch.sigmoid(gate_logits)
             readout = {
                 "token": attended * use_gate,
                 "weights": weights,
                 "effective_weights": weights * use_gate,
+                "use_gate_logits": gate_logits,
                 "use_gate": use_gate,
                 "abstain": 1.0 - use_gate,
             }
@@ -748,9 +752,11 @@ class Dreamer(nn.Module):
                 losses["memory_align"] = self._masked_mean(
                     align_loss, memory_mask.unsqueeze(-1))
 
-                use_loss = F.binary_cross_entropy(use_gate,
-                                                  torch.ones_like(use_gate),
-                                                  reduction="none")
+                use_loss = F.binary_cross_entropy_with_logits(
+                    memory_readout["use_gate_logits"],
+                    torch.ones_like(memory_readout["use_gate_logits"]),
+                    reduction="none",
+                )
                 losses["memory_use"] = self._masked_mean(
                     use_loss, memory_mask.unsqueeze(-1))
 
