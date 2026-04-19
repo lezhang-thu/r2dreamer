@@ -220,7 +220,7 @@ rather than the whole solution.
 A strong combined version would be:
 
 - replay includes expert segments with an annealed fraction
-- actor/value use `rl_feat = [stoch, deter, attended_memory]`
+- actor/value use `rl_feat = [stoch, deter]`, while memory is used for shaping
 - add BC loss on expert replay samples only
 - optionally weight BC by a schedule or critic-based filter
 - optionally add a value prior from expert return-to-go

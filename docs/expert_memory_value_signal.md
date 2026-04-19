@@ -163,7 +163,7 @@ The goal is closer to:
 ```text
 recognize that this region of state space is good,
 know where it is on that good trajectory,
-and use expert action/waypoint information as guidance
+and use expert retrieval as a value-shaped guide
 ```
 
 This is more robust when:
@@ -192,21 +192,21 @@ The memory context stores:
 - expert latent state
 - expert stochastic feature
 - expert action
-- expert reward
-- expert discounted return-to-go
+- expert symlog return-to-go for token construction
+- expert raw return-to-go for shaping
 - expert progress
-- expert future waypoint
-- a learned null memory slot for abstention
 
-### Retrieved RL context
+The retrieval module also has a query-dependent memory-use gate for
+abstention.
 
-The actor and critic consume an RL feature that includes:
+### Policy/value input
 
-- current latent
-- retrieved expert token
-- retrieved waypoint
-- retrieved expert action
-- retrieved reward / return-to-go / progress
+The actor and critic now consume only the agent's own latent state:
+
+- current stochastic latent
+- current deterministic latent
+
+Expert retrieval is kept separate and is not concatenated into `rl_feat`.
 
 ### Auxiliary losses
 
