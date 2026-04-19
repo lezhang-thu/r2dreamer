@@ -32,10 +32,12 @@ REINFORCE-style advantage, biasing credit assignment toward expert-valued
 regions.
 
 To avoid assigning expert value to obviously unrelated imagined states, memory
-retrieval includes an explicit null / abstain slot whose expert-valued fields
-are zero. If no expert state matches well, attention can route mass to that
-slot so `Φ(s)` shrinks toward zero instead of becoming an arbitrary weighted
-average over the expert trajectory.
+retrieval uses an explicit query-dependent abstention gate. Attention still
+selects among expert positions, but a separate sigmoid gate decides whether the
+retrieved expert tuple should be used at all. When the gate stays closed,
+retrieved expert-valued fields are driven toward zero, so `Φ(s)` shrinks
+toward zero instead of becoming an arbitrary weighted average over the expert
+trajectory.
 
 ### Why γ_eff, not disc alone
 
@@ -75,7 +77,7 @@ expert_shaping_scale: 0.1   # 0.0 disables shaping
 In `_actor_critic_forward` of `dreamer.py`:
 
 - Query expert memory with `imag_deter` (frozen) to retrieve `raw_rtg`
-- Include a learned null memory slot with zero-valued expert fields
+- Use a query-dependent `memory_use_gate` to abstain from memory when needed
 - Compute `gamma_eff = imag_cont[:, 1:] * disc`
 - Compute `shaping = gamma_eff * phi[:, 1:] - phi[:, :-1]`
 - Add to `imag_reward` at interior timesteps

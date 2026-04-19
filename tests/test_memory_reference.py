@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from distributions import symlog
-from dreamer import Dreamer, ExpertTag, NullMemorySlot
+from dreamer import Dreamer, ExpertTag
 
 
 class _FakeRSSM:
@@ -17,7 +17,6 @@ class _AttnDummy:
 
     _get_memory_context = Dreamer._get_memory_context
     _build_memory_tokens = Dreamer._build_memory_tokens
-    _get_null_memory_token = Dreamer._get_null_memory_token
     _zero_memory_readout = Dreamer._zero_memory_readout
     _apply_memory_attention = Dreamer._apply_memory_attention
     _read_memory = Dreamer._read_memory
@@ -46,13 +45,17 @@ class _AttnDummy:
         self._frozen_mem_proj = self.mem_proj
         self.expert_tag = ExpertTag(deter_dim)
         self._frozen_expert_tag = self.expert_tag
-        self.null_memory = NullMemorySlot(deter_dim)
-        self._frozen_null_memory = self.null_memory
         self.memory_attention = nn.MultiheadAttention(deter_dim,
                                                       num_heads=1,
                                                       dropout=0.0,
                                                       batch_first=True)
         self._frozen_memory_attention = self.memory_attention
+        self.memory_use_gate = nn.Sequential(
+            nn.Linear(2 * deter_dim, deter_dim),
+            nn.SiLU(),
+            nn.Linear(deter_dim, 1),
+        )
+        self._frozen_memory_use_gate = self.memory_use_gate
 
     def refresh_memory_context(self):
         self.refresh_calls += 1
@@ -100,6 +103,18 @@ class _FixedAttention:
         weights = self.weights.to(device=query.device, dtype=query.dtype)
         attended = torch.matmul(weights, key)
         return attended, weights
+
+
+class _FixedGate:
+
+    def __init__(self, logit):
+        self.logit = float(logit)
+
+    def __call__(self, gate_input):
+        return torch.full((*gate_input.shape[:-1], 1),
+                          self.logit,
+                          dtype=gate_input.dtype,
+                          device=gate_input.device)
 
 
 class _RefreshDummy:
@@ -223,8 +238,7 @@ class MemoryAttentionTest(unittest.TestCase):
         out3 = dummy._apply_memory_attention(q3)
         self.assertEqual(out3.shape, (3, 7, D))
 
-    def test_read_memory_returns_zero_valued_fields_when_null_slot_selected(
-            self):
+    def test_read_memory_returns_zero_valued_fields_when_gate_abstains(self):
         T, D, A = 2, 4, 2
         raw_rtg = torch.tensor([[3.0], [5.0]])
         ctx = {
@@ -242,8 +256,10 @@ class MemoryAttentionTest(unittest.TestCase):
                            deter_dim=D,
                            act_dim=A)
         dummy.memory_attention = _FixedAttention(
-            torch.tensor([[[0.0, 0.0, 1.0]]], dtype=torch.float32))
+            torch.tensor([[[0.25, 0.75]]], dtype=torch.float32))
         dummy._frozen_memory_attention = dummy.memory_attention
+        dummy.memory_use_gate = _FixedGate(-100.0)
+        dummy._frozen_memory_use_gate = dummy.memory_use_gate
 
         q = torch.randn(1, D)
         readout = dummy._read_memory(q)
@@ -254,8 +270,15 @@ class MemoryAttentionTest(unittest.TestCase):
         torch.testing.assert_close(readout["progress"], torch.zeros(1, 1))
         torch.testing.assert_close(readout["action"], torch.zeros(1, A))
         torch.testing.assert_close(readout["waypoint"], torch.zeros(1, D))
-        self.assertEqual(readout["weights"].shape[-1], T + 1)
-        torch.testing.assert_close(readout["weights"][0, -1], torch.tensor(1.0))
+        self.assertEqual(readout["weights"].shape[-1], T)
+        torch.testing.assert_close(readout["abstain"],
+                                   torch.ones(1, 1),
+                                   atol=1e-6,
+                                   rtol=0.0)
+        torch.testing.assert_close(readout["use_gate"],
+                                   torch.zeros(1, 1),
+                                   atol=1e-6,
+                                   rtol=0.0)
 
 
 class RefreshMemoryContextTest(unittest.TestCase):

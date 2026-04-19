@@ -5,6 +5,7 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 from torch.amp import GradScaler, autocast
+from torch.nn import functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
 import networks
@@ -25,14 +26,6 @@ class ExpertTag(nn.Module):
 
     def forward(self, x):
         return x + self.tag.to(device=x.device, dtype=x.dtype)
-
-
-class NullMemorySlot(nn.Module):
-    """Learned attention slot representing 'no expert match'."""
-
-    def __init__(self, dim):
-        super().__init__()
-        self.token = nn.Parameter(torch.zeros(int(dim), dtype=torch.float32))
 
 
 class Dreamer(nn.Module):
@@ -100,7 +93,6 @@ class Dreamer(nn.Module):
             nn.Linear(deter_dim, deter_dim, bias=True),
         )
         self.expert_tag = ExpertTag(deter_dim)
-        self.null_memory = NullMemorySlot(deter_dim)
         self.rl_feat_size = self.rssm.flat_stoch + 3 * deter_dim + self.act_dim + self._memory_scalar_dim
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
@@ -110,6 +102,12 @@ class Dreamer(nn.Module):
             dropout=0.0,
             batch_first=True,
         )
+        self.memory_use_gate = nn.Sequential(
+            nn.Linear(2 * deter_dim, deter_dim, bias=True),
+            act_fn(),
+            nn.Linear(deter_dim, 1, bias=True),
+        )
+        nn.init.constant_(self.memory_use_gate[-1].bias, -2.0)
         self.memory_progress = nn.Sequential(
             nn.Linear(deter_dim, deter_dim, bias=True),
             act_fn(),
@@ -134,8 +132,8 @@ class Dreamer(nn.Module):
             "rtg_proj": self.rtg_proj,
             "mem_proj": self.mem_proj,
             "expert_tag": self.expert_tag,
-            "null_memory": self.null_memory,
             "memory_attention": self.memory_attention,
+            "memory_use_gate": self.memory_use_gate,
             "memory_progress": self.memory_progress,
             "reward": self.reward,
             "cont": self.cont,
@@ -233,8 +231,8 @@ class Dreamer(nn.Module):
                 "rtg_proj",
                 "mem_proj",
                 "expert_tag",
-                "null_memory",
                 "memory_attention",
+                "memory_use_gate",
                 "memory_progress",
         ):
             setattr(
@@ -363,12 +361,12 @@ class Dreamer(nn.Module):
                                dim=-1)
         return expert_tag(mem_proj(token_feat))
 
-    def _get_null_memory_token(self, dtype, device, frozen=False):
-        null_memory = self._frozen_null_memory if frozen else self.null_memory
-        return null_memory.token.to(device=device, dtype=dtype).unsqueeze(0)
-
     def _zero_memory_readout(self, query):
         zeros_d = torch.zeros_like(query)
+        zeros_1 = torch.zeros(*query.shape[:-1],
+                              1,
+                              dtype=query.dtype,
+                              device=query.device)
         return {
             "token":
                 zeros_d,
@@ -395,12 +393,15 @@ class Dreamer(nn.Module):
                             dtype=query.dtype,
                             device=query.device),
             "progress":
-                torch.zeros(*query.shape[:-1],
-                            1,
-                            dtype=query.dtype,
-                            device=query.device),
+                zeros_1,
             "weights":
                 None,
+            "effective_weights":
+                None,
+            "use_gate":
+                zeros_1,
+            "abstain":
+                torch.ones_like(zeros_1),
         }
 
     def _read_memory(self, deter, frozen=False, require_fresh_memory=False):
@@ -421,32 +422,27 @@ class Dreamer(nn.Module):
                                                       frozen=frozen)
             memory_tokens = memory_tokens.unsqueeze(0).expand(
                 query.shape[0], -1, -1)
-            null_token = self._get_null_memory_token(query.dtype,
-                                                     query.device,
-                                                     frozen=frozen)
-            null_token = null_token.unsqueeze(0).expand(query.shape[0], -1, -1)
-            memory_tokens = torch.cat([memory_tokens, null_token], dim=1)
             attention = self._frozen_memory_attention if frozen else self.memory_attention
             attended, weights = attention(query,
                                           memory_tokens,
                                           memory_tokens,
                                           need_weights=True)
+            gate_module = self._frozen_memory_use_gate if frozen else self.memory_use_gate
+            use_gate = torch.sigmoid(
+                gate_module(torch.cat([query, attended], dim=-1)))
             readout = {
-                "token": attended,
+                "token": attended * use_gate,
                 "weights": weights,
+                "effective_weights": weights * use_gate,
+                "use_gate": use_gate,
+                "abstain": 1.0 - use_gate,
             }
             for key in ("waypoint", "action", "reward", "rtg", "raw_rtg",
                         "progress"):
                 value = memory_context[key].to(device=query.device,
                                                dtype=query.dtype)
                 value = value.unsqueeze(0).expand(query.shape[0], -1, -1)
-                null_value = torch.zeros(query.shape[0],
-                                         1,
-                                         value.shape[-1],
-                                         dtype=query.dtype,
-                                         device=query.device)
-                value = torch.cat([value, null_value], dim=1)
-                readout[key] = torch.matmul(weights, value)
+                readout[key] = torch.matmul(weights, value) * use_gate
         if squeeze_time:
             for key, value in tuple(readout.items()):
                 if value is not None:
@@ -722,39 +718,58 @@ class Dreamer(nn.Module):
         losses["con"] = self._masked_mean(con_loss, t_mask)
 
         memory_mask = data["is_memory"] & data["t_mask"]
+        non_memory_mask = (~data["is_memory"]) & data["t_mask"]
         memory_targets = self._memory_targets(data["memory_index"],
                                               dtype=torch.float32,
                                               device=post_deter.device,
                                               require_fresh=False)
-        if memory_targets is not None and bool(memory_mask.any().item()):
-            expert_rl_feat, memory_readout = self._get_rl_feat(
+        if memory_targets is not None and bool(data["t_mask"].any().item()):
+            _, memory_readout = self._get_rl_feat(
                 post_stoch.detach(),
                 post_deter.detach(),
                 frozen=False,
                 require_fresh_memory=False,
                 return_aux=True,
             )
-            progress_pred = torch.sigmoid(
-                self.memory_progress(post_deter.detach()))
-            progress_loss = (progress_pred - memory_targets["progress"]).pow(2)
-            losses["memory_progress"] = self._masked_mean(
-                progress_loss, memory_mask.unsqueeze(-1))
+            use_gate = memory_readout["use_gate"]
+            if bool(memory_mask.any().item()):
+                progress_pred = torch.sigmoid(
+                    self.memory_progress(post_deter.detach()))
+                progress_loss = (progress_pred -
+                                 memory_targets["progress"]).pow(2)
+                losses["memory_progress"] = self._masked_mean(
+                    progress_loss, memory_mask.unsqueeze(-1))
 
-            align_log_prob = torch.log(
-                memory_readout["weights"].clamp_min(1e-6))
-            target_index = data["memory_index"].clamp(min=0).to(torch.long)
-            align_loss = -align_log_prob.gather(-1, target_index.unsqueeze(-1))
-            losses["memory_align"] = self._masked_mean(
-                align_loss, memory_mask.unsqueeze(-1))
+                align_log_prob = torch.log(
+                    memory_readout["weights"].clamp_min(1e-6))
+                target_index = data["memory_index"].clamp(min=0).to(torch.long)
+                align_loss = -align_log_prob.gather(-1,
+                                                    target_index.unsqueeze(-1))
+                losses["memory_align"] = self._masked_mean(
+                    align_loss, memory_mask.unsqueeze(-1))
 
-            pred_index = memory_readout["weights"].argmax(dim=-1)
-            metrics["memory_progress_mae"] = self._masked_mean(
-                (progress_pred - memory_targets["progress"]).abs(),
-                memory_mask.unsqueeze(-1))
-            metrics["memory_align_acc"] = self._masked_mean(
-                (pred_index == target_index).to(torch.float32), memory_mask)
-            metrics["memory_rtg"] = self._masked_mean(memory_targets["raw_rtg"],
-                                                      memory_mask.unsqueeze(-1))
+                use_loss = F.binary_cross_entropy(use_gate,
+                                                  torch.ones_like(use_gate),
+                                                  reduction="none")
+                losses["memory_use"] = self._masked_mean(
+                    use_loss, memory_mask.unsqueeze(-1))
+
+                pred_index = memory_readout["weights"].argmax(dim=-1)
+                metrics["memory_progress_mae"] = self._masked_mean(
+                    (progress_pred - memory_targets["progress"]).abs(),
+                    memory_mask.unsqueeze(-1))
+                metrics["memory_align_acc"] = self._masked_mean(
+                    (pred_index == target_index).to(torch.float32), memory_mask)
+                metrics["memory_use"] = self._masked_mean(
+                    use_gate, memory_mask.unsqueeze(-1))
+                metrics["memory_rtg"] = self._masked_mean(
+                    memory_targets["raw_rtg"], memory_mask.unsqueeze(-1))
+
+            if bool(non_memory_mask.any().item()):
+                losses["memory_sparse"] = self._masked_mean(
+                    use_gate, non_memory_mask.unsqueeze(-1))
+                metrics["memory_sparse"] = self._masked_mean(
+                    use_gate, non_memory_mask.unsqueeze(-1))
 
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())
@@ -842,6 +857,8 @@ class Dreamer(nn.Module):
         metrics["rew"] = torch.mean(imag_reward)
         if self.expert_shaping_scale > 0 and self.memory is not None:
             metrics["shaping"] = torch.mean(shaping)
+            metrics["imag_memory_use"] = torch.mean(imag_readout["use_gate"])
+            metrics["imag_memory_abstain"] = torch.mean(imag_readout["abstain"])
         metrics["val"] = torch.mean(imag_value)
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_value)

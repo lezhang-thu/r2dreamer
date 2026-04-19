@@ -67,10 +67,13 @@ Without this, the model may receive expert state information and reward
 information, but it still does not know that they correspond to the same expert
 time step.
 
-In practice, the attention also needs an explicit null / abstain option. If
-the current state is not meaningfully related to the expert trajectory, the
-model should be able to route attention to a zero-valued null slot rather than
-being forced to average over unrelated expert positions.
+In practice, the retrieval also needs an explicit abstention mechanism. If the
+current state is not meaningfully related to the expert trajectory, the model
+should be able to keep a separate memory-use gate closed rather than being
+forced to average over unrelated expert positions. This separates:
+
+- which expert position matches best
+- whether expert memory should be used at all
 
 ## Why return-to-go matters more than raw reward
 
@@ -106,6 +109,16 @@ This teaches:
 
 - "this current latent corresponds to expert position `t`"
 - "the retrieved tuple should come from that same position"
+
+### 1b. Memory-use supervision and sparsity
+
+The abstention gate should open on expert-memory states, but default toward
+closed elsewhere unless using expert memory clearly helps.
+
+This teaches:
+
+- "expert states should use expert memory"
+- "ordinary states should abstain unless there is strong evidence to retrieve"
 
 ### 2. Progress supervision
 

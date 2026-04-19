@@ -30,12 +30,14 @@ loss_scales:
   rep: 0.1
   memory_align: 0.1
   memory_progress: 1.0
+  memory_use: 0.1
+  memory_sparse: 0.01
   # memory_value removed: the value head should track the current policy's
   # return, not expert RTG. Expert value enters via potential-based shaping.
   policy: 1.0
   value: 1.0
 
-expert_shaping_scale: 1.0
+expert_shaping_scale: 0.1
 
 r2dreamer:
   lambd: 5e-4

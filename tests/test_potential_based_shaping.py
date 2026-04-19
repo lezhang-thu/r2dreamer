@@ -151,7 +151,12 @@ class _ShapingDummy:
 
     def _read_memory(self, imag_deter, frozen=True):
         del imag_deter, frozen
-        return {"raw_rtg": self._phi}
+        zeros = torch.zeros_like(self._phi)
+        return {
+            "raw_rtg": self._phi,
+            "use_gate": zeros,
+            "abstain": torch.ones_like(self._phi),
+        }
 
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):
         del last, term, value, boot, disc, lamb
