@@ -176,10 +176,6 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         return self
 
-    def _get_rl_feat(self, stoch, deter):
-        stoch_flat = stoch.reshape(*stoch.shape[:-2], self.rssm.flat_stoch)
-        return torch.cat([stoch_flat, deter], dim=-1)
-
     @torch.no_grad()
     def act(self, obs, state, eval=False):
         """Policy inference step."""
@@ -200,7 +196,7 @@ class Dreamer(nn.Module):
         # Phase 1: posterior from tokens
         carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
             carry, embed_sq, is_first)
-        rl_feat = self._get_rl_feat(stoch, h_prev)
+        rl_feat = self._frozen_rssm.get_feat(stoch, h_prev)
         action_dist = self._frozen_actor(rl_feat)
         action = action_dist.mode if eval else action_dist.rsample()
         # Phase 2: update KV-cache with (stoch, action)
@@ -413,18 +409,15 @@ class Dreamer(nn.Module):
         losses = {}
         metrics = {}
 
-        imag_feat, imag_action, imag_stoch, imag_deter = self._imagine(
+        imag_feat, imag_action = self._imagine(
             (start_stoch, start_deter), self.imag_horizon + 1, imag_carry)
         imag_feat = imag_feat.detach()
         imag_action = imag_action.detach()
-        imag_stoch = imag_stoch.detach()
-        imag_deter = imag_deter.detach()
-        imag_rl_feat = self._get_rl_feat(imag_stoch, imag_deter)
 
         imag_reward = self._frozen_reward(imag_feat).mode()
         imag_cont = self._frozen_cont(imag_feat).mean
-        imag_value = self._frozen_value(imag_rl_feat).mode()
-        imag_slow_value = self._frozen_slow_value(imag_rl_feat).mode()
+        imag_value = self._frozen_value(imag_feat).mode()
+        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
         disc = 1 - 1 / self.horizon
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
@@ -435,14 +428,14 @@ class Dreamer(nn.Module):
         ret_offset, ret_scale = self.return_ema(ret)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
-        policy = self.actor(imag_rl_feat)
+        policy = self.actor(imag_feat)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() +
                                                   self.act_entropy * entropy)
         losses["policy"] = self._masked_mean(policy_loss, imag_mask)
 
-        imag_value_dist = self.value(imag_rl_feat)
+        imag_value_dist = self.value(imag_feat)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
         value_loss = (weight[:, :-1].detach() *
                       (-imag_value_dist.log_prob(tar_padded.detach()) -
@@ -610,27 +603,21 @@ class Dreamer(nn.Module):
         # (B, S, K), (B, D)
         feats = []
         actions = []
-        stoch_seq = []
-        deter_seq = []
         stoch, deter = start
         for _ in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
-            rl_feat = self._get_rl_feat(stoch, deter)
             # (B, A)
-            action = self._frozen_actor(rl_feat).rsample()
+            action = self._frozen_actor(feat).rsample()
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
-            stoch_seq.append(stoch)
-            deter_seq.append(deter)
             stoch, deter, imag_carry = self._frozen_rssm.img_step_with_carry(
                 stoch, imag_carry, action)
 
         # Stack along sequence dim T_imag.
-        # (B, T_imag, F), (B, T_imag, A), (B, T_imag, S, K), (B, T_imag, D)
-        return (torch.stack(feats, dim=1), torch.stack(actions, dim=1),
-                torch.stack(stoch_seq, dim=1), torch.stack(deter_seq, dim=1))
+        # (B, T_imag, F), (B, T_imag, A)
+        return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
 
     @torch.no_grad()
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):
