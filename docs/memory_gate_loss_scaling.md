@@ -11,11 +11,12 @@ existing metrics in TensorBoard:
    early-training low-confidence attention is too strong. Drop
    `memory_sparse` to `0.5`.
 
-2. **`metrics/memory_confidence`** — mean `(max_weight − 1/n) / (1 − 1/n)`
-   over all `t_mask` positions. Should rise over training as attention
-   aligns on memory-labeled data. If it stays near 0, attention is not
-   sharpening — the problem is upstream (alignment or representation),
-   not loss-scale tuning.
+2. **`metrics/memory_confidence`** — mean `1 − H(weights) / log(n)` over all
+   `t_mask` positions, where `H(weights)` is the Shannon entropy of the
+   attention distribution. Should rise over training as attention aligns on
+   memory-labeled data. If it stays near 0, attention is not sharpening —
+   the problem is upstream (alignment or representation), not loss-scale
+   tuning.
 
 If both curves look healthy, the 1.0 / 1.0 configuration is valid for the
 confidence-gated design.
