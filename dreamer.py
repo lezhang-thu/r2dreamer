@@ -1,4 +1,5 @@
 import copy
+import math
 from collections import OrderedDict
 
 import torch
@@ -302,6 +303,7 @@ class Dreamer(nn.Module):
         return {
             "raw_rtg": zeros_1,
             "weights": None,
+            "confidence": zeros_1,
             "use_gate_logits": closed_gate_logits,
             "use_gate": zeros_1,
         }
@@ -327,12 +329,23 @@ class Dreamer(nn.Module):
                                           memory_tokens,
                                           memory_tokens,
                                           need_weights=True)
+            n_memory = int(weights.shape[-1])
+            if n_memory <= 1:
+                confidence = torch.ones_like(weights[..., :1])
+            else:
+                safe_weights = weights.clamp_min(1e-9)
+                entropy = -(safe_weights * safe_weights.log()).sum(dim=-1,
+                                                                   keepdim=True)
+                confidence = (1.0 - entropy / math.log(n_memory)).clamp(
+                    0.0, 1.0)
             gate_module = self._frozen_memory_use_gate if frozen else self.memory_use_gate
             gate_logits = gate_module(torch.cat([query, attended], dim=-1))
             use_gate = torch.sigmoid(gate_logits)
             readout = {
                 "weights":
                     weights,
+                "confidence":
+                    confidence,
                 "use_gate_logits":
                     gate_logits,
                 "use_gate":
@@ -589,7 +602,6 @@ class Dreamer(nn.Module):
         losses["con"] = self._masked_mean(con_loss, t_mask)
 
         memory_mask = data["is_memory"] & data["t_mask"]
-        non_memory_mask = (~data["is_memory"]) & data["t_mask"]
         memory_targets = self._memory_targets(data["memory_index"],
                                               dtype=torch.float32,
                                               device=post_deter.device,
@@ -625,11 +637,14 @@ class Dreamer(nn.Module):
                 metrics["memory_rtg"] = self._masked_mean(
                     memory_targets["raw_rtg"], memory_mask.unsqueeze(-1))
 
-            if bool(non_memory_mask.any().item()):
-                memory_sparse = self._masked_mean(use_gate,
-                                                  non_memory_mask.unsqueeze(-1))
-                losses["memory_sparse"] = memory_sparse
-                metrics["memory_sparse"] = memory_sparse
+            confidence = memory_readout["confidence"].detach()
+            sparse_loss = use_gate * (1.0 - confidence)
+            memory_sparse = self._masked_mean(sparse_loss,
+                                              data["t_mask"].unsqueeze(-1))
+            losses["memory_sparse"] = memory_sparse
+            metrics["memory_sparse"] = memory_sparse
+            metrics["memory_confidence"] = self._masked_mean(
+                memory_readout["confidence"], data["t_mask"].unsqueeze(-1))
 
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())

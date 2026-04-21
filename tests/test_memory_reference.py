@@ -182,6 +182,10 @@ class MemoryAttentionTest(unittest.TestCase):
                                    torch.tensor([[0.625]]),
                                    atol=1e-6,
                                    rtol=0.0)
+        torch.testing.assert_close(readout["confidence"],
+                                   torch.tensor([[0.18872188]]),
+                                   atol=1e-6,
+                                   rtol=0.0)
         self.assertEqual(readout["weights"].shape[-1], T)
         torch.testing.assert_close(readout["use_gate"],
                                    torch.zeros(1, 1),
