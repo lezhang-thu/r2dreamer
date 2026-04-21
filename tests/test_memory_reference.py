@@ -65,6 +65,8 @@ class _ObserveRecorder:
         self._D = deter_dim
         self._S = stoch_groups
         self._K = stoch_classes
+        self._window_size = T
+        self._offset = 0
 
     def observe(self, embed, action, is_first, sample=True):
         del embed, action, is_first
@@ -74,6 +76,25 @@ class _ObserveRecorder:
         stoch = torch.zeros(1, self._T, self._S, self._K)
         stoch[..., 0] = 1.0  # one-hot on class 0
         return {}, {"deter": deter, "stoch": stoch}
+
+    def initial(self, batch_size):
+        del batch_size
+        return {"h_prev": torch.zeros(1, self._D)}
+
+    def observe_with_carry(self, embed, action, is_first, carry, sample=True):
+        del action, is_first
+        self.sample_args.append(sample)
+        T = embed.shape[1]
+        start = self._offset
+        end = start + T
+        deter = (torch.arange(start * self._D,
+                              end * self._D,
+                              dtype=torch.float32).reshape(1, T, self._D))
+        stoch = torch.zeros(1, T, self._S, self._K)
+        stoch[..., 0] = 1.0
+        self._offset = end
+        carry["h_prev"] = deter[:, -1]
+        return {}, {"deter": deter, "stoch": stoch}, carry
 
 
 class _FixedAttention:

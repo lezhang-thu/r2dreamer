@@ -357,6 +357,163 @@ class TransformerRSSM(nn.Module):
         deters = torch.stack(deters, dim=1)
         return stochs, deters, carry
 
+    def update_carry_sequence(self, carry, stoch, action, reset):
+        """KV-cache Transformer update for a sequence of posterior states.
+
+        This is the chunked equivalent of calling update_carry() repeatedly.
+        It keeps memory O(window_size) while matching the windowed causal
+        Transformer computation for the returned hidden sequence.
+        """
+        B, L = stoch.shape[:2]
+        D = self._deter
+        H = self._n_heads
+        D_head = self._d_head
+        W = self._window_size
+        device = stoch.device
+
+        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
+        stoch_flat = stoch.reshape(B, L, self.flat_stoch)
+        x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
+
+        kv_cache = carry['kv_cache']
+        pos = carry['pos'].to(device=device)
+        reset = reset.to(device=device, dtype=torch.bool)
+        steps = torch.arange(L, device=device)
+
+        reset_positions = torch.where(
+            reset,
+            steps.unsqueeze(0).expand(B, L),
+            torch.full((B, L), -1, dtype=torch.long, device=device),
+        )
+        last_reset = torch.cummax(reset_positions, dim=1).values
+        positions = torch.where(
+            last_reset >= 0,
+            steps.unsqueeze(0) - last_reset,
+            pos.to(torch.long).unsqueeze(1) + steps.unsqueeze(0))
+
+        prefix_idx = torch.arange(W, device=device)
+        n_prev = torch.clamp(pos, max=W).to(torch.long)
+        valid_prefix = prefix_idx.unsqueeze(0) >= (W - n_prev).unsqueeze(1)
+        reset_seen = torch.cumsum(reset.to(torch.int32), dim=1) > 0
+        prefix_window = prefix_idx.reshape(1, 1,
+                                           W) >= (steps.reshape(1, L, 1) + 1)
+        prefix_allowed = (valid_prefix.unsqueeze(1) & prefix_window &
+                          (~reset_seen).unsqueeze(-1))
+
+        key_steps = steps
+        causal = key_steps.reshape(1, L) <= steps.reshape(L, 1)
+        local = key_steps.reshape(1, L) >= (steps.reshape(L, 1) - (W - 1))
+        chunk_allowed = (causal & local).unsqueeze(0).expand(B, L, L)
+        reset_cumsum = torch.cumsum(reset.to(torch.int32), dim=1)
+        same_segment = (reset_cumsum.unsqueeze(2) -
+                        reset_cumsum.unsqueeze(1)) == 0
+        chunk_allowed = chunk_allowed & same_segment
+        attn_mask = torch.cat([prefix_allowed, chunk_allowed],
+                              dim=-1).unsqueeze(1)
+
+        last_reset_in_chunk = last_reset[:, -1]
+        has_reset = last_reset_in_chunk >= 0
+        final_pos = torch.where(has_reset, L - last_reset_in_chunk,
+                                pos.to(torch.long) + L).to(torch.int32)
+
+        def _final_cache(old_cache, new_cache):
+            combined = torch.cat([old_cache, new_cache], dim=1)
+            if not bool(has_reset.any().item()):
+                return combined[:, -W:]
+            out = torch.zeros(B,
+                              W,
+                              D,
+                              dtype=new_cache.dtype,
+                              device=new_cache.device)
+            for b in range(B):
+                if bool(has_reset[b].item()):
+                    valid = new_cache[b, int(last_reset_in_chunk[b].item()):]
+                    tail = valid[-W:]
+                    out[b, W - tail.shape[0]:] = tail
+                else:
+                    out[b] = combined[b, -W:]
+            return out
+
+        new_kv_cache_layers = []
+        for i in range(self._n_layers):
+            res = x
+            x = self._attn_norms[i](x)
+
+            Q = self._q_projs[i](x).reshape(B, L, H, D_head).transpose(1, 2)
+            K_new = self._k_projs[i](x).reshape(B, L, H, D_head).transpose(1, 2)
+            V_new = self._v_projs[i](x).reshape(B, L, H, D_head).transpose(1, 2)
+
+            Q = self._apply_rope(Q, positions)
+            K_new = self._apply_rope(K_new, positions)
+
+            k_new_flat = K_new.transpose(1, 2).reshape(B, L, D)
+            v_new_flat = V_new.transpose(1, 2).reshape(B, L, D)
+
+            k_cache = kv_cache[:, i, 0]
+            v_cache = kv_cache[:, i, 1]
+            K_all = torch.cat([k_cache, k_new_flat], dim=1)
+            V_all = torch.cat([v_cache, v_new_flat], dim=1)
+            K_all = K_all.reshape(B, W + L, H, D_head).transpose(1, 2)
+            V_all = V_all.reshape(B, W + L, H, D_head).transpose(1, 2)
+
+            x = F.scaled_dot_product_attention(Q,
+                                               K_all,
+                                               V_all,
+                                               attn_mask=attn_mask)
+            x = x.transpose(1, 2).reshape(B, L, D)
+            x = res + self._o_projs[i](x)
+
+            res = x
+            x = self._ffn_norms[i](x)
+            x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
+            x = res + x
+
+            new_kv_cache_layers.append(
+                (_final_cache(k_cache,
+                              k_new_flat), _final_cache(v_cache, v_new_flat)))
+
+        h = self._outnorm(x)
+        ks = torch.stack([kv[0] for kv in new_kv_cache_layers], dim=1)
+        vs = torch.stack([kv[1] for kv in new_kv_cache_layers], dim=1)
+        new_kv_cache = torch.stack([ks, vs], dim=2)
+
+        return h, {
+            'kv_cache': new_kv_cache,
+            'pos': final_pos,
+            'h_prev': h[:, -1],
+        }
+
+    def observe_with_carry(self,
+                           tokens,
+                           action,
+                           reset,
+                           carry=None,
+                           sample=True):
+        """Chunked observe path backed by a rolling KV cache."""
+        if carry is None:
+            carry = self.initial(tokens.shape[0])
+
+        post_logit = self._post_head(tokens)
+        post_dist = self.get_dist(post_logit)
+        if sample:
+            stoch = post_dist.rsample()
+        else:
+            stoch = post_dist.base_dist.mode
+
+        h, new_carry = self.update_carry_sequence(carry, stoch, action, reset)
+        h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
+        h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
+        prior_logit = self._prior_head(h_prev)
+
+        entries = {'deter': h_prev, 'stoch': stoch}
+        feat = {
+            'deter': h_prev,
+            'stoch': stoch,
+            'post_logit': post_logit,
+            'prior_logit': prior_logit,
+        }
+        return entries, feat, new_carry
+
     # ------------------------------------------------------------------
     # KV-cache policy inference
     # ------------------------------------------------------------------
