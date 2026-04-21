@@ -118,7 +118,6 @@ class _ShapingDummy:
 
         self._imag_feat = torch.zeros(1, 3, 5, dtype=torch.float32)
         self._imag_action = torch.zeros(1, 3, 2, dtype=torch.float32)
-        self._imag_stoch = torch.zeros(1, 3, 1, 1, dtype=torch.float32)
         self._imag_deter = torch.zeros(1, 3, 4, dtype=torch.float32)
         self._imag_reward = torch.tensor([[[5.0], [1.0], [2.0]]],
                                          dtype=torch.float32)
@@ -140,14 +139,7 @@ class _ShapingDummy:
     def _imagine(self, start, imag_horizon, imag_carry):
         del start, imag_carry
         assert imag_horizon == self.imag_horizon + 1
-        return self._imag_feat, self._imag_action, self._imag_stoch, self._imag_deter
-
-    def _get_rl_feat(self, imag_stoch, imag_deter):
-        del imag_stoch
-        return torch.zeros(*imag_deter.shape[:-1],
-                           1,
-                           dtype=imag_deter.dtype,
-                           device=imag_deter.device)
+        return self._imag_feat, self._imag_action, self._imag_deter
 
     def _read_memory(self, imag_deter, frozen=True):
         del imag_deter, frozen
@@ -155,7 +147,6 @@ class _ShapingDummy:
         return {
             "raw_rtg": self._phi,
             "use_gate": zeros,
-            "abstain": torch.ones_like(self._phi),
         }
 
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):

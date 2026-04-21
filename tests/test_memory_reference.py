@@ -20,7 +20,6 @@ class _AttnDummy:
     _build_memory_tokens = Dreamer._build_memory_tokens
     _zero_memory_readout = Dreamer._zero_memory_readout
     _read_memory = Dreamer._read_memory
-    _get_rl_feat = Dreamer._get_rl_feat
 
     def __init__(self, memory, context, deter_dim=4, act_dim=2, stale=False):
         self.memory = memory
@@ -170,15 +169,6 @@ class MemoryAttentionTest(unittest.TestCase):
         dummy._refresh_memory_context_if_stale()
         self.assertEqual(dummy.refresh_calls, 1)
 
-    def test_get_rl_feat_uses_only_agent_latent_state(self):
-        dummy = _AttnDummy(memory=None, context=None)
-        stoch = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])  # (B, S=1, K=2)
-        deter = torch.tensor([[5.0, 6.0, 7.0, 8.0], [1.0, 2.0, 3.0,
-                                                     4.0]])  # (B, D=4)
-        rl_feat = dummy._get_rl_feat(stoch, deter)
-        expected = torch.cat([stoch.reshape(2, 2), deter], dim=-1)
-        torch.testing.assert_close(rl_feat, expected)
-
     def test_build_memory_tokens_uses_all_input_channels(self):
         T, D, A = 3, 4, 2
         deter = torch.arange(T * D, dtype=torch.float32).reshape(T, D)
@@ -233,10 +223,6 @@ class MemoryAttentionTest(unittest.TestCase):
 
         torch.testing.assert_close(readout["raw_rtg"], torch.zeros(1, 1))
         self.assertEqual(readout["weights"].shape[-1], T)
-        torch.testing.assert_close(readout["abstain"],
-                                   torch.ones(1, 1),
-                                   atol=1e-6,
-                                   rtol=0.0)
         torch.testing.assert_close(readout["use_gate"],
                                    torch.zeros(1, 1),
                                    atol=1e-6,
