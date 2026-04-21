@@ -11,7 +11,6 @@ from torch.optim.lr_scheduler import LambdaLR
 import networks
 import rssm
 import tools
-from distributions import symlog
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
@@ -69,16 +68,6 @@ class Dreamer(nn.Module):
         # Actor-critic components
         deter_dim = int(config.transformer.deter)
         act_fn = getattr(torch.nn, config.transformer.act)
-        self._memory_rtg_embed_dim = 16
-        self.rtg_proj = nn.Linear(1, self._memory_rtg_embed_dim, bias=True)
-        self.mem_proj = nn.Sequential(
-            nn.Linear(self.rssm.feat_size + self.act_dim +
-                      self._memory_rtg_embed_dim,
-                      deter_dim,
-                      bias=True),
-            act_fn(),
-            nn.Linear(deter_dim, deter_dim, bias=True),
-        )
         self.rl_feat_size = self.rssm.flat_stoch + deter_dim
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
@@ -94,11 +83,6 @@ class Dreamer(nn.Module):
             nn.Linear(deter_dim, 1, bias=True),
         )
         nn.init.constant_(self.memory_use_gate[-1].bias, -2.0)
-        self.memory_progress = nn.Sequential(
-            nn.Linear(deter_dim, deter_dim, bias=True),
-            act_fn(),
-            nn.Linear(deter_dim, 1, bias=True),
-        )
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -115,11 +99,8 @@ class Dreamer(nn.Module):
             "rssm": self.rssm,
             "actor": self.actor,
             "value": self.value,
-            "rtg_proj": self.rtg_proj,
-            "mem_proj": self.mem_proj,
             "memory_attention": self.memory_attention,
             "memory_use_gate": self.memory_use_gate,
-            "memory_progress": self.memory_progress,
             "reward": self.reward,
             "cont": self.cont,
             "encoder": self.encoder,
@@ -213,11 +194,8 @@ class Dreamer(nn.Module):
                 "actor",
                 "value",
                 "slow_value",
-                "rtg_proj",
-                "mem_proj",
                 "memory_attention",
                 "memory_use_gate",
-                "memory_progress",
         ):
             setattr(
                 self, f"_frozen_{name}",
@@ -289,19 +267,11 @@ class Dreamer(nn.Module):
                                                  data["is_first"],
                                                  sample=False)
         deter = feat_dict["deter"].squeeze(0).detach()
-        stoch_flat = feat_dict["stoch"].squeeze(0).reshape(
-            deter.shape[0], self.rssm.flat_stoch).detach()
         reward = data["reward"].squeeze(0).to(torch.float32).unsqueeze(-1)
         raw_rtg = self._compute_memory_return_to_go(reward).detach()
         self._memory_context = {
             "deter":
                 deter,
-            "stoch_flat":
-                stoch_flat,
-            "action":
-                data["action"].squeeze(0).detach(),
-            "rtg":
-                symlog(raw_rtg).detach(),
             "raw_rtg":
                 raw_rtg,
             "progress":
@@ -322,20 +292,6 @@ class Dreamer(nn.Module):
     def _refresh_memory_context_if_stale(self):
         if self.memory is not None and self._memory_context_stale:
             self.refresh_memory_context()
-
-    def _build_memory_tokens(self, memory_context, dtype, device, frozen=False):
-        if memory_context is None:
-            return None
-        rtg_proj = self._frozen_rtg_proj if frozen else self.rtg_proj
-        mem_proj = self._frozen_mem_proj if frozen else self.mem_proj
-        deter = memory_context["deter"].to(device=device, dtype=dtype)
-        stoch_flat = memory_context["stoch_flat"].to(device=device, dtype=dtype)
-        action = memory_context["action"].to(device=device, dtype=dtype)
-        rtg = memory_context["rtg"].to(device=device, dtype=dtype)
-        token_feat = torch.cat([deter, stoch_flat, action,
-                                rtg_proj(rtg)],
-                               dim=-1)
-        return mem_proj(token_feat)
 
     def _zero_memory_readout(self, query):
         zeros_1 = torch.zeros(*query.shape[:-1],
@@ -362,10 +318,8 @@ class Dreamer(nn.Module):
         if memory_context is None:
             readout = self._zero_memory_readout(query)
         else:
-            memory_tokens = self._build_memory_tokens(memory_context,
-                                                      dtype=query.dtype,
-                                                      device=query.device,
-                                                      frozen=frozen)
+            memory_tokens = memory_context["deter"].to(device=query.device,
+                                                       dtype=query.dtype)
             memory_tokens = memory_tokens.unsqueeze(0).expand(
                 query.shape[0], -1, -1)
             attention = self._frozen_memory_attention if frozen else self.memory_attention
@@ -391,6 +345,14 @@ class Dreamer(nn.Module):
                             dtype=query.dtype).unsqueeze(0).expand(
                                 query.shape[0], -1, -1),
                     ) * use_gate,
+                "progress":
+                    torch.matmul(
+                        weights,
+                        memory_context["progress"].to(
+                            device=query.device,
+                            dtype=query.dtype).unsqueeze(0).expand(
+                                query.shape[0], -1, -1),
+                    ),
             }
         if squeeze_time:
             for key, value in tuple(readout.items()):
@@ -640,20 +602,10 @@ class Dreamer(nn.Module):
             )
             use_gate = memory_readout["use_gate"]
             if bool(memory_mask.any().item()):
-                progress_pred = torch.sigmoid(
-                    self.memory_progress(post_deter.detach()))
-                progress_loss = (progress_pred -
+                progress_loss = (memory_readout["progress"] -
                                  memory_targets["progress"]).pow(2)
                 losses["memory_progress"] = self._masked_mean(
                     progress_loss, memory_mask.unsqueeze(-1))
-
-                align_log_prob = torch.log(
-                    memory_readout["weights"].clamp_min(1e-6))
-                target_index = data["memory_index"].clamp(min=0).to(torch.long)
-                align_loss = -align_log_prob.gather(-1,
-                                                    target_index.unsqueeze(-1))
-                losses["memory_align"] = self._masked_mean(
-                    align_loss, memory_mask.unsqueeze(-1))
 
                 use_loss = F.binary_cross_entropy_with_logits(
                     memory_readout["use_gate_logits"],
@@ -664,12 +616,10 @@ class Dreamer(nn.Module):
                                                     memory_mask.unsqueeze(-1))
                 losses["memory_use"] = memory_use_loss
 
-                pred_index = memory_readout["weights"].argmax(dim=-1)
                 metrics["memory_progress_mae"] = self._masked_mean(
-                    (progress_pred - memory_targets["progress"]).abs(),
+                    (memory_readout["progress"] -
+                     memory_targets["progress"]).abs(),
                     memory_mask.unsqueeze(-1))
-                metrics["memory_align_acc"] = self._masked_mean(
-                    (pred_index == target_index).to(torch.float32), memory_mask)
                 metrics["memory_use"] = self._masked_mean(
                     use_gate, memory_mask.unsqueeze(-1))
                 metrics["memory_rtg"] = self._masked_mean(

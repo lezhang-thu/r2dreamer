@@ -3,7 +3,6 @@ import unittest
 import torch
 from torch import nn
 
-from distributions import symlog
 from dreamer import Dreamer
 
 
@@ -17,7 +16,6 @@ class _AttnDummy:
 
     _get_memory_context = Dreamer._get_memory_context
     _refresh_memory_context_if_stale = Dreamer._refresh_memory_context_if_stale
-    _build_memory_tokens = Dreamer._build_memory_tokens
     _zero_memory_readout = Dreamer._zero_memory_readout
     _read_memory = Dreamer._read_memory
 
@@ -30,17 +28,6 @@ class _AttnDummy:
         self._frozen_rssm = _FakeRSSM()
         self.refresh_calls = 0
 
-        flat_stoch = self.rssm.flat_stoch
-        rtg_emb_dim = 16
-        self.rtg_proj = nn.Linear(1, rtg_emb_dim)
-        self._frozen_rtg_proj = self.rtg_proj
-        mem_in_dim = deter_dim + flat_stoch + act_dim + rtg_emb_dim
-        self.mem_proj = nn.Sequential(
-            nn.Linear(mem_in_dim, deter_dim),
-            nn.SiLU(),
-            nn.Linear(deter_dim, deter_dim),
-        )
-        self._frozen_mem_proj = self.mem_proj
         self.memory_attention = nn.MultiheadAttention(deter_dim,
                                                       num_heads=1,
                                                       dropout=0.0,
@@ -169,42 +156,11 @@ class MemoryAttentionTest(unittest.TestCase):
         dummy._refresh_memory_context_if_stale()
         self.assertEqual(dummy.refresh_calls, 1)
 
-    def test_build_memory_tokens_uses_all_input_channels(self):
-        T, D, A = 3, 4, 2
-        deter = torch.arange(T * D, dtype=torch.float32).reshape(T, D)
-        stoch_flat = torch.full((T, 2), 0.5)
-        action = torch.eye(A)[torch.zeros(T, dtype=torch.long)]
-        rtg = torch.tensor([[3.0], [4.0], [4.0]])
-        ctx = {
-            "deter": deter,
-            "stoch_flat": stoch_flat,
-            "action": action,
-            "rtg": rtg
-        }
-
-        dummy = _AttnDummy(memory={"reward": torch.zeros(T)},
-                           context=ctx,
-                           deter_dim=D,
-                           act_dim=A)
-        tokens = dummy._build_memory_tokens(ctx,
-                                            dtype=torch.float32,
-                                            device=torch.device("cpu"),
-                                            frozen=False)
-
-        rtg_emb = dummy.rtg_proj(rtg)
-        feats = torch.cat([deter, stoch_flat, action, rtg_emb], dim=-1)
-        expected = dummy.mem_proj(feats)
-        torch.testing.assert_close(tokens, expected)
-        self.assertEqual(tokens.shape, (T, D))
-
     def test_read_memory_returns_zero_valued_fields_when_gate_abstains(self):
         T, D, A = 2, 4, 2
         raw_rtg = torch.tensor([[3.0], [5.0]])
         ctx = {
             "deter": torch.randn(T, D),
-            "stoch_flat": torch.randn(T, 2),
-            "action": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            "rtg": symlog(raw_rtg),
             "raw_rtg": raw_rtg,
             "progress": torch.tensor([[0.25], [0.75]]),
         }
@@ -222,6 +178,10 @@ class MemoryAttentionTest(unittest.TestCase):
         readout = dummy._read_memory(q)
 
         torch.testing.assert_close(readout["raw_rtg"], torch.zeros(1, 1))
+        torch.testing.assert_close(readout["progress"],
+                                   torch.tensor([[0.625]]),
+                                   atol=1e-6,
+                                   rtol=0.0)
         self.assertEqual(readout["weights"].shape[-1], T)
         torch.testing.assert_close(readout["use_gate"],
                                    torch.zeros(1, 1),
@@ -241,13 +201,9 @@ class RefreshMemoryContextTest(unittest.TestCase):
 
         self.assertEqual(dummy._frozen_rssm.sample_args, [False])
         self.assertFalse(dummy._memory_context_stale)
-        for key in ("deter", "stoch_flat", "action", "rtg", "raw_rtg",
-                    "progress"):
+        for key in ("deter", "raw_rtg", "progress"):
             self.assertIn(key, ctx)
         self.assertEqual(ctx["deter"].shape, (3, 2))
-        self.assertEqual(ctx["stoch_flat"].shape, (3, 2))
-        self.assertEqual(ctx["action"].shape, (3, 2))
-        self.assertEqual(ctx["rtg"].shape, (3, 1))
         self.assertEqual(ctx["raw_rtg"].shape, (3, 1))
         self.assertEqual(ctx["progress"].shape, (3, 1))
 
@@ -263,7 +219,6 @@ class RefreshMemoryContextTest(unittest.TestCase):
                               rewards=(1.0, 2.0, 4.0))
         ctx = dummy.refresh_memory_context()
         expected_G = torch.tensor([[3.0], [4.0], [4.0]])
-        torch.testing.assert_close(ctx["rtg"], symlog(expected_G))
         torch.testing.assert_close(ctx["raw_rtg"], expected_G)
 
     def test_refresh_returns_none_when_memory_absent(self):

@@ -100,15 +100,17 @@ that tell it how expert memory should be used.
 
 The most important ones are:
 
-### 1. Localization / alignment supervision
+### 1. Progress-readout supervision
 
-When the replay sample comes from the expert memory, the true expert index is
-known. Use that to train the model to attend to the correct expert position.
+When the replay sample comes from the expert memory, its rough trajectory
+progress is known. Use the memory attention weights to read out normalized
+expert progress and train that scalar readout, rather than forcing an exact
+expert index match.
 
 This teaches:
 
-- "this current latent corresponds to expert position `t`"
-- "the retrieved tuple should come from that same position"
+- "this current latent corresponds to this rough fraction of the expert path"
+- "nearby expert positions can be acceptable if they imply similar progress"
 
 ### 1b. Memory-use supervision and sparsity
 
@@ -120,14 +122,7 @@ This teaches:
 - "expert states should use expert memory"
 - "ordinary states should abstain unless there is strong evidence to retrieve"
 
-### 2. Progress supervision
-
-Train a small head to predict normalized trajectory progress `p_t`.
-
-This gives the model an explicit notion of:
-
-- where it is on the expert path
-- whether it is moving forward
+### 2. Memory-use supervision and sparsity
 
 ### 3. Potential-based shaping during imagination
 
@@ -210,10 +205,12 @@ Expert retrieval is kept separate and is not concatenated into `rl_feat`.
 
 ### Auxiliary losses
 
-Two expert-only auxiliary losses are added:
+Expert-memory auxiliary losses are added:
 
-- `memory_align`: attend to the correct expert index
-- `memory_progress`: predict where we are on the expert path
+- `memory_progress`: make the attention-weighted progress readout match rough
+  expert trajectory progress
+- `memory_use` / `memory_sparse`: open the memory gate on expert states and
+  keep it sparse elsewhere
 
 In addition, actor-critic imagination uses potential-based reward shaping from
 retrieved expert `raw_rtg` rather than a direct expert-value regression loss.
