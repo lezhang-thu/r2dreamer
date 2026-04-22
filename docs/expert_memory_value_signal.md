@@ -114,15 +114,13 @@ This teaches:
 
 ### 1b. Memory-use supervision and sparsity
 
-The abstention gate should open on expert-memory states, but otherwise stay
-small when memory attention is diffuse. Sparsity is tied to retrieval
-confidence, not to whether the sample came from agent replay or expert memory.
+The abstention gate should open on expert-memory states, but default toward
+closed elsewhere unless using expert memory clearly helps.
 
 This teaches:
 
 - "expert states should use expert memory"
-- "low-confidence retrievals should abstain"
-- "agent-owned states that clearly match memory can still use it"
+- "ordinary states should abstain unless there is strong evidence to retrieve"
 
 ### 2. Memory-use supervision and sparsity
 
@@ -212,7 +210,7 @@ Expert-memory auxiliary losses are added:
 - `memory_progress`: make the attention-weighted progress readout match rough
   expert trajectory progress
 - `memory_use` / `memory_sparse`: open the memory gate on expert states and
-  discourage opening it when attention confidence is low
+  keep it sparse elsewhere
 
 In addition, actor-critic imagination uses potential-based reward shaping from
 retrieved expert `raw_rtg` rather than a direct expert-value regression loss.
