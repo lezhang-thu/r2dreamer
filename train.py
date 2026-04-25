@@ -75,7 +75,7 @@ def main(config):
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
-    memory_path = pathlib.Path(__file__).with_name("ge.json")
+    memory_path = pathlib.Path(__file__).with_name("ge-14600.json")
     memory = None
     if memory_path.exists():
         print(f"Load memory from {memory_path}.")
