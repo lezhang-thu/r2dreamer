@@ -307,16 +307,52 @@ class Dreamer(nn.Module):
             self._memory_context = None
             self._memory_context_stale = False
             return None
-        data = self.preprocess(self._memory_episode_tensordict())
-        embed = self._frozen_encoder(data)
-        _, feat_dict = self._frozen_rssm.observe(embed,
-                                                 data["action"],
-                                                 data["is_first"],
-                                                 sample=False)
-        deter = feat_dict["deter"].squeeze(0).detach()
-        stoch_flat = feat_dict["stoch"].squeeze(0).reshape(
-            deter.shape[0], self.rssm.flat_stoch).detach()
-        reward = data["reward"].squeeze(0).to(torch.float32).unsqueeze(-1)
+        if "reward" not in self.memory:
+            raise KeyError("self.memory must contain a 'reward' field.")
+        T = int(len(self.memory["reward"]))
+        chunk_size = max(1, int(getattr(self._frozen_rssm, "_window_size", T)))
+        carry = self._frozen_rssm.initial(1)
+        deter_chunks = []
+        stoch_chunks = []
+        action_chunks = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            chunk = {}
+            for key, value in self.memory.items():
+                tensor = value if isinstance(
+                    value, torch.Tensor) else torch.as_tensor(value)
+                tensor = tensor[start:end]
+                if tensor.is_floating_point():
+                    tensor = tensor.to(self.device, non_blocking=True)
+                else:
+                    tensor = tensor.to(self.device)
+                chunk[key] = tensor.unsqueeze(0)
+            if "is_first" not in chunk:
+                chunk["is_first"] = torch.zeros(1,
+                                                end - start,
+                                                dtype=torch.bool,
+                                                device=self.device)
+            chunk["is_first"] = chunk["is_first"].to(torch.bool)
+            if start == 0:
+                chunk["is_first"][:, 0] = True
+            data = self.preprocess(
+                TensorDict(chunk, batch_size=(1, end - start)))
+            embed = self._frozen_encoder(data)
+            _, feat_dict, carry = self._frozen_rssm.observe_with_carry(
+                embed, data["action"], data["is_first"], carry, sample=False)
+            deter_chunks.append(feat_dict["deter"].squeeze(0).detach())
+            stoch_chunks.append(feat_dict["stoch"].squeeze(0).reshape(
+                end - start, self.rssm.flat_stoch).detach())
+            action_chunks.append(data["action"].squeeze(0).detach())
+
+        deter = torch.cat(deter_chunks, dim=0)
+        stoch_flat = torch.cat(stoch_chunks, dim=0)
+        action = torch.cat(action_chunks, dim=0)
+        reward_tensor = self.memory["reward"] if isinstance(
+            self.memory["reward"], torch.Tensor) else torch.as_tensor(
+                self.memory["reward"])
+        reward = reward_tensor.to(self.device,
+                                  dtype=torch.float32).reshape(T, 1)
         raw_rtg = self._compute_memory_return_to_go(reward).detach()
         self._memory_context = {
             "deter":
@@ -324,7 +360,7 @@ class Dreamer(nn.Module):
             "stoch_flat":
                 stoch_flat,
             "action":
-                data["action"].squeeze(0).detach(),
+                action,
             "reward":
                 reward.detach(),
             "rtg":

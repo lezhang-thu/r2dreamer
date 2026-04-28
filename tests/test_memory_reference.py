@@ -79,6 +79,8 @@ class _ObserveRecorder:
         self._D = deter_dim
         self._S = stoch_groups
         self._K = stoch_classes
+        self._window_size = T
+        self._offset = 0
 
     def observe(self, embed, action, is_first, sample=True):
         del embed, action, is_first
@@ -88,6 +90,25 @@ class _ObserveRecorder:
         stoch = torch.zeros(1, self._T, self._S, self._K)
         stoch[..., 0] = 1.0  # one-hot on class 0
         return {}, {"deter": deter, "stoch": stoch}
+
+    def initial(self, batch_size):
+        del batch_size
+        return {"h_prev": torch.zeros(1, self._D)}
+
+    def observe_with_carry(self, embed, action, is_first, carry, sample=True):
+        del action, is_first
+        self.sample_args.append(sample)
+        T = embed.shape[1]
+        start = self._offset
+        end = start + T
+        deter = (torch.arange(start * self._D,
+                              end * self._D,
+                              dtype=torch.float32).reshape(1, T, self._D))
+        stoch = torch.zeros(1, T, self._S, self._K)
+        stoch[..., 0] = 1.0
+        self._offset = end
+        carry["h_prev"] = deter[:, -1]
+        return {}, {"deter": deter, "stoch": stoch}, carry
 
 
 class _FixedAttention:
@@ -281,6 +302,22 @@ class RefreshMemoryContextTest(unittest.TestCase):
         self.assertEqual(ctx["raw_rtg"].shape, (3, 1))
         self.assertEqual(ctx["progress"].shape, (3, 1))
         self.assertEqual(ctx["waypoint"].shape, (3, 2))
+
+    def test_refresh_builds_memory_context_in_chunks(self):
+        dummy = _RefreshDummy(T=5,
+                              deter_dim=2,
+                              act_dim=2,
+                              disc=0.5,
+                              rewards=(1.0, 2.0, 3.0, 4.0, 5.0))
+        dummy._frozen_rssm._window_size = 2
+
+        ctx = dummy.refresh_memory_context()
+
+        self.assertEqual(dummy._frozen_rssm.sample_args, [False, False, False])
+        torch.testing.assert_close(ctx["deter"][:, 0],
+                                   torch.tensor([0.0, 2.0, 4.0, 6.0, 8.0]))
+        self.assertEqual(ctx["stoch_flat"].shape, (5, 2))
+        self.assertEqual(ctx["action"].shape, (5, 2))
 
     def test_refresh_computes_discounted_return_to_go(self):
         # rewards = [1, 2, 4], disc = 0.5
