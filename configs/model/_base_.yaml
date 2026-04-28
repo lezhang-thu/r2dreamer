@@ -46,14 +46,24 @@ transformer:
   act: ${model.act}
   rope_base: 1000000.0
   rope_max_seq_len: 32768
+  attn_dropout: 0.0
+  norm_eps: 1e-6
   head_hidden: ${model.hidden}
   post_layers: 1
   prior_layers: 2
-  n_heads: 8
-  #n_layers: 4
-  n_layers: 6
-  #d_ff: 4096
-  d_ff: 2048
+  n_heads: 16
+  num_kv_heads: 8
+  head_dim: 128
+  n_layers: 28
+  d_ff: 3072
+  q_proj_bias: False
+  k_proj_bias: False
+  v_proj_bias: False
+  output_proj_bias: False
+  q_norm: True
+  k_norm: True
+  gated_mlp: True
+  mlp_bias: False
   #window_size: 64
   window_size: ${batch_length}
   device: ${device}

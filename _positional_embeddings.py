@@ -63,15 +63,6 @@ class Qwen2RotaryPositionalEmbeddings(nn.Module):
         cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
         self.register_buffer("cache", cache, persistent=False)
 
-    def _maybe_grow_cache(self, needed_seq_len: int) -> None:
-        """Grow cached RoPE table if a requested position exceeds cache."""
-        if needed_seq_len <= self.cache.shape[0]:
-            return
-        # Grow geometrically to avoid frequent reallocations on long trajectories.
-        new_len = max(needed_seq_len, self.cache.shape[0] * 2)
-        self.max_seq_len = int(new_len)
-        self.build_rope_cache(self.max_seq_len)
-
     def forward(self,
                 x: torch.Tensor,
                 input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -100,32 +91,16 @@ class Qwen2RotaryPositionalEmbeddings(nn.Module):
         # input tensor has shape [b, s, n_h, h_d]
         seq_len = x.size(1)
         head_dim = x.size(-1)
-        if head_dim != self.dim:
-            raise ValueError(
-                f"RoPE dim mismatch: got head_dim={head_dim}, expected {self.dim}"
-            )
-        if head_dim % 2 != 0:
-            raise ValueError(f"RoPE head_dim must be even, got {head_dim}")
-
-        if input_pos is None:
-            needed_seq_len = seq_len
-        else:
-            input_pos = input_pos.to(torch.long)
-            needed_seq_len = int(torch.max(input_pos).item()) + 1
-        self._maybe_grow_cache(needed_seq_len)
 
         # extract the values based on whether input_pos is set or not. When
         # input_pos is provided, we're in inference mode
-        if input_pos is None:
-            rope_cache = self.cache[:seq_len]  # (s, 2*h_d)
-            rope_cache = rope_cache.unsqueeze(0).unsqueeze(2)  # (1,s,1,2*h_d)
-        else:
-            if input_pos.dim() == 1:
-                # (s,) -> (1,s,1,2*h_d)
-                rope_cache = self.cache[input_pos].unsqueeze(0).unsqueeze(2)
-            else:
-                # (b,s) -> (b,s,1,2*h_d)
-                rope_cache = self.cache[input_pos].unsqueeze(2)
+        rope_cache = (self.cache[:seq_len]
+                      if input_pos is None else self.cache[input_pos])
+
+        # reshape the cache for broadcasting
+        # tensor has shape [b, s, 1, h_d * 2] if packed samples,
+        # otherwise has shape [1, s, 1, h_d * 2]
+        rope_cache = rope_cache.view(-1, seq_len, 1, head_dim * 2)
 
         # [b, s, 1, h_d]
         cos = rope_cache[..., :head_dim].to(x.dtype)

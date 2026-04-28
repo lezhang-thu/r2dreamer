@@ -20,9 +20,21 @@ class TransformerRSSM(nn.Module):
         self._device = torch.device(config.device)
         self._act_dim = act_dim
         self._n_heads = int(config.n_heads)
+        self._num_kv_heads = int(getattr(config, 'num_kv_heads', self._n_heads))
         self._n_layers = int(config.n_layers)
         self._d_ff = int(config.d_ff)
         self._window_size = int(config.window_size)
+        self._attn_dropout = float(getattr(config, 'attn_dropout', 0.0))
+        self._norm_eps = float(getattr(config, 'norm_eps', 1e-04))
+        self._q_norm = bool(getattr(config, 'q_norm', False))
+        self._k_norm = bool(getattr(config, 'k_norm', False))
+        self._gated_mlp = bool(getattr(config, 'gated_mlp', False))
+        self._mlp_bias = bool(getattr(config, 'mlp_bias', not self._gated_mlp))
+        self._q_proj_bias = bool(getattr(config, 'q_proj_bias', False))
+        self._k_proj_bias = bool(getattr(config, 'k_proj_bias', False))
+        self._v_proj_bias = bool(getattr(config, 'v_proj_bias', False))
+        self._output_proj_bias = bool(getattr(config, 'output_proj_bias',
+                                              False))
         act_fn = getattr(torch.nn, config.act)
 
         self.flat_stoch = self._stoch * self._discrete
@@ -30,8 +42,16 @@ class TransformerRSSM(nn.Module):
 
         D = self._deter
         H = self._n_heads
+        H_kv = self._num_kv_heads
         assert D % H == 0, f"deter ({D}) must be divisible by n_heads ({H})"
-        self._d_head = D // H
+        assert H % H_kv == 0, (
+            f"n_heads ({H}) must be divisible by num_kv_heads ({H_kv})")
+        if self._q_norm != self._k_norm:
+            raise ValueError("q_norm and k_norm must be enabled together")
+        self._q_per_kv = H // H_kv
+        self._d_head = int(getattr(config, 'head_dim', D // H))
+        self._q_dim = H * self._d_head
+        self._kv_dim = H_kv * self._d_head
         assert self._d_head % 2 == 0, (
             f"d_head ({self._d_head}) must be even for RoPE")
 
@@ -56,24 +76,43 @@ class TransformerRSSM(nn.Module):
         self._k_projs = nn.ModuleList()
         self._v_projs = nn.ModuleList()
         self._o_projs = nn.ModuleList()
+        self._q_norms = nn.ModuleList()
+        self._k_norms = nn.ModuleList()
         self._ffn_norms = nn.ModuleList()
         self._ff1s = nn.ModuleList()
+        self._ff3s = nn.ModuleList()
         self._ff2s = nn.ModuleList()
 
         for _ in range(self._n_layers):
             self._attn_norms.append(
-                nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
-            self._q_projs.append(nn.Linear(D, D, bias=False))
-            self._k_projs.append(nn.Linear(D, D, bias=False))
-            self._v_projs.append(nn.Linear(D, D, bias=False))
-            self._o_projs.append(nn.Linear(D, D, bias=False))
-            self._ffn_norms.append(nn.RMSNorm(D, eps=1e-04,
-                                              dtype=torch.float32))
-            self._ff1s.append(nn.Linear(D, self._d_ff))
-            self._ff2s.append(nn.Linear(self._d_ff, D))
+                nn.RMSNorm(D, eps=self._norm_eps, dtype=torch.float32))
+            self._q_projs.append(
+                nn.Linear(D, self._q_dim, bias=self._q_proj_bias))
+            self._k_projs.append(
+                nn.Linear(D, self._kv_dim, bias=self._k_proj_bias))
+            self._v_projs.append(
+                nn.Linear(D, self._kv_dim, bias=self._v_proj_bias))
+            self._o_projs.append(
+                nn.Linear(self._q_dim, D, bias=self._output_proj_bias))
+            self._q_norms.append(
+                nn.
+                RMSNorm(self._d_head, eps=self._norm_eps, dtype=torch.float32
+                       ) if self._q_norm else nn.Identity())
+            self._k_norms.append(
+                nn.
+                RMSNorm(self._d_head, eps=self._norm_eps, dtype=torch.float32
+                       ) if self._k_norm else nn.Identity())
+            self._ffn_norms.append(
+                nn.RMSNorm(D, eps=self._norm_eps, dtype=torch.float32))
+            self._ff1s.append(nn.Linear(D, self._d_ff, bias=self._mlp_bias))
+            if self._gated_mlp:
+                self._ff3s.append(nn.Linear(D, self._d_ff, bias=self._mlp_bias))
+            else:
+                self._ff3s.append(nn.Identity())
+            self._ff2s.append(nn.Linear(self._d_ff, D, bias=self._mlp_bias))
 
         # Output norm
-        self._outnorm = nn.RMSNorm(D, eps=1e-04, dtype=torch.float32)
+        self._outnorm = nn.RMSNorm(D, eps=self._norm_eps, dtype=torch.float32)
 
         # Richer posterior/prior heads, analogous to RSSM obs/img heads.
         self._head_hidden = int(getattr(config, 'head_hidden', D))
@@ -87,7 +126,9 @@ class TransformerRSSM(nn.Module):
                 f"post_{i}", nn.Linear(inp_dim, self._head_hidden, bias=True))
             self._post_head.add_module(
                 f"post_n_{i}",
-                nn.RMSNorm(self._head_hidden, eps=1e-04, dtype=torch.float32))
+                nn.RMSNorm(self._head_hidden,
+                           eps=self._norm_eps,
+                           dtype=torch.float32))
             self._post_head.add_module(f"post_a_{i}", act_fn())
             inp_dim = self._head_hidden
         self._post_head.add_module(
@@ -106,7 +147,9 @@ class TransformerRSSM(nn.Module):
                 f"prior_{i}", nn.Linear(inp_dim, self._head_hidden, bias=True))
             self._prior_head.add_module(
                 f"prior_n_{i}",
-                nn.RMSNorm(self._head_hidden, eps=1e-04, dtype=torch.float32))
+                nn.RMSNorm(self._head_hidden,
+                           eps=self._norm_eps,
+                           dtype=torch.float32))
             self._prior_head.add_module(f"prior_a_{i}", act_fn())
             inp_dim = self._head_hidden
         self._prior_head.add_module(
@@ -168,17 +211,17 @@ class TransformerRSSM(nn.Module):
         prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
 
         entries = {'deter': h_prev, 'stoch': stoch}
-        B, L, T, D = kv['k'].shape
+        B, L, T, KV = kv['k'].shape
         dummy_k = torch.zeros(B,
                               L,
                               self._window_size,
-                              D,
+                              KV,
                               dtype=kv['k'].dtype,
                               device=kv['k'].device)
         dummy_v = torch.zeros(B,
                               L,
                               self._window_size,
-                              D,
+                              KV,
                               dtype=kv['v'].dtype,
                               device=kv['v'].device)
         feat = {
@@ -189,9 +232,9 @@ class TransformerRSSM(nn.Module):
             # Detached to avoid expanding the autograd graph.
             # Prepend W dummy zero-KV slots to match initial() cache style.
             'kv_k': torch.cat([dummy_k, kv['k']],
-                              dim=2).detach(),  # (B, L, T+W, D)
+                              dim=2).detach(),  # (B, L, T+W, KV)
             'kv_v': torch.cat([dummy_v, kv['v']],
-                              dim=2).detach(),  # (B, L, T+W, D)
+                              dim=2).detach(),  # (B, L, T+W, KV)
         }
         return entries, feat
 
@@ -207,6 +250,25 @@ class TransformerRSSM(nn.Module):
             x_t = self._rope(x_t, input_pos=positions.to(torch.long))
         return x_t.transpose(1, 2)
 
+    def _expand_kv(self, k, v):
+        """Expand grouped K/V heads to query-head count for attention."""
+        if self._num_kv_heads == self._n_heads:
+            return k, v
+        B, _, T, _ = k.shape
+        expand_shape = (B, self._num_kv_heads, self._q_per_kv, T, self._d_head)
+        k = k.unsqueeze(2).expand(expand_shape).reshape(B, self._n_heads, T,
+                                                        self._d_head)
+        v = v.unsqueeze(2).expand(expand_shape).reshape(B, self._n_heads, T,
+                                                        self._d_head)
+        return k, v
+
+    def _ffn(self, layer_idx, x):
+        if self._gated_mlp:
+            return self._ff2s[layer_idx](
+                self._act_fn(self._ff1s[layer_idx](x)) *
+                self._ff3s[layer_idx](x))
+        return self._ff2s[layer_idx](self._act_fn(self._ff1s[layer_idx](x)))
+
     def _fwd(self, x, return_kv=False):
         """Pre-norm causal Transformer with RoPE.
 
@@ -217,6 +279,7 @@ class TransformerRSSM(nn.Module):
         """
         B, T, D = x.shape
         H = self._n_heads
+        H_kv = self._num_kv_heads
         D_head = self._d_head
         W = self._window_size
         # Windowed causal mask: each query can attend to at most W recent keys
@@ -237,30 +300,38 @@ class TransformerRSSM(nn.Module):
             x = self._attn_norms[i](x)
             Q = self._q_projs[i](x).reshape(B, T, H, D_head).transpose(
                 1, 2)  # (B, H, T, D_head)
-            K = self._k_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            V = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
+            K = self._k_projs[i](x).reshape(B, T, H_kv, D_head).transpose(1, 2)
+            V = self._v_projs[i](x).reshape(B, T, H_kv, D_head).transpose(1, 2)
+            Q = self._q_norms[i](Q)
+            K = self._k_norms[i](K)
             Q = self._apply_rope(Q, positions=None)
             K = self._apply_rope(K, positions=None)
             if return_kv:
                 # Match cache storage layout used by update_carry.
-                k_layers.append(K.transpose(1, 2).reshape(B, T, D))
-                v_layers.append(V.transpose(1, 2).reshape(B, T, D))
+                k_layers.append(K.transpose(1, 2).reshape(B, T, self._kv_dim))
+                v_layers.append(V.transpose(1, 2).reshape(B, T, self._kv_dim))
+            K_attn, V_attn = self._expand_kv(K, V)
             x = F.scaled_dot_product_attention(
-                Q, K, V, attn_mask=attn_mask)  # (B, H, T, D_head)
-            x = x.transpose(1, 2).reshape(B, T, D)
+                Q,
+                K_attn,
+                V_attn,
+                attn_mask=attn_mask,
+                dropout_p=self._attn_dropout if self.training else 0.0,
+            )  # (B, H, T, D_head)
+            x = x.transpose(1, 2).reshape(B, T, self._q_dim)
             x = res + self._o_projs[i](x)
 
             # FFN sublayer (pre-norm)
             res = x
             x = self._ffn_norms[i](x)
-            x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
+            x = self._ffn(i, x)
             x = res + x
 
         out = self._outnorm(x)
         if return_kv:
             return out, {
-                'k': torch.stack(k_layers, dim=1),  # (B, L, T, D)
-                'v': torch.stack(v_layers, dim=1),  # (B, L, T, D)
+                'k': torch.stack(k_layers, dim=1),  # (B, L, T, KV)
+                'v': torch.stack(v_layers, dim=1),  # (B, L, T, KV)
             }
         return out
 
@@ -292,26 +363,26 @@ class TransformerRSSM(nn.Module):
         Args:
             stoch_seq: (B, T, S, Kcat)
             deter_seq: (B, T, D) h_prev sequence
-            kv_k: (B, L, T+W, D) cached keys with W prepended dummy slots
-            kv_v: (B, L, T+W, D) cached values with W prepended dummy slots
+            kv_k: (B, L, T+W, KV) cached keys with W prepended dummy slots
+            kv_v: (B, L, T+W, KV) cached values with W prepended dummy slots
             starts: (B, K) integer start indices, all valid per episode
         Returns:
             start_stoch: (B*K, S, Kcat)
             start_deter: (B*K, D)
-            carry: dict with kv_cache (B*K,L,2,W,D), pos (B*K), h_prev (B*K,D)
+            carry: dict with kv_cache (B*K,L,2,W,KV), pos (B*K), h_prev (B*K,D)
         """
         B, T = stoch_seq.shape[:2]
         L = kv_k.shape[1]
         W = self._window_size
         starts = starts.to(device=stoch_seq.device, dtype=torch.long)
         assert starts.ndim == 2 and starts.shape[0] == B
-        assert kv_k.shape == (B, L, T + W, self._deter)
-        assert kv_v.shape == (B, L, T + W, self._deter)
+        assert kv_k.shape == (B, L, T + W, self._kv_dim)
+        assert kv_v.shape == (B, L, T + W, self._kv_dim)
         assert torch.all(starts >= 0)
         assert torch.all(starts < T)
 
         K = starts.shape[1]
-        D = self._deter
+        KV = self._kv_dim
         batch_index = torch.arange(B, device=stoch_seq.device)[:, None]
         offsets = torch.arange(W, device=stoch_seq.device)
 
@@ -322,16 +393,16 @@ class TransformerRSSM(nn.Module):
         for k in range(K):
             s = starts[:, k]  # (B,)
             time_index = s[:, None] + offsets[None, :]  # (B, W)
-            gather_index = time_index[:, None, :, None].expand(B, L, W, D)
-            k_slice = kv_k.gather(2, gather_index)  # (B, L, W, D)
-            v_slice = kv_v.gather(2, gather_index)  # (B, L, W, D)
+            gather_index = time_index[:, None, :, None].expand(B, L, W, KV)
+            k_slice = kv_k.gather(2, gather_index)  # (B, L, W, KV)
+            v_slice = kv_v.gather(2, gather_index)  # (B, L, W, KV)
             cache_list.append(torch.stack([k_slice, v_slice], dim=2))
 
-        kv_cache = torch.stack(cache_list, dim=1)  # (B, K, L, 2, W, D)
+        kv_cache = torch.stack(cache_list, dim=1)  # (B, K, L, 2, W, KV)
         start_stoch = start_stoch.reshape(B * K, *stoch_seq.shape[2:])
         start_deter = start_deter.reshape(B * K, deter_seq.shape[-1])
         carry = {
-            'kv_cache': kv_cache.reshape(B * K, L, 2, W, D),
+            'kv_cache': kv_cache.reshape(B * K, L, 2, W, KV),
             'pos': starts.reshape(B * K).to(torch.int32),
             'h_prev': start_deter,
         }
@@ -364,6 +435,7 @@ class TransformerRSSM(nn.Module):
     def initial(self, batch_size):
         """Return initial carry dict for KV-cache inference."""
         D = self._deter
+        KV = self._kv_dim
         W = self._window_size
         return {
             'kv_cache':
@@ -371,7 +443,7 @@ class TransformerRSSM(nn.Module):
                             self._n_layers,
                             2,
                             W,
-                            D,
+                            KV,
                             dtype=torch.float32,
                             device=self._device),
             'pos':
@@ -427,8 +499,10 @@ class TransformerRSSM(nn.Module):
         B = stoch.shape[0]
         D = self._deter
         H = self._n_heads
+        H_kv = self._num_kv_heads
         D_head = self._d_head
         W = self._window_size
+        KV = self._kv_dim
 
         # Normalize action
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
@@ -438,7 +512,7 @@ class TransformerRSSM(nn.Module):
         x_t = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
         x_t = x_t.unsqueeze(1)  # (B, 1, D)
 
-        kv_cache = carry['kv_cache']  # (B, L, 2, W, D)
+        kv_cache = carry['kv_cache']  # (B, L, 2, W, KV)
         pos = carry['pos']  # (B,)
         ts = pos.unsqueeze(1)  # (B, 1)
 
@@ -458,41 +532,47 @@ class TransformerRSSM(nn.Module):
             # Project Q, K_new, V_new
             Q = self._q_projs[i](x_t).reshape(B, 1, H, D_head).transpose(
                 1, 2)  # (B, H, 1, D_head)
-            K_new = self._k_projs[i](x_t).reshape(B, 1, H,
+            K_new = self._k_projs[i](x_t).reshape(B, 1, H_kv,
                                                   D_head).transpose(1, 2)
-            V_new = self._v_projs[i](x_t).reshape(B, 1, H,
+            V_new = self._v_projs[i](x_t).reshape(B, 1, H_kv,
                                                   D_head).transpose(1, 2)
+            Q = self._q_norms[i](Q)
+            K_new = self._k_norms[i](K_new)
 
             # Apply RoPE at current position
             Q = self._apply_rope(Q, ts)
             K_new = self._apply_rope(K_new, ts)
 
-            # Flatten K_new, V_new to (B, 1, D) for cache storage
-            k_new_flat = K_new.transpose(1, 2).reshape(B, 1, D)
-            v_new_flat = V_new.transpose(1, 2).reshape(B, 1, D)
+            # Flatten K_new, V_new to (B, 1, KV) for cache storage
+            k_new_flat = K_new.transpose(1, 2).reshape(B, 1, KV)
+            v_new_flat = V_new.transpose(1, 2).reshape(B, 1, KV)
 
             # Shift cache left by 1, append new K/V
             k_cache = torch.cat([kv_cache[:, i, 0, 1:], k_new_flat],
-                                dim=1)  # (B, W, D)
+                                dim=1)  # (B, W, KV)
             v_cache = torch.cat([kv_cache[:, i, 1, 1:], v_new_flat], dim=1)
             new_kv_cache_layers.append((k_cache, v_cache))
 
-            # Reshape cached K/V for attention: (B, W, D) -> (B, H, W, D_head)
-            K_cached = k_cache.reshape(B, W, H, D_head).transpose(1, 2)
-            V_cached = v_cache.reshape(B, W, H, D_head).transpose(1, 2)
+            # Reshape cached K/V for attention:
+            # (B, W, KV) -> (B, H_kv, W, D_head)
+            K_cached = k_cache.reshape(B, W, H_kv, D_head).transpose(1, 2)
+            V_cached = v_cache.reshape(B, W, H_kv, D_head).transpose(1, 2)
+            K_cached, V_cached = self._expand_kv(K_cached, V_cached)
 
             # Cross-attend Q to cached K/V
-            x_t = F.scaled_dot_product_attention(Q,
-                                                 K_cached,
-                                                 V_cached,
-                                                 attn_mask=attn_mask)
-            x_t = x_t.transpose(1, 2).reshape(B, 1, D)
+            x_t = F.scaled_dot_product_attention(
+                Q,
+                K_cached,
+                V_cached,
+                attn_mask=attn_mask,
+                dropout_p=self._attn_dropout if self.training else 0.0)
+            x_t = x_t.transpose(1, 2).reshape(B, 1, self._q_dim)
             x_t = res + self._o_projs[i](x_t)
 
             # FFN sublayer
             res = x_t
             x_t = self._ffn_norms[i](x_t)
-            x_t = self._ff2s[i](self._act_fn(self._ff1s[i](x_t)))
+            x_t = self._ffn(i, x_t)
             x_t = res + x_t
 
         x_t = self._outnorm(x_t)
@@ -500,9 +580,9 @@ class TransformerRSSM(nn.Module):
 
         # Assemble updated KV cache
         ks = torch.stack([kv[0] for kv in new_kv_cache_layers],
-                         dim=1)  # (B, L, W, D)
+                         dim=1)  # (B, L, W, KV)
         vs = torch.stack([kv[1] for kv in new_kv_cache_layers], dim=1)
-        new_kv_cache = torch.stack([ks, vs], dim=2)  # (B, L, 2, W, D)
+        new_kv_cache = torch.stack([ks, vs], dim=2)  # (B, L, 2, W, KV)
 
         return {
             'kv_cache': new_kv_cache,

@@ -1,7 +1,7 @@
 defaults:
   - _base_
 
-deter: 512
+deter: 1024
 hidden: 1024
 discrete: 64
 depth: 64
