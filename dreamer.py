@@ -5,7 +5,6 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 from torch.amp import GradScaler, autocast
-from torch.nn import functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
 import networks
@@ -67,7 +66,6 @@ class Dreamer(nn.Module):
 
         # Actor-critic components
         deter_dim = int(config.transformer.deter)
-        act_fn = getattr(torch.nn, config.transformer.act)
         self.rl_feat_size = self.rssm.flat_stoch + deter_dim
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
@@ -77,12 +75,6 @@ class Dreamer(nn.Module):
             dropout=0.0,
             batch_first=True,
         )
-        self.memory_use_gate = nn.Sequential(
-            nn.Linear(2 * deter_dim, deter_dim, bias=True),
-            act_fn(),
-            nn.Linear(deter_dim, 1, bias=True),
-        )
-        nn.init.constant_(self.memory_use_gate[-1].bias, -2.0)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -100,7 +92,6 @@ class Dreamer(nn.Module):
             "actor": self.actor,
             "value": self.value,
             "memory_attention": self.memory_attention,
-            "memory_use_gate": self.memory_use_gate,
             "reward": self.reward,
             "cont": self.cont,
             "encoder": self.encoder,
@@ -195,7 +186,6 @@ class Dreamer(nn.Module):
                 "value",
                 "slow_value",
                 "memory_attention",
-                "memory_use_gate",
         ):
             setattr(
                 self, f"_frozen_{name}",
@@ -329,12 +319,9 @@ class Dreamer(nn.Module):
                               1,
                               dtype=query.dtype,
                               device=query.device)
-        closed_gate_logits = torch.full_like(zeros_1, -30.0)
         return {
             "raw_rtg": zeros_1,
             "weights": None,
-            "use_gate_logits": closed_gate_logits,
-            "use_gate": zeros_1,
         }
 
     def _read_memory(self, deter, frozen=False, require_fresh_memory=False):
@@ -354,20 +341,13 @@ class Dreamer(nn.Module):
             memory_tokens = memory_tokens.unsqueeze(0).expand(
                 query.shape[0], -1, -1)
             attention = self._frozen_memory_attention if frozen else self.memory_attention
-            attended, weights = attention(query,
-                                          memory_tokens,
-                                          memory_tokens,
-                                          need_weights=True)
-            gate_module = self._frozen_memory_use_gate if frozen else self.memory_use_gate
-            gate_logits = gate_module(torch.cat([query, attended], dim=-1))
-            use_gate = torch.sigmoid(gate_logits)
+            _, weights = attention(query,
+                                   memory_tokens,
+                                   memory_tokens,
+                                   need_weights=True)
             readout = {
                 "weights":
                     weights,
-                "use_gate_logits":
-                    gate_logits,
-                "use_gate":
-                    use_gate,
                 "raw_rtg":
                     torch.matmul(
                         weights,
@@ -375,7 +355,7 @@ class Dreamer(nn.Module):
                             device=query.device,
                             dtype=query.dtype).unsqueeze(0).expand(
                                 query.shape[0], -1, -1),
-                    ) * use_gate,
+                    ),
                 "progress":
                     torch.matmul(
                         weights,
@@ -620,7 +600,6 @@ class Dreamer(nn.Module):
         losses["con"] = self._masked_mean(con_loss, t_mask)
 
         memory_mask = data["is_memory"] & data["t_mask"]
-        non_memory_mask = (~data["is_memory"]) & data["t_mask"]
         memory_targets = self._memory_targets(data["memory_index"],
                                               dtype=torch.float32,
                                               device=post_deter.device,
@@ -631,36 +610,18 @@ class Dreamer(nn.Module):
                 frozen=False,
                 require_fresh_memory=False,
             )
-            use_gate = memory_readout["use_gate"]
             if bool(memory_mask.any().item()):
                 progress_loss = (memory_readout["progress"] -
                                  memory_targets["progress"]).pow(2)
                 losses["memory_progress"] = self._masked_mean(
                     progress_loss, memory_mask.unsqueeze(-1))
 
-                use_loss = F.binary_cross_entropy_with_logits(
-                    memory_readout["use_gate_logits"],
-                    torch.ones_like(memory_readout["use_gate_logits"]),
-                    reduction="none",
-                )
-                memory_use_loss = self._masked_mean(use_loss,
-                                                    memory_mask.unsqueeze(-1))
-                losses["memory_use"] = memory_use_loss
-
                 metrics["memory_progress_mae"] = self._masked_mean(
                     (memory_readout["progress"] -
                      memory_targets["progress"]).abs(),
                     memory_mask.unsqueeze(-1))
-                metrics["memory_use"] = self._masked_mean(
-                    use_gate, memory_mask.unsqueeze(-1))
                 metrics["memory_rtg"] = self._masked_mean(
                     memory_targets["raw_rtg"], memory_mask.unsqueeze(-1))
-
-            if bool(non_memory_mask.any().item()):
-                memory_sparse = self._masked_mean(use_gate,
-                                                  non_memory_mask.unsqueeze(-1))
-                losses["memory_sparse"] = memory_sparse
-                metrics["memory_sparse"] = memory_sparse
 
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())
@@ -746,7 +707,6 @@ class Dreamer(nn.Module):
         metrics["rew"] = torch.mean(imag_reward)
         if self.expert_shaping_scale > 0 and self.memory is not None:
             metrics["shaping"] = torch.mean(shaping)
-            metrics["imag_memory_use"] = torch.mean(imag_readout["use_gate"])
         metrics["val"] = torch.mean(imag_value)
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_value)

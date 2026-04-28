@@ -33,12 +33,6 @@ class _AttnDummy:
                                                       dropout=0.0,
                                                       batch_first=True)
         self._frozen_memory_attention = self.memory_attention
-        self.memory_use_gate = nn.Sequential(
-            nn.Linear(2 * deter_dim, deter_dim),
-            nn.SiLU(),
-            nn.Linear(deter_dim, 1),
-        )
-        self._frozen_memory_use_gate = self.memory_use_gate
 
     def refresh_memory_context(self):
         self.refresh_calls += 1
@@ -109,18 +103,6 @@ class _FixedAttention:
         return attended, weights
 
 
-class _FixedGate:
-
-    def __init__(self, logit):
-        self.logit = float(logit)
-
-    def __call__(self, gate_input):
-        return torch.full((*gate_input.shape[:-1], 1),
-                          self.logit,
-                          dtype=gate_input.dtype,
-                          device=gate_input.device)
-
-
 class _RefreshDummy:
     _memory_episode_tensordict = Dreamer._memory_episode_tensordict
     _compute_memory_return_to_go = Dreamer._compute_memory_return_to_go
@@ -177,7 +159,7 @@ class MemoryAttentionTest(unittest.TestCase):
         dummy._refresh_memory_context_if_stale()
         self.assertEqual(dummy.refresh_calls, 1)
 
-    def test_read_memory_returns_zero_valued_fields_when_gate_abstains(self):
+    def test_read_memory_returns_attention_weighted_fields(self):
         T, D, A = 2, 4, 2
         raw_rtg = torch.tensor([[3.0], [5.0]])
         ctx = {
@@ -192,22 +174,19 @@ class MemoryAttentionTest(unittest.TestCase):
         dummy.memory_attention = _FixedAttention(
             torch.tensor([[[0.25, 0.75]]], dtype=torch.float32))
         dummy._frozen_memory_attention = dummy.memory_attention
-        dummy.memory_use_gate = _FixedGate(-100.0)
-        dummy._frozen_memory_use_gate = dummy.memory_use_gate
 
         q = torch.randn(1, D)
         readout = dummy._read_memory(q)
 
-        torch.testing.assert_close(readout["raw_rtg"], torch.zeros(1, 1))
+        torch.testing.assert_close(readout["raw_rtg"],
+                                   torch.tensor([[4.5]]),
+                                   atol=1e-6,
+                                   rtol=0.0)
         torch.testing.assert_close(readout["progress"],
                                    torch.tensor([[0.625]]),
                                    atol=1e-6,
                                    rtol=0.0)
         self.assertEqual(readout["weights"].shape[-1], T)
-        torch.testing.assert_close(readout["use_gate"],
-                                   torch.zeros(1, 1),
-                                   atol=1e-6,
-                                   rtol=0.0)
 
 
 class RefreshMemoryContextTest(unittest.TestCase):

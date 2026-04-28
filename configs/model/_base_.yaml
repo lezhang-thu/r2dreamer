@@ -29,8 +29,6 @@ loss_scales:
   dyn: 1.0
   rep: 0.1
   memory_progress: 1.0
-  memory_use: 1.0
-  memory_sparse: 1.0
   # memory_value removed: the value head should track the current policy's
   # return, not expert RTG. Expert value enters via potential-based shaping.
   policy: 1.0
