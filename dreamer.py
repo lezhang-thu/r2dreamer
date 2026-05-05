@@ -230,8 +230,8 @@ class Dreamer(nn.Module):
     def update(self, replay_buffer, batch_size):
         """Sample a batch from replay and perform one optimization step.
 
-        ReplayY provides contiguous single-trajectory segments (zero-padded
-        only when the sampled episode is shorter than batch_length).
+        ReplayY provides contiguous single-trajectory segments with optional
+        prefix context and masks losses to the target portion.
 
         Args:
             replay_buffer: ReplayY instance.
@@ -349,8 +349,11 @@ class Dreamer(nn.Module):
 
     def _world_model_forward(self, data):
         """World-model losses and detached cache for imagination updates."""
-        # t_mask: (B, T) bool — True for real data, False for padding
+        # t_mask: (B, T) bool — True for target data that contributes to loss.
         t_mask = data["t_mask"].float()  # (B, T)
+        seq_mask = data["seq_mask"] if "seq_mask" in data.keys(
+        ) else data["t_mask"]
+        positions = data["position"] if "position" in data.keys() else None
         B, T = data.shape
 
         losses = {}
@@ -362,7 +365,11 @@ class Dreamer(nn.Module):
 
         # Transformer path: posterior from tokens, transition on (stoch, a_t)
         action = data["action"]  # (B, T, A) — current action a_t
-        _, feat_dict = self.rssm.observe(embed, action, data["is_first"])
+        _, feat_dict = self.rssm.observe(embed,
+                                         action,
+                                         data["is_first"],
+                                         positions=positions,
+                                         valid=seq_mask)
         post_stoch = feat_dict['stoch']  # (B, T, S, K)
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
@@ -394,12 +401,24 @@ class Dreamer(nn.Module):
             self.rssm.get_dist(post_logit).entropy())
 
         imag_source = {
-            "post_stoch": post_stoch.detach(),
-            "post_deter": post_deter.detach(),
-            "kv_k": feat_dict["kv_k"].detach(),
-            "kv_v": feat_dict["kv_v"].detach(),
-            "valid_lens": torch.clamp(t_mask.sum(dim=1).to(torch.int64), min=1),
-            "T": T,
+            "post_stoch":
+                post_stoch.detach(),
+            "post_deter":
+                post_deter.detach(),
+            "kv_k":
+                feat_dict["kv_k"].detach(),
+            "kv_v":
+                feat_dict["kv_v"].detach(),
+            "valid_lens":
+                torch.clamp(t_mask.sum(dim=1).to(torch.int64), min=1),
+            "target_start":
+                data["target_start"][:, 0].detach()
+                if "target_start" in data.keys() else torch.zeros(
+                    B, dtype=torch.int64, device=t_mask.device),
+            "positions":
+                None if positions is None else positions.detach(),
+            "T":
+                T,
         }
         return losses, metrics, imag_source
 
@@ -514,7 +533,7 @@ class Dreamer(nn.Module):
 
             starts = self._sample_transformer_imag_starts(
                 imag_source["valid_lens"],
-                imag_source["T"],
+                imag_source["target_start"],
             )
             ac_losses = {}
             ac_metrics = {}
@@ -528,6 +547,7 @@ class Dreamer(nn.Module):
                     imag_source["post_deter"],
                     imag_source["kv_k"],
                     imag_source["kv_v"],
+                    imag_source["positions"],
                     start_chunk,
                 )
                 chunk_losses, chunk_metrics = self._actor_critic_forward(
@@ -564,6 +584,7 @@ class Dreamer(nn.Module):
         post_deter,
         kv_k,
         kv_v,
+        positions,
         starts,
     ):
         """Prepare transformer imagination starts from trajectory KV tensors."""
@@ -572,28 +593,32 @@ class Dreamer(nn.Module):
 
         # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
-            post_stoch, post_deter, kv_k, kv_v, starts)
+            post_stoch, post_deter, kv_k, kv_v, starts, positions=positions)
         imag_mask = torch.ones((B * K, 1, 1), device=starts.device)
         return start_stoch, start_deter, imag_carry, imag_mask
 
     @torch.no_grad()
-    def _sample_transformer_imag_starts(self, valid_lens, T):
+    def _sample_transformer_imag_starts(self, valid_lens, target_start):
         """Sample all imagination start indices for one actor-critic update."""
-        K = min(self.imag_last if self.imag_last > 0 else T, T)
-        return self._sample_valid_imag_starts(valid_lens, K, valid_lens.device)
+        target_T = int(valid_lens.max().item())
+        K = min(self.imag_last if self.imag_last > 0 else target_T, target_T)
+        return self._sample_valid_imag_starts(valid_lens, target_start, K,
+                                              valid_lens.device)
 
     @torch.no_grad()
-    def _sample_valid_imag_starts(self, valid_lens, K, device):
+    def _sample_valid_imag_starts(self, valid_lens, target_start, K, device):
         """Sample K valid imagination starts independently per episode."""
         offsets = torch.arange(K, device=device)
         starts = []
-        for valid_len_t in valid_lens:
+        for valid_len_t, target_start_t in zip(valid_lens, target_start):
             valid_len = int(valid_len_t.item())
+            base = int(target_start_t.item())
             if valid_len >= K:
                 start0 = torch.randint(0, valid_len - K + 1, (), device=device)
-                starts.append(start0 + offsets)
+                starts.append(base + start0 + offsets)
             else:
-                starts.append(torch.randint(0, valid_len, (K,), device=device))
+                starts.append(base +
+                              torch.randint(0, valid_len, (K,), device=device))
         return torch.stack(starts, dim=0)
 
     @torch.no_grad()

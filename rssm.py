@@ -129,7 +129,13 @@ class TransformerRSSM(nn.Module):
     # Training path
     # ------------------------------------------------------------------
 
-    def observe(self, tokens, action, reset, sample=True):
+    def observe(self,
+                tokens,
+                action,
+                reset,
+                sample=True,
+                positions=None,
+                valid=None):
         """Windowed-causal full-sequence training path.
 
         Args:
@@ -139,6 +145,9 @@ class TransformerRSSM(nn.Module):
             sample: Whether to sample posterior stochastics. When False,
                 uses the posterior mode, which is useful for deterministic
                 cached reference trajectories.
+            positions: Optional absolute episode positions, shape (B, T).
+            valid: Optional bool mask for real non-padding timesteps, shape
+                (B, T). Invalid keys are hidden from attention.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
             feat: dict with deter, stoch, post_logit, prior_logit, and
@@ -160,7 +169,8 @@ class TransformerRSSM(nn.Module):
         x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
 
         # Causal Transformer forward
-        h, kv = self._fwd(x, return_kv=True)  # (B, T, D)
+        h, kv = self._fwd(x, return_kv=True, positions=positions,
+                          valid=valid)  # (B, T, D)
 
         # Shift right: h_prev[t] = h[t-1], h_prev[0] = 0
         h_prev = torch.cat([torch.zeros_like(h[:, :1]), h[:, :-1]], dim=1)
@@ -168,6 +178,8 @@ class TransformerRSSM(nn.Module):
         # Zero h_prev at episode resets
         reset_mask = reset.unsqueeze(-1).float()  # (B, T, 1)
         h_prev = h_prev * (1.0 - reset_mask)
+        if valid is not None:
+            h_prev = h_prev * valid.unsqueeze(-1).to(h_prev.dtype)
 
         # Prior: conditioned on h_prev only
         prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
@@ -209,14 +221,19 @@ class TransformerRSSM(nn.Module):
         else:
             if positions.dim() == 1:
                 positions = positions.unsqueeze(0).expand(x.shape[0], -1)
-            x_t = self._rope(x_t, input_pos=positions.to(torch.long))
+            x_t = self._rope(x_t,
+                             input_pos=positions.to(device=x_t.device,
+                                                    dtype=torch.long))
         return x_t.transpose(1, 2)
 
-    def _fwd(self, x, return_kv=False):
+    def _fwd(self, x, return_kv=False, positions=None, valid=None):
         """Pre-norm causal Transformer with RoPE.
 
         Args:
             x: (B, T, D) input sequence.
+            positions: Optional absolute episode positions, shape (B, T).
+            valid: Optional bool mask for real non-padding timesteps, shape
+                (B, T). Invalid keys are hidden from attention.
         Returns:
             (B, T, D) transformed sequence.
         """
@@ -232,6 +249,16 @@ class TransformerRSSM(nn.Module):
         else:
             local = causal
         attn_mask = local.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+        valid_f = None
+        if valid is not None:
+            valid = valid.to(dtype=torch.bool, device=x.device)
+            valid_f = valid.unsqueeze(-1).to(dtype=x.dtype)
+            x = x * valid_f
+            attn_mask = attn_mask & valid.unsqueeze(1).unsqueeze(2)
+            invalid_query = (~valid).unsqueeze(1).unsqueeze(-1)
+            diag = torch.eye(T, dtype=torch.bool,
+                             device=x.device).unsqueeze(0).unsqueeze(0)
+            attn_mask = attn_mask | (invalid_query & diag)
         if return_kv:
             k_layers = []
             v_layers = []
@@ -244,8 +271,8 @@ class TransformerRSSM(nn.Module):
                 1, 2)  # (B, H, T, D_head)
             K = self._k_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
             V = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            Q = self._apply_rope(Q, positions=None)
-            K = self._apply_rope(K, positions=None)
+            Q = self._apply_rope(Q, positions=positions)
+            K = self._apply_rope(K, positions=positions)
             if return_kv:
                 # Match cache storage layout used by update_carry.
                 k_layers.append(K.transpose(1, 2).reshape(B, T, D))
@@ -260,8 +287,12 @@ class TransformerRSSM(nn.Module):
             x = self._ffn_norms[i](x)
             x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
             x = res + x
+            if valid_f is not None:
+                x = x * valid_f
 
         out = self._outnorm(x)
+        if valid_f is not None:
+            out = out * valid_f
         if return_kv:
             return out, {
                 'k': torch.stack(k_layers, dim=1),  # (B, L, T, D)
@@ -272,13 +303,6 @@ class TransformerRSSM(nn.Module):
     # ------------------------------------------------------------------
     # Imagination (KV-cache transition)
     # ------------------------------------------------------------------
-
-    def img_step(self, stoch, deter, action):
-        """Fallback single-step prior using zeroed KV carry."""
-        carry = self.initial(stoch.shape[0])
-        carry['h_prev'] = deter
-        stoch, deter, _ = self.img_step_with_carry(stoch, carry, action)
-        return stoch, deter
 
     def img_step_with_carry(self, stoch, carry, action):
         """Single prior step with KV-cache carry."""
@@ -291,7 +315,13 @@ class TransformerRSSM(nn.Module):
         return stoch, deter, carry
 
     @torch.no_grad()
-    def build_imag_starts(self, stoch_seq, deter_seq, kv_k, kv_v, starts):
+    def build_imag_starts(self,
+                          stoch_seq,
+                          deter_seq,
+                          kv_k,
+                          kv_v,
+                          starts,
+                          positions=None):
         """Build imagination starts from trajectory KV tensors.
 
         Args:
@@ -300,6 +330,7 @@ class TransformerRSSM(nn.Module):
             kv_k: (B, L, T+W, D) cached keys with W prepended dummy slots
             kv_v: (B, L, T+W, D) cached values with W prepended dummy slots
             starts: (B, K) integer start indices, all valid per episode
+            positions: Optional (B, T) absolute episode positions for starts.
         Returns:
             start_stoch: (B*K, S, Kcat)
             start_deter: (B*K, D)
@@ -312,6 +343,8 @@ class TransformerRSSM(nn.Module):
         assert starts.ndim == 2 and starts.shape[0] == B
         assert kv_k.shape == (B, L, T + W, self._deter)
         assert kv_v.shape == (B, L, T + W, self._deter)
+        if positions is not None:
+            assert positions.shape == (B, T)
         assert torch.all(starts >= 0)
         assert torch.all(starts < T)
 
@@ -322,6 +355,11 @@ class TransformerRSSM(nn.Module):
 
         start_stoch = stoch_seq[batch_index, starts]  # (B, K, S, Kcat)
         start_deter = deter_seq[batch_index, starts]  # (B, K, D)
+        if positions is None:
+            start_pos = starts
+        else:
+            start_pos = positions.to(device=stoch_seq.device,
+                                     dtype=torch.long)[batch_index, starts]
 
         cache_list = []
         for k in range(K):
@@ -337,7 +375,7 @@ class TransformerRSSM(nn.Module):
         start_deter = start_deter.reshape(B * K, deter_seq.shape[-1])
         carry = {
             'kv_cache': kv_cache.reshape(B * K, L, 2, W, D),
-            'pos': starts.reshape(B * K).to(torch.int32),
+            'pos': start_pos.reshape(B * K).to(torch.int32),
             'h_prev': start_deter,
         }
         return start_stoch, start_deter, carry

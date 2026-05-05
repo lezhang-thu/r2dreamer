@@ -10,8 +10,15 @@ class ReplayY:
                  capacity=1000,
                  seed=0,
                  memory=None,
-                 memory_sample_frac=0.0):
-        self.length = length
+                 memory_sample_frac=0.0,
+                 prefix_length=0):
+        self.length = int(length)
+        self.prefix_length = int(prefix_length)
+        if self.length < 1:
+            raise ValueError(f"length must be >= 1, got {self.length}.")
+        if self.prefix_length < 0:
+            raise ValueError("prefix_length must be >= 0, got "
+                             f"{self.prefix_length}.")
         self.capacity = int(capacity)
         self.rng = np.random.default_rng(seed)
         self.memory_sample_frac = float(memory_sample_frac)
@@ -130,11 +137,13 @@ class ReplayY:
 
     def _sample_episode_segments(self, episodes, batch):
         if batch <= 0:
-            return [], []
+            return [], [], [], [], []
         if not episodes:
             raise RuntimeError("ReplayY.sample() requested segments from an "
                                "empty episode source.")
         L = self.length
+        P = self.prefix_length
+        total_len = P + L
         ep_lens = np.asarray([len(next(iter(ep.values()))) for ep in episodes],
                              dtype=np.int64)
         segment_counts = np.maximum(ep_lens - L + 1, 1)
@@ -143,28 +152,49 @@ class ReplayY:
         sampled_segments = self.rng.integers(0, total_segments, size=batch)
 
         seqs = []
-        valid_lens = []
+        seq_masks = []
+        target_masks = []
+        target_starts = []
+        positions = []
         for seg_id in sampled_segments:
             ep_index = int(
                 np.searchsorted(segment_offsets, seg_id, side="right"))
             prev_offset = 0 if ep_index == 0 else int(segment_offsets[ep_index -
                                                                       1])
-            start = int(seg_id - prev_offset)
+            target_start = int(seg_id - prev_offset)
             ep = episodes[ep_index]
             ep_len = int(ep_lens[ep_index])
-            stop = min(start + L, ep_len)
-            valid_len = stop - start
+            seq_start = target_start - P
+            seq_stop = target_start + L
+            src_start = max(seq_start, 0)
+            src_stop = min(seq_stop, ep_len)
+            dst_start = src_start - seq_start
+            real_len = max(src_stop - src_start, 0)
+            target_valid_len = max(
+                min(target_start + L, ep_len) - target_start, 0)
 
             item = {}
             for k, v in ep.items():
-                arr = v[start:stop]
-                if valid_len < L:
-                    pad = np.zeros((L - valid_len, *v.shape[1:]), dtype=v.dtype)
-                    arr = np.concatenate([arr, pad], axis=0)
+                arr = np.zeros((total_len, *v.shape[1:]), dtype=v.dtype)
+                if real_len > 0:
+                    arr[dst_start:dst_start + real_len] = v[src_start:src_stop]
                 item[k] = arr
             seqs.append(item)
-            valid_lens.append(valid_len)
-        return seqs, valid_lens
+            seq_mask = np.zeros((total_len,), dtype=bool)
+            if real_len > 0:
+                seq_mask[dst_start:dst_start + real_len] = True
+            target_mask = np.zeros((total_len,), dtype=bool)
+            if target_valid_len > 0:
+                target_mask[P:P + target_valid_len] = True
+            position = np.zeros((total_len,), dtype=np.int64)
+            if real_len > 0:
+                position[dst_start:dst_start + real_len] = np.arange(
+                    src_start, src_stop, dtype=np.int64)
+            seq_masks.append(seq_mask)
+            target_masks.append(target_mask)
+            target_starts.append(np.full((total_len,), P, dtype=np.int64))
+            positions.append(position)
+        return seqs, seq_masks, target_masks, target_starts, positions
 
     def sample(self, batch):
         L = self.length
@@ -191,17 +221,26 @@ class ReplayY:
             replay_batch = int(batch)
 
         seqs = []
-        valid_lens = []
+        seq_masks = []
+        target_masks = []
+        target_starts = []
+        positions = []
         if replay_batch > 0:
-            replay_seqs, replay_valid_lens = self._sample_episode_segments(
+            replay_seqs, replay_seq_masks, replay_target_masks, replay_target_starts, replay_positions = self._sample_episode_segments(
                 valid, replay_batch)
             seqs.extend(replay_seqs)
-            valid_lens.extend(replay_valid_lens)
+            seq_masks.extend(replay_seq_masks)
+            target_masks.extend(replay_target_masks)
+            target_starts.extend(replay_target_starts)
+            positions.extend(replay_positions)
         if memory_batch > 0:
-            memory_seqs, memory_valid_lens = self._sample_episode_segments(
+            memory_seqs, memory_seq_masks, memory_target_masks, memory_target_starts, memory_positions = self._sample_episode_segments(
                 [self.memory], memory_batch)
             seqs.extend(memory_seqs)
-            valid_lens.extend(memory_valid_lens)
+            seq_masks.extend(memory_seq_masks)
+            target_masks.extend(memory_target_masks)
+            target_starts.extend(memory_target_starts)
+            positions.extend(memory_positions)
 
         if len(seqs) != int(batch):
             raise RuntimeError("ReplayY.sample() produced an unexpected number "
@@ -209,16 +248,17 @@ class ReplayY:
         if len(seqs) > 1:
             order = self.rng.permutation(len(seqs))
             seqs = [seqs[i] for i in order]
-            valid_lens = [valid_lens[i] for i in order]
+            seq_masks = [seq_masks[i] for i in order]
+            target_masks = [target_masks[i] for i in order]
+            target_starts = [target_starts[i] for i in order]
+            positions = [positions[i] for i in order]
 
         data = {k: np.stack([s[k] for s in seqs]) for k in seqs[0]}
 
-        # t_mask[i, t] = True iff step t is real (not padding).
-        t_mask = np.zeros((batch, L), dtype=bool)
-        for i, valid_len in enumerate(valid_lens):
-            t_mask[i, :valid_len] = True
-        data["t_mask"] = t_mask
-
-        if "is_first" in data:
-            data["is_first"][:, 0] = True
+        # seq_mask marks real timesteps, including prefix context. t_mask marks
+        # the target portion that contributes to losses and imagination starts.
+        data["seq_mask"] = np.stack(seq_masks)
+        data["t_mask"] = np.stack(target_masks)
+        data["target_start"] = np.stack(target_starts)
+        data["position"] = np.stack(positions)
         return data
