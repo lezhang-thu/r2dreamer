@@ -38,6 +38,48 @@ class ReplayY:
             self.memory is not None)
 
     @staticmethod
+    def _copy_episode(episode):
+        if episode is None:
+            return None
+        return {k: np.array(v, copy=True) for k, v in episode.items()}
+
+    def state_dict(self):
+        """Return a serializable ReplayY state without expert memory data."""
+        with self.lock:
+            eps = [self._copy_episode(ep) for ep in self.eps]
+        return {"eps": eps}
+
+    def load_state_dict(self, state_dict):
+        """Load completed replay episodes, leaving self.memory untouched."""
+        if isinstance(state_dict, dict):
+            if "eps" not in state_dict:
+                raise KeyError("ReplayY state_dict must contain an 'eps' key.")
+            eps = state_dict["eps"]
+        else:
+            # Accept raw eps lists for simple/manual checkpoints.
+            eps = state_dict
+
+        if not isinstance(eps, (list, tuple)):
+            raise TypeError("ReplayY eps checkpoint must be a list or tuple.")
+        if len(eps) > self.capacity:
+            raise ValueError(
+                "ReplayY eps checkpoint is larger than this buffer capacity: "
+                f"{len(eps)} > {self.capacity}.")
+
+        loaded_eps = []
+        for ep in eps:
+            loaded_eps.append(None if ep is
+                              None else self._sanitize_episode(ep))
+        loaded_eps.extend([None] * (self.capacity - len(loaded_eps)))
+
+        with self.lock:
+            self.eps = loaded_eps
+            self.num_eps = sum(ep is not None for ep in self.eps)
+            self.write_pos = next(
+                (i for i, ep in enumerate(self.eps) if ep is None), 0)
+            self.local = {}
+
+    @staticmethod
     def _sanitize_episode(episode):
         if episode is None:
             return None

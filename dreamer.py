@@ -60,7 +60,7 @@ class Dreamer(nn.Module):
             config.actor.dist = config.actor.dist.cont
 
         # Actor-critic components
-        self.rl_feat_size = self.rssm.flat_stoch + int(config.transformer.deter)
+        self.rl_feat_size = self.rssm.feat_size
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
         self.value = networks.MLPHead(config.critic, self.rl_feat_size)
         self.slow_target_update = int(config.slow_target_update)

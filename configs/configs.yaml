@@ -6,7 +6,10 @@ defaults:
   - _self_
 
 logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
+#agent_load_path: /home/ubuntu/lezhang.thu/claude/r2dreamer/agent_interrupted_state_dict.pt  # Optional .pt containing only Dreamer.state_dict().
+#replay_load_path: /home/ubuntu/lezhang.thu/claude/r2dreamer/replay_y_interrupted_state_dict.pt  # Optional .pt containing ReplayY.state_dict() eps only.
 agent_load_path: null  # Optional .pt containing only Dreamer.state_dict().
+replay_load_path: null  # Optional .pt containing ReplayY.state_dict() eps only.
 seed: 0
 deterministic_run: False
 device: 'cuda:0'
@@ -22,6 +25,7 @@ buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   max_size: 5e5
+  #memory_sample_frac: 0.0625
   memory_sample_frac: 0.5
   device: ${device}
   storage_device: 'cuda:0'

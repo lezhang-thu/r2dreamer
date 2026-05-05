@@ -15,6 +15,7 @@ class TransformerRSSM(nn.Module):
         super().__init__()
         self._stoch = int(config.stoch)
         self._deter = int(config.deter)
+        self._feat_deter = int(getattr(config, "feat_deter", self._deter))
         self._discrete = int(config.discrete)
         self._unimix_ratio = float(config.unimix_ratio)
         self._device = torch.device(config.device)
@@ -26,7 +27,7 @@ class TransformerRSSM(nn.Module):
         act_fn = getattr(torch.nn, config.act)
 
         self.flat_stoch = self._stoch * self._discrete
-        self.feat_size = self.flat_stoch + self._deter
+        self.feat_size = self.flat_stoch + self._feat_deter
 
         D = self._deter
         H = self._n_heads
@@ -74,6 +75,10 @@ class TransformerRSSM(nn.Module):
 
         # Output norm
         self._outnorm = nn.RMSNorm(D, eps=1e-04, dtype=torch.float32)
+        if self._feat_deter == D:
+            self._feat_proj = nn.Identity()
+        else:
+            self._feat_proj = nn.Linear(D, self._feat_deter, bias=True)
 
         # Richer posterior/prior heads, analogous to RSSM obs/img heads.
         self._head_hidden = int(getattr(config, 'head_hidden', D))
@@ -523,6 +528,7 @@ class TransformerRSSM(nn.Module):
     def get_feat(self, stoch, deter):
         """Flatten stoch and concatenate with deter."""
         stoch = stoch.reshape(*stoch.shape[:-2], self._stoch * self._discrete)
+        deter = self._feat_proj(deter)
         return torch.cat([stoch, deter], -1)
 
     def get_dist(self, logit):

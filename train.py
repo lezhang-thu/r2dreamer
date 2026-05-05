@@ -38,6 +38,20 @@ def load_agent_state_dict(agent, path):
     print(f"Loaded Dreamer agent state_dict from {path}.")
 
 
+def save_replay_state_dict(replay_buffer, path):
+    torch.save(replay_buffer.state_dict(), path)
+    print(f"Saved ReplayY eps state_dict to {path}.")
+
+
+def load_replay_state_dict(replay_buffer, path):
+    try:
+        state_dict = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state_dict = torch.load(path, map_location="cpu")
+    replay_buffer.load_state_dict(state_dict)
+    print(f"Loaded ReplayY eps state_dict from {path}.")
+
+
 def resolve_config_path(path_value):
     path = pathlib.Path(str(path_value)).expanduser()
     if path.is_absolute():
@@ -75,7 +89,7 @@ def main(config):
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
-    memory_path = pathlib.Path(__file__).with_name("ge.json")
+    memory_path = pathlib.Path(__file__).with_name("ge-14600.json")
     memory = None
     if memory_path.exists():
         print(f"Load memory from {memory_path}.")
@@ -101,6 +115,14 @@ def main(config):
         memory=memory,
         memory_sample_frac=float(config.buffer.memory_sample_frac),
     )
+    replay_load_path = config.get("replay_load_path", None)
+    if replay_load_path is not None:
+        replay_load_path = resolve_config_path(replay_load_path)
+        if not replay_load_path.exists():
+            raise FileNotFoundError(
+                f"Configured replay_load_path does not exist: {replay_load_path}"
+            )
+        load_replay_state_dict(replay_buffer, replay_load_path)
 
     print("Simulate agent.")
     agent = Dreamer(
@@ -118,11 +140,13 @@ def main(config):
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
                                    logdir, train_envs, eval_envs)
     interrupted_agent_path = logdir / "agent_interrupted_state_dict.pt"
+    interrupted_replay_path = logdir / "replay_y_interrupted_state_dict.pt"
     try:
         policy_trainer.begin(agent)
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received during training.")
         save_agent_state_dict(agent, interrupted_agent_path)
+        #save_replay_state_dict(replay_buffer, interrupted_replay_path)
         raise
 
 
