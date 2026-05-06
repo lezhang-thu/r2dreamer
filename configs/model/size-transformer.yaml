@@ -2,7 +2,8 @@ defaults:
   - _base_
 
 deter: 512
-feat_deter: 8192
+#feat_deter: 8192
+feat_deter: 512
 hidden: 1024
 discrete: 64
 depth: 64
