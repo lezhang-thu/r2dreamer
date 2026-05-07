@@ -364,8 +364,12 @@ class TransformerRSSM(nn.Module):
         cache_list = []
         for k in range(K):
             s = starts[:, k]  # (B,)
-            time_index = s[:, None] + offsets[None, :]  # (B, W)
-            gather_index = time_index[:, None, :, None].expand(B, L, W, D)
+            # Gather the W keys/values immediately before start s. kv_k/kv_v
+            # are stored with W dummy slots prepended, so adding W to
+            # [s-W, ..., s-1] simplifies to [s, ..., s+W-1].
+            left_time = s[:, None] - W + offsets[None, :]  # (B, W)
+            gather_time = left_time + W
+            gather_index = gather_time[:, None, :, None].expand(B, L, W, D)
             k_slice = kv_k.gather(2, gather_index)  # (B, L, W, D)
             v_slice = kv_v.gather(2, gather_index)  # (B, L, W, D)
             cache_list.append(torch.stack([k_slice, v_slice], dim=2))
