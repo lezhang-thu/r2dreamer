@@ -114,7 +114,6 @@ def main(config):
         seed=config.seed,
         memory=memory,
         memory_sample_frac=float(config.buffer.memory_sample_frac),
-        prefix_length=int(config.model.transformer.window_size),
     )
     replay_load_path = config.get("replay_load_path", None)
     if replay_load_path is not None:

@@ -10,15 +10,10 @@ class ReplayY:
                  capacity=1000,
                  seed=0,
                  memory=None,
-                 memory_sample_frac=0.0,
-                 prefix_length=0):
+                 memory_sample_frac=0.0):
         self.length = int(length)
-        self.prefix_length = int(prefix_length)
         if self.length < 1:
             raise ValueError(f"length must be >= 1, got {self.length}.")
-        if self.prefix_length < 0:
-            raise ValueError("prefix_length must be >= 0, got "
-                             f"{self.prefix_length}.")
         self.capacity = int(capacity)
         self.rng = np.random.default_rng(seed)
         self.memory_sample_frac = float(memory_sample_frac)
@@ -39,8 +34,6 @@ class ReplayY:
         self.lock = threading.Lock()
 
     def __len__(self):
-        # Count any stored episode (zero-padding handles episodes shorter than
-        # self.length, so every non-None slot is valid).
         return sum(1 for ep in self.eps if ep is not None) + int(
             self.memory is not None)
 
@@ -104,8 +97,7 @@ class ReplayY:
         return episode
 
     def _episode_segment_count(self, ep):
-        ep_len = int(len(next(iter(ep.values()))))
-        return max(ep_len - self.length + 1, 1)
+        return 1
 
     def num_segments(self):
         with self.lock:
@@ -114,6 +106,21 @@ class ReplayY:
         if self.memory is not None:
             total += self._episode_segment_count(self.memory)
         return int(total)
+
+    def can_sample(self, batch):
+        """Return whether sample(batch) can produce dense replay rows."""
+        batch = int(batch)
+        if batch <= 0:
+            return False
+        with self.lock:
+            has_replay = any(ep is not None for ep in self.eps)
+        has_memory = self.memory is not None
+        if not has_replay and not has_memory:
+            return False
+        # Expert memory is included exactly once. Any remaining rows must come
+        # from non-memory replay episodes so memory is not duplicated.
+        non_memory_rows = batch - int(has_memory)
+        return non_memory_rows <= 0 or has_replay
 
     def add(self, step, worker=0):
         step = {k: v for k, v in step.items() if not k.startswith('log_')}
@@ -135,111 +142,82 @@ class ReplayY:
             self.write_pos = (self.write_pos + 1) % self.capacity
             self.num_eps = min(self.num_eps + 1, self.capacity)
 
-    def _sample_episode_segments(self, episodes, batch):
-        if batch <= 0:
-            return [], [], [], [], []
+    def _sample_episode(self, episodes):
         if not episodes:
-            raise RuntimeError("ReplayY.sample() requested segments from an "
-                               "empty episode source.")
+            raise RuntimeError("ReplayY.sample() requested an episode from an "
+                               "empty source.")
+        return episodes[int(self.rng.integers(0, len(episodes)))]
+
+    def _build_sequence(self, first_episode, append_episodes):
+        """Concatenate full episodes and a final episode prefix to length L."""
         L = self.length
-        P = self.prefix_length
-        total_len = P + L
-        ep_lens = np.asarray([len(next(iter(ep.values()))) for ep in episodes],
-                             dtype=np.int64)
-        segment_counts = np.maximum(ep_lens - L + 1, 1)
-        segment_offsets = np.cumsum(segment_counts)
-        total_segments = int(segment_offsets[-1])
-        sampled_segments = self.rng.integers(0, total_segments, size=batch)
-
-        seqs = []
-        seq_masks = []
-        target_masks = []
-        target_starts = []
+        if not append_episodes:
+            append_episodes = [first_episode]
+        pieces = []
         positions = []
-        for seg_id in sampled_segments:
-            ep_index = int(
-                np.searchsorted(segment_offsets, seg_id, side="right"))
-            prev_offset = 0 if ep_index == 0 else int(segment_offsets[ep_index -
-                                                                      1])
-            target_start = int(seg_id - prev_offset)
-            ep = episodes[ep_index]
-            ep_len = int(ep_lens[ep_index])
-            seq_start = target_start - P
-            seq_stop = target_start + L
-            src_start = max(seq_start, 0)
-            src_stop = min(seq_stop, ep_len)
-            dst_start = src_start - seq_start
-            real_len = max(src_stop - src_start, 0)
-            target_valid_len = max(
-                min(target_start + L, ep_len) - target_start, 0)
+        pos = 0
+        ep = first_episode
+        while pos < L:
+            ep_len = int(len(next(iter(ep.values()))))
+            if ep_len <= 0:
+                raise RuntimeError("ReplayY encountered an empty episode.")
+            take = min(ep_len, L - pos)
+            piece = {k: np.array(v[:take], copy=True) for k, v in ep.items()}
+            if "is_first" in piece:
+                piece["is_first"][0] = True
+            pieces.append(piece)
+            positions.append(np.arange(take, dtype=np.int64))
+            pos += take
+            if pos < L:
+                ep = self._sample_episode(append_episodes)
 
-            item = {}
-            for k, v in ep.items():
-                arr = np.zeros((total_len, *v.shape[1:]), dtype=v.dtype)
-                if real_len > 0:
-                    arr[dst_start:dst_start + real_len] = v[src_start:src_stop]
-                item[k] = arr
-            seqs.append(item)
-            seq_mask = np.zeros((total_len,), dtype=bool)
-            if real_len > 0:
-                seq_mask[dst_start:dst_start + real_len] = True
-            target_mask = np.zeros((total_len,), dtype=bool)
-            if target_valid_len > 0:
-                target_mask[P:P + target_valid_len] = True
-            position = np.zeros((total_len,), dtype=np.int64)
-            if real_len > 0:
-                position[dst_start:dst_start + real_len] = np.arange(
-                    src_start, src_stop, dtype=np.int64)
-            seq_masks.append(seq_mask)
-            target_masks.append(target_mask)
-            target_starts.append(np.full((total_len,), P, dtype=np.int64))
+        item = {}
+        for key in pieces[0]:
+            item[key] = np.concatenate([piece[key] for piece in pieces],
+                                       axis=0)
+        position = np.concatenate(positions, axis=0)
+        return item, position
+
+    def _sample_episode_sequences(self, first_episodes, append_episodes):
+        seqs = []
+        positions = []
+        for ep in first_episodes:
+            seq, position = self._build_sequence(ep, append_episodes)
+            seqs.append(seq)
             positions.append(position)
-        return seqs, seq_masks, target_masks, target_starts, positions
+        return seqs, positions
 
     def sample(self, batch):
-        L = self.length
         with self.lock:
             valid = [ep for ep in self.eps if ep is not None]
         if not valid and self.memory is None:
             raise RuntimeError(
                 "ReplayY.sample() called with no complete episodes.")
 
-        memory_batch = 0
-        if self.memory is not None:
-            if valid:
-                memory_batch = int(
-                    np.floor(batch * self.memory_sample_frac + 0.5))
-                memory_batch = int(np.clip(memory_batch, 0, batch))
-            else:
-                memory_batch = int(batch)
-        replay_batch = int(batch) - memory_batch
+        batch = int(batch)
+        memory_batch = int(self.memory is not None and batch > 0)
+        replay_batch = batch - memory_batch
         if replay_batch > 0 and not valid:
-            replay_batch = 0
-            memory_batch = int(batch)
-        if memory_batch > 0 and self.memory is None:
-            memory_batch = 0
-            replay_batch = int(batch)
+            raise RuntimeError(
+                "ReplayY.sample() needs replay episodes to fill the non-memory "
+                "batch rows while keeping expert memory exactly once.")
+        append_episodes = valid if valid else (
+            [self.memory] if self.memory is not None else [])
 
         seqs = []
-        seq_masks = []
-        target_masks = []
-        target_starts = []
         positions = []
         if replay_batch > 0:
-            replay_seqs, replay_seq_masks, replay_target_masks, replay_target_starts, replay_positions = self._sample_episode_segments(
-                valid, replay_batch)
+            replay_first = [
+                self._sample_episode(valid) for _ in range(replay_batch)
+            ]
+            replay_seqs, replay_positions = self._sample_episode_sequences(
+                replay_first, append_episodes)
             seqs.extend(replay_seqs)
-            seq_masks.extend(replay_seq_masks)
-            target_masks.extend(replay_target_masks)
-            target_starts.extend(replay_target_starts)
             positions.extend(replay_positions)
         if memory_batch > 0:
-            memory_seqs, memory_seq_masks, memory_target_masks, memory_target_starts, memory_positions = self._sample_episode_segments(
-                [self.memory], memory_batch)
+            memory_seqs, memory_positions = self._sample_episode_sequences(
+                [self.memory], append_episodes)
             seqs.extend(memory_seqs)
-            seq_masks.extend(memory_seq_masks)
-            target_masks.extend(memory_target_masks)
-            target_starts.extend(memory_target_starts)
             positions.extend(memory_positions)
 
         if len(seqs) != int(batch):
@@ -248,17 +226,8 @@ class ReplayY:
         if len(seqs) > 1:
             order = self.rng.permutation(len(seqs))
             seqs = [seqs[i] for i in order]
-            seq_masks = [seq_masks[i] for i in order]
-            target_masks = [target_masks[i] for i in order]
-            target_starts = [target_starts[i] for i in order]
             positions = [positions[i] for i in order]
 
         data = {k: np.stack([s[k] for s in seqs]) for k in seqs[0]}
-
-        # seq_mask marks real timesteps, including prefix context. t_mask marks
-        # the target portion that contributes to losses and imagination starts.
-        data["seq_mask"] = np.stack(seq_masks)
-        data["t_mask"] = np.stack(target_masks)
-        data["target_start"] = np.stack(target_starts)
         data["position"] = np.stack(positions)
         return data

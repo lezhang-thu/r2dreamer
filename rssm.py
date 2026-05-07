@@ -170,7 +170,7 @@ class TransformerRSSM(nn.Module):
 
         # Causal Transformer forward
         h, kv = self._fwd(x, return_kv=True, positions=positions,
-                          valid=valid)  # (B, T, D)
+                          valid=valid, reset=reset)  # (B, T, D)
 
         # Shift right: h_prev[t] = h[t-1], h_prev[0] = 0
         h_prev = torch.cat([torch.zeros_like(h[:, :1]), h[:, :-1]], dim=1)
@@ -226,7 +226,7 @@ class TransformerRSSM(nn.Module):
                                                     dtype=torch.long))
         return x_t.transpose(1, 2)
 
-    def _fwd(self, x, return_kv=False, positions=None, valid=None):
+    def _fwd(self, x, return_kv=False, positions=None, valid=None, reset=None):
         """Pre-norm causal Transformer with RoPE.
 
         Args:
@@ -234,6 +234,7 @@ class TransformerRSSM(nn.Module):
             positions: Optional absolute episode positions, shape (B, T).
             valid: Optional bool mask for real non-padding timesteps, shape
                 (B, T). Invalid keys are hidden from attention.
+            reset: Optional bool mask for episode starts, shape (B, T).
         Returns:
             (B, T, D) transformed sequence.
         """
@@ -241,14 +242,23 @@ class TransformerRSSM(nn.Module):
         H = self._n_heads
         D_head = self._d_head
         W = self._window_size
-        # Windowed causal mask: each query can attend to at most W recent keys
-        # (including itself), matching inference/imagination transition scope.
-        causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
-        if W < T:
-            local = torch.triu(causal, diagonal=-(W - 1))
+        # Windowed causal mask by episode position, not just sequence index.
+        # This lets a training row contain multiple complete episodes while
+        # preventing attention across episode boundaries.
+        if positions is None:
+            pos = torch.arange(T, device=x.device,
+                               dtype=torch.long).unsqueeze(0).expand(B, -1)
         else:
-            local = causal
-        attn_mask = local.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+            pos = positions.to(device=x.device, dtype=torch.long)
+        if reset is None:
+            episode = torch.zeros(B, T, dtype=torch.long, device=x.device)
+        else:
+            episode = reset.to(device=x.device, dtype=torch.long).cumsum(dim=1)
+        q_pos = pos.unsqueeze(2)
+        k_pos = pos.unsqueeze(1)
+        same_episode = episode.unsqueeze(2) == episode.unsqueeze(1)
+        attn_mask = same_episode & (k_pos <= q_pos) & ((q_pos - k_pos) < W)
+        attn_mask = attn_mask.unsqueeze(1)  # (B, 1, T, T)
         valid_f = None
         if valid is not None:
             valid = valid.to(dtype=torch.bool, device=x.device)

@@ -189,7 +189,7 @@ class OnlineTrainer:
             #if step // (envs.env_num *
             #            self._action_repeat) > self.batch_length:
             #if self.replay_buffer.num_segments() > 0:
-            if self.replay_buffer.num_segments() > self.batch_size:
+            if self.replay_buffer.can_sample(self.batch_size):
                 if self._should_pretrain():
                     update_num = self.pretrain
                 else:

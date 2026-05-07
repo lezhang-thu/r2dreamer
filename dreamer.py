@@ -34,6 +34,8 @@ class Dreamer(nn.Module):
         self.imag_last = int(getattr(config, 'imag_last', 0))
         self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
         self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))
+        self.ac_updates_per_wm = max(
+            1, int(getattr(config, "ac_updates_per_wm", 1)))
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -101,8 +103,21 @@ class Dreamer(nn.Module):
             else:
                 for param_name, param in module.named_parameters():
                     self._named_params[f"{name}.{param_name}"] = param
+        self._wm_named_params = OrderedDict(
+            (name, param) for name, param in self._named_params.items()
+            if name.split(".", 1)[0]
+            in ("rssm", "reward", "cont", "encoder", "projector"))
+        self._ac_named_params = OrderedDict(
+            (name, param) for name, param in self._named_params.items()
+            if name.split(".", 1)[0] in ("actor", "value"))
         print(
             f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters."
+        )
+        print(
+            f"World model optimizer has: {sum(p.numel() for p in self._wm_named_params.values())} parameters."
+        )
+        print(
+            f"Actor-critic optimizer has: {sum(p.numel() for p in self._ac_named_params.values())} parameters."
         )
 
         def _agc(params):
@@ -112,26 +127,39 @@ class Dreamer(nn.Module):
                            foreach=True)
 
         self._agc = _agc
-        self._optimizer = LaProp(
-            self._named_params.values(),
+        self._wm_optimizer = LaProp(
+            self._wm_named_params.values(),
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             eps=config.eps,
         )
-        self._scaler = GradScaler()
+        self._ac_optimizer = LaProp(
+            self._ac_named_params.values(),
+            lr=config.lr,
+            betas=(config.beta1, config.beta2),
+            eps=config.eps,
+        )
+        self._wm_scaler = GradScaler()
+        self._ac_scaler = GradScaler()
 
         def lr_lambda(step):
             if config.warmup:
                 return min(1.0, (step + 1) / config.warmup)
             return 1.0
 
-        self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
+        self._wm_scheduler = LambdaLR(self._wm_optimizer,
+                                      lr_lambda=lr_lambda)
+        self._ac_scheduler = LambdaLR(self._ac_optimizer,
+                                      lr_lambda=lr_lambda)
 
         self.train()
         self.clone_and_freeze()
         if config.compile:
-            print("Compiling update function with torch.compile...")
-            self._cal_grad = torch.compile(self._cal_grad, mode="default")
+            print("Compiling forward loss functions with torch.compile...")
+            self._world_model_forward = torch.compile(
+                self._world_model_forward, mode="default")
+            self._actor_critic_forward = torch.compile(
+                self._actor_critic_forward, mode="default")
 
     def _update_slow_target(self):
         """Update slow-moving value target network."""
@@ -230,8 +258,8 @@ class Dreamer(nn.Module):
     def update(self, replay_buffer, batch_size):
         """Sample a batch from replay and perform one optimization step.
 
-        ReplayY provides contiguous single-trajectory segments with optional
-        prefix context and masks losses to the target portion.
+        ReplayY returns fixed-length rows made of complete episodes plus a
+        final episode prefix, so no padding mask is needed.
 
         Args:
             replay_buffer: ReplayY instance.
@@ -254,62 +282,52 @@ class Dreamer(nn.Module):
 
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
-        self._update_slow_target()
-        metrics = {}
-        with autocast(device_type=self.device.type, dtype=torch.float16):
-            mets = self._cal_grad(p_data)
-        self._scaler.unscale_(self._optimizer)  # unscale grads in params
+
+        self._wm_optimizer.zero_grad(set_to_none=True)
+        metrics = self._cal_grad(p_data)
+
+        self._wm_scaler.unscale_(self._wm_optimizer)
         if self._log_grads:
-            old_params = [
-                p.data.clone().detach() for p in self._named_params.values()
-            ]
-            grads = [
-                p.grad
-                for p in self._named_params.values()
+            wm_grads = [
+                p.grad for p in self._wm_named_params.values()
                 if p.grad is not None
-            ]  # log grads before clipping
-            grad_norm = tools.compute_global_norm(grads)
-            grad_rms = tools.compute_rms(grads)
-            mets["opt/grad_norm"] = grad_norm
-            mets["opt/grad_rms"] = grad_rms
-        self._agc(self._named_params.values())  # clipping
-        self._scaler.step(self._optimizer)  # update params
-        self._scaler.update()  # adjust scale
-        self._scheduler.step()  # increment scheduler
-        self._optimizer.zero_grad(set_to_none=True)  # reset grads
-        mets["opt/lr"] = self._scheduler.get_lr()[0]
-        mets["opt/grad_scale"] = self._scaler.get_scale()
-        if self._log_grads:
-            updates = [
-                (new - old)
-                for (new, old) in zip(self._named_params.values(), old_params)
             ]
-            update_rms = tools.compute_rms(updates)
-            params_rms = tools.compute_rms(self._named_params.values())
-            mets["opt/param_rms"] = params_rms
-            mets["opt/update_rms"] = update_rms
-        metrics.update(mets)
+            metrics["opt/wm_grad_norm"] = tools.compute_global_norm(wm_grads)
+            metrics["opt/wm_grad_rms"] = tools.compute_rms(wm_grads)
+        self._agc(self._wm_named_params.values())
+        self._wm_scaler.step(self._wm_optimizer)
+        self._wm_scaler.update()
+        self._wm_scheduler.step()
+        self._wm_optimizer.zero_grad(set_to_none=True)
+        metrics["opt/wm_lr"] = self._wm_scheduler.get_last_lr()[0]
+        metrics["opt/wm_grad_scale"] = self._wm_scaler.get_scale()
         return metrics
 
-    @staticmethod
-    def _masked_mean(x, mask):
-        """Average over valid elements only, supporting broadcastable masks."""
-        mask = mask.to(dtype=x.dtype)
-        if mask.shape != x.shape:
-            mask = torch.broadcast_to(mask, x.shape)
-        denom = mask.sum().clamp_min(1.0)
-        return (x * mask).sum() / denom
+    def _step_actor_critic_optimizer(self, metrics):
+        self._ac_scaler.unscale_(self._ac_optimizer)
+        if self._log_grads:
+            ac_grads = [
+                p.grad for p in self._ac_named_params.values()
+                if p.grad is not None
+            ]
+            metrics["opt/ac_grad_norm"] = tools.compute_global_norm(ac_grads)
+            metrics["opt/ac_grad_rms"] = tools.compute_rms(ac_grads)
+        self._agc(self._ac_named_params.values())
+        self._ac_scaler.step(self._ac_optimizer)
+        self._ac_scaler.update()
+        self._ac_scheduler.step()
+        self._ac_optimizer.zero_grad(set_to_none=True)
+        metrics["opt/ac_lr"] = self._ac_scheduler.get_last_lr()[0]
+        metrics["opt/ac_grad_scale"] = self._ac_scaler.get_scale()
 
     @staticmethod
-    def _masked_barlow_loss(x1, x2, flat_mask, lambd, eps=1e-8):
-        """Compute Barlow Twins loss using only valid rows."""
-        flat_mask = flat_mask.to(dtype=x1.dtype)
-        count = flat_mask.sum().clamp_min(1.0)
-
-        x1_mean = (x1 * flat_mask).sum(0) / count
-        x2_mean = (x2 * flat_mask).sum(0) / count
-        x1_centered = (x1 - x1_mean) * flat_mask
-        x2_centered = (x2 - x2_mean) * flat_mask
+    def _barlow_loss(x1, x2, lambd, eps=1e-8):
+        """Compute Barlow Twins loss over a dense no-padding batch."""
+        count = torch.tensor(x1.shape[0], dtype=x1.dtype, device=x1.device)
+        x1_mean = x1.sum(0) / count
+        x2_mean = x2.sum(0) / count
+        x1_centered = x1 - x1_mean
+        x2_centered = x2 - x2_mean
 
         x1_var = x1_centered.pow(2).sum(0) / count
         x2_var = x2_centered.pow(2).sum(0) / count
@@ -347,12 +365,14 @@ class Dreamer(nn.Module):
             end = min(start + chunk, K)
             yield starts[:, start:end], float(end - start) / float(K)
 
+    def _ac_updates_for_chunk(self, chunk_index, chunk_count):
+        base = self.ac_updates_per_wm // max(1, int(chunk_count))
+        extra = self.ac_updates_per_wm % max(1, int(chunk_count))
+        return base + int(chunk_index < extra)
+
     def _world_model_forward(self, data):
         """World-model losses and detached cache for imagination updates."""
-        # t_mask: (B, T) bool — True for target data that contributes to loss.
-        t_mask = data["t_mask"].float()  # (B, T)
-        seq_mask = data["seq_mask"] if "seq_mask" in data.keys(
-        ) else data["t_mask"]
+        seq_mask = data["seq_mask"] if "seq_mask" in data.keys() else None
         positions = data["position"] if "position" in data.keys() else None
         B, T = data.shape
 
@@ -376,24 +396,22 @@ class Dreamer(nn.Module):
         prior_logit = feat_dict['prior_logit']
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
                                                self.kl_free)
-        losses["dyn"] = self._masked_mean(dyn_loss, t_mask)
-        losses["rep"] = self._masked_mean(rep_loss, t_mask)
+        losses["dyn"] = dyn_loss.mean()
+        losses["rep"] = rep_loss.mean()
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
-        flat_mask = t_mask.reshape(B * T, 1)  # (B*T, 1)
         x1 = self.prj(feat.reshape(B * T, -1))
         x2 = embed.reshape(B * T, -1).detach()
-        losses["barlow"] = self._masked_barlow_loss(x1, x2, flat_mask,
-                                                    self.barlow_lambd)
+        losses["barlow"] = self._barlow_loss(x1, x2, self.barlow_lambd)
 
         rew_loss = -self.reward(feat).log_prob(
             to_f32(data["reward"]).unsqueeze(-1))  # (B, T)
-        losses["rew"] = self._masked_mean(rew_loss, t_mask)
+        losses["rew"] = rew_loss.mean()
         cont = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         con_loss = -self.cont(feat).log_prob(cont)  # (B, T)
-        losses["con"] = self._masked_mean(con_loss, t_mask)
+        losses["con"] = con_loss.mean()
 
         metrics["dyn_entropy"] = torch.mean(
             self.rssm.get_dist(prior_logit).entropy())
@@ -410,11 +428,7 @@ class Dreamer(nn.Module):
             "kv_v":
                 feat_dict["kv_v"].detach(),
             "valid_lens":
-                torch.clamp(t_mask.sum(dim=1).to(torch.int64), min=1),
-            "target_start":
-                data["target_start"][:, 0].detach()
-                if "target_start" in data.keys() else torch.zeros(
-                    B, dtype=torch.int64, device=t_mask.device),
+                torch.full((B,), T, dtype=torch.int64, device=self.device),
             "positions":
                 None if positions is None else positions.detach(),
             "T":
@@ -422,8 +436,7 @@ class Dreamer(nn.Module):
         }
         return losses, metrics, imag_source
 
-    def _actor_critic_forward(self, start_stoch, start_deter, imag_carry,
-                              imag_mask):
+    def _actor_critic_forward(self, start_stoch, start_deter, imag_carry):
         """Single actor-critic forward pass from imagination starts."""
         losses = {}
         metrics = {}
@@ -452,7 +465,7 @@ class Dreamer(nn.Module):
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() +
                                                   self.act_entropy * entropy)
-        losses["policy"] = self._masked_mean(policy_loss, imag_mask)
+        losses["policy"] = policy_loss.mean()
 
         imag_value_dist = self.value(imag_feat)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
@@ -460,7 +473,7 @@ class Dreamer(nn.Module):
                       (-imag_value_dist.log_prob(tar_padded.detach()) -
                        imag_value_dist.log_prob(
                            imag_slow_value.detach()))[:, :-1].unsqueeze(-1))
-        losses["value"] = self._masked_mean(value_loss, imag_mask)
+        losses["value"] = value_loss.mean()
 
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -479,22 +492,11 @@ class Dreamer(nn.Module):
         return losses, metrics
 
     def _cal_grad(self, data):
-        """Compute gradients for one batch.
-
-        t_mask from data masks out zero-padded positions.
-
-        Notes
-        -----
-        This function computes:
-        1) World model loss (dynamics + representation)
-        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
-        3) Imagination rollouts for actor-critic updates with start-chunk
-           gradient accumulation
-        """
+        """Compute world-model grads and run repeated actor-critic updates."""
         metrics = {}
         losses = {}
-        opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-        total_valid = data["t_mask"].float().sum().clamp_min(1.0)
+        wm_opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        ac_opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
 
         def _accum(target, source, weight):
             if not isinstance(weight, torch.Tensor):
@@ -514,54 +516,70 @@ class Dreamer(nn.Module):
                 )
                 target[name] = target[name] + value.detach() * weight
 
-        for wm_data, wm_batch_weight in self._iter_batch_chunks(
-                data, self.wm_accum_steps):
-            wm_losses, wm_metrics, imag_source = self._world_model_forward(
-                wm_data)
-            wm_valid = wm_data["t_mask"].float().sum()
-            wm_loss_weight = wm_valid / total_valid
+        wm_chunks = list(self._iter_batch_chunks(data, self.wm_accum_steps))
+        for chunk_index, (wm_data, wm_batch_weight) in enumerate(wm_chunks):
             wm_batch_weight = torch.tensor(wm_batch_weight,
                                            dtype=torch.float32,
                                            device=self.device)
+            with autocast(device_type=self.device.type, dtype=torch.float16):
+                wm_losses, wm_metrics, imag_source = self._world_model_forward(
+                    wm_data)
 
             world_model_loss = sum(self._loss_scales[name] * value
                                    for name, value in wm_losses.items())
-            self._scaler.scale(world_model_loss * wm_loss_weight).backward()
-            opt_loss = opt_loss + world_model_loss.detach() * wm_loss_weight
-            _accum(losses, wm_losses, wm_loss_weight)
+            self._wm_scaler.scale(world_model_loss *
+                                  wm_batch_weight).backward()
+            wm_opt_loss = wm_opt_loss + world_model_loss.detach(
+            ) * wm_batch_weight
+            _accum(losses, wm_losses, wm_batch_weight)
             _accum(metrics, wm_metrics, wm_batch_weight)
 
-            starts = self._sample_transformer_imag_starts(
-                imag_source["valid_lens"],
-                imag_source["target_start"],
-            )
-            ac_losses = {}
-            ac_metrics = {}
-            for start_chunk, s_weight in self._iter_start_chunks(
-                    starts, self.ac_accum_steps):
-                s_weight = torch.tensor(s_weight,
-                                        dtype=torch.float32,
-                                        device=self.device)
-                s_stoch, s_deter, s_carry, s_mask = self._prepare_transformer_imag_start(
-                    imag_source["post_stoch"],
-                    imag_source["post_deter"],
-                    imag_source["kv_k"],
-                    imag_source["kv_v"],
-                    imag_source["positions"],
-                    start_chunk,
+            ac_repeats = self._ac_updates_for_chunk(chunk_index,
+                                                    len(wm_chunks))
+            ac_metric_weight = torch.tensor(1.0 / float(self.ac_updates_per_wm),
+                                            dtype=torch.float32,
+                                            device=self.device)
+            for _ in range(ac_repeats):
+                self._update_slow_target()
+                self._ac_optimizer.zero_grad(set_to_none=True)
+                starts = self._sample_transformer_imag_starts(
+                    imag_source["valid_lens"],
                 )
-                chunk_losses, chunk_metrics = self._actor_critic_forward(
-                    s_stoch, s_deter, s_carry, s_mask)
-                ac_total = (
-                    self._loss_scales["policy"] * chunk_losses["policy"] +
-                    self._loss_scales["value"] * chunk_losses["value"])
-                grad_weight = wm_batch_weight * s_weight
-                self._scaler.scale(ac_total * grad_weight).backward()
-                opt_loss = opt_loss + ac_total.detach() * grad_weight
-                _accum(ac_losses, chunk_losses, s_weight)
-                _accum(ac_metrics, chunk_metrics, s_weight)
-            _accum(losses, ac_losses, wm_batch_weight)
-            _accum(metrics, ac_metrics, wm_batch_weight)
+                ac_losses = {}
+                ac_metrics = {}
+                repeat_loss = torch.zeros((),
+                                          dtype=torch.float32,
+                                          device=self.device)
+                for start_chunk, s_weight in self._iter_start_chunks(
+                        starts, self.ac_accum_steps):
+                    s_weight = torch.tensor(s_weight,
+                                            dtype=torch.float32,
+                                            device=self.device)
+                    s_stoch, s_deter, s_carry = self._prepare_transformer_imag_start(
+                        imag_source["post_stoch"],
+                        imag_source["post_deter"],
+                        imag_source["kv_k"],
+                        imag_source["kv_v"],
+                        imag_source["positions"],
+                        start_chunk,
+                    )
+                    with autocast(device_type=self.device.type,
+                                  dtype=torch.float16):
+                        chunk_losses, chunk_metrics = self._actor_critic_forward(
+                            s_stoch, s_deter, s_carry)
+                        ac_total = (
+                            self._loss_scales["policy"] *
+                            chunk_losses["policy"] +
+                            self._loss_scales["value"] *
+                            chunk_losses["value"])
+                    self._ac_scaler.scale(ac_total * s_weight).backward()
+                    repeat_loss = repeat_loss + ac_total.detach() * s_weight
+                    _accum(ac_losses, chunk_losses, s_weight)
+                    _accum(ac_metrics, chunk_metrics, s_weight)
+                self._step_actor_critic_optimizer(metrics)
+                ac_opt_loss = ac_opt_loss + repeat_loss * ac_metric_weight
+                _accum(losses, ac_losses, ac_metric_weight)
+                _accum(metrics, ac_metrics, ac_metric_weight)
 
         metrics["wm_accum_steps"] = torch.tensor(
             float(self.wm_accum_steps),
@@ -571,10 +589,16 @@ class Dreamer(nn.Module):
             float(self.ac_accum_steps),
             device=self.device,
         )
+        metrics["ac_updates_per_wm"] = torch.tensor(
+            float(self.ac_updates_per_wm),
+            device=self.device,
+        )
         metrics.update({
             f"loss/{name}": loss.detach() for name, loss in losses.items()
         })
-        metrics.update({"opt/loss": opt_loss.detach()})
+        metrics["opt/wm_loss"] = wm_opt_loss.detach()
+        metrics["opt/ac_loss"] = ac_opt_loss.detach()
+        metrics["opt/loss"] = (wm_opt_loss + ac_opt_loss).detach()
         return metrics
 
     @torch.no_grad()
@@ -594,31 +618,27 @@ class Dreamer(nn.Module):
         # observe() already returns KV with W prepended dummy zero slots.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
             post_stoch, post_deter, kv_k, kv_v, starts, positions=positions)
-        imag_mask = torch.ones((B * K, 1, 1), device=starts.device)
-        return start_stoch, start_deter, imag_carry, imag_mask
+        return start_stoch, start_deter, imag_carry
 
     @torch.no_grad()
-    def _sample_transformer_imag_starts(self, valid_lens, target_start):
+    def _sample_transformer_imag_starts(self, valid_lens):
         """Sample all imagination start indices for one actor-critic update."""
         target_T = int(valid_lens.max().item())
         K = min(self.imag_last if self.imag_last > 0 else target_T, target_T)
-        return self._sample_valid_imag_starts(valid_lens, target_start, K,
-                                              valid_lens.device)
+        return self._sample_valid_imag_starts(valid_lens, K, valid_lens.device)
 
     @torch.no_grad()
-    def _sample_valid_imag_starts(self, valid_lens, target_start, K, device):
+    def _sample_valid_imag_starts(self, valid_lens, K, device):
         """Sample K valid imagination starts independently per episode."""
         offsets = torch.arange(K, device=device)
         starts = []
-        for valid_len_t, target_start_t in zip(valid_lens, target_start):
+        for valid_len_t in valid_lens:
             valid_len = int(valid_len_t.item())
-            base = int(target_start_t.item())
             if valid_len >= K:
                 start0 = torch.randint(0, valid_len - K + 1, (), device=device)
-                starts.append(base + start0 + offsets)
+                starts.append(start0 + offsets)
             else:
-                starts.append(base +
-                              torch.randint(0, valid_len, (K,), device=device))
+                starts.append(torch.randint(0, valid_len, (K,), device=device))
         return torch.stack(starts, dim=0)
 
     @torch.no_grad()
