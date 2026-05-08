@@ -23,7 +23,19 @@ class TransformerRSSM(nn.Module):
         self._n_heads = int(config.n_heads)
         self._n_layers = int(config.n_layers)
         self._d_ff = int(config.d_ff)
-        self._window_size = int(config.window_size)
+        self._memory_size = int(getattr(config, "memory_size", 0))
+        configured_segment = getattr(config, "segment_length", None)
+        if configured_segment is None:
+            configured_segment = getattr(config, "window_size", None)
+        if configured_segment is None:
+            raise AttributeError(
+                "TransformerRSSM config requires segment_length.")
+        self._segment_length = int(configured_segment)
+        if self._memory_size < 0:
+            raise AssertionError("memory_size must be >= 0.")
+        if self._segment_length < 1:
+            raise AssertionError("segment_length must be >= 1.")
+        self._window_size = self._memory_size + self._segment_length
         act_fn = getattr(torch.nn, config.act)
 
         self.flat_stoch = self._stoch * self._discrete
@@ -135,8 +147,9 @@ class TransformerRSSM(nn.Module):
                 reset,
                 sample=True,
                 positions=None,
-                valid=None):
-        """Windowed-causal full-sequence training path.
+                valid=None,
+                memory_carry=None):
+        """Transformer training path.
 
         Args:
             tokens: (B, T, E) encoder embeddings.
@@ -148,11 +161,22 @@ class TransformerRSSM(nn.Module):
             positions: Optional absolute episode positions, shape (B, T).
             valid: Optional bool mask for real non-padding timesteps, shape
                 (B, T). Invalid keys are hidden from attention.
+            memory_carry: Optional detached Transformer-XL carry for segment
+                training without replay-side prefix tokens.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
             feat: dict with deter, stoch, post_logit, prior_logit, and
                 trajectory KV tensors for imagination starts.
         """
+        if memory_carry is not None:
+            return self._observe_with_carry(tokens,
+                                            action,
+                                            reset,
+                                            memory_carry,
+                                            sample=sample,
+                                            positions=positions,
+                                            valid=valid)
+
         # Normalize action magnitude
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
@@ -209,6 +233,59 @@ class TransformerRSSM(nn.Module):
                               dim=2).detach(),  # (B, L, T+W, D)
             'kv_v': torch.cat([dummy_v, kv['v']],
                               dim=2).detach(),  # (B, L, T+W, D)
+        }
+        return entries, feat
+
+    def _observe_with_carry(self,
+                            tokens,
+                            action,
+                            reset,
+                            carry,
+                            sample=True,
+                            positions=None,
+                            valid=None):
+        """Observe one real segment using detached Transformer-XL memory."""
+        B, T = tokens.shape[:2]
+        if positions is None:
+            positions = torch.arange(T, device=tokens.device,
+                                     dtype=torch.long).unsqueeze(0).expand(B, -1)
+        else:
+            positions = positions.to(device=tokens.device, dtype=torch.long)
+        if valid is None:
+            valid = torch.ones(B, T, dtype=torch.bool, device=tokens.device)
+        else:
+            valid = valid.to(device=tokens.device, dtype=torch.bool)
+
+        carry = self._mask_carry(carry, reset[:, 0])
+        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
+        post_logit = self._post_head(tokens)
+        post_dist = self.get_dist(post_logit)
+        if sample:
+            stoch = post_dist.rsample()
+        else:
+            stoch = post_dist.base_dist.mode
+
+        stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)
+        x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
+        h, kv, next_carry = self._fwd_segment_with_carry(
+            x, carry, positions, reset, valid)
+
+        h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
+        h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
+        h_prev = h_prev * valid.unsqueeze(-1).to(h_prev.dtype)
+        prior_logit = self._prior_head(h_prev)
+
+        kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
+        kv_v = torch.cat([carry['kv_cache'][:, :, 1].detach(), kv['v']], dim=2)
+        entries = {'deter': h_prev, 'stoch': stoch}
+        feat = {
+            'deter': h_prev,
+            'stoch': stoch,
+            'post_logit': post_logit,
+            'prior_logit': prior_logit,
+            'kv_k': kv_k.detach(),
+            'kv_v': kv_v.detach(),
+            'next_carry': next_carry,
         }
         return entries, feat
 
@@ -310,6 +387,94 @@ class TransformerRSSM(nn.Module):
             }
         return out
 
+    def _fwd_segment_with_carry(self, x, carry, positions, reset, valid):
+        """Forward a segment against detached fixed-length TXL cache."""
+        B, T, D = x.shape
+        H = self._n_heads
+        D_head = self._d_head
+        W = self._window_size
+        M = self._memory_size
+        positions = positions.to(device=x.device, dtype=torch.long)
+        reset = reset.to(device=x.device, dtype=torch.bool)
+        valid = valid.to(device=x.device, dtype=torch.bool)
+
+        # Memory keys represent the previous episode context only until a reset
+        # appears inside the current segment.
+        reset_count = reset.to(dtype=torch.long).cumsum(dim=1)
+        n_mem = torch.clamp(carry['pos'].to(device=x.device), min=0, max=M)
+        j_mem = torch.arange(W, device=x.device)
+        mem_mask = j_mem.unsqueeze(0) >= (W - n_mem).unsqueeze(1)
+        mem_mask = mem_mask[:, None, :] & (reset_count == 0)[:, :, None]
+
+        episode = reset_count
+        q_index = torch.arange(T, device=x.device).view(1, T, 1)
+        k_index = torch.arange(T, device=x.device).view(1, 1, T)
+        cur_mask = (k_index <= q_index) & (
+            episode.unsqueeze(2) == episode.unsqueeze(1))
+        cur_mask = cur_mask & valid.unsqueeze(1)
+        attn_mask = torch.cat([mem_mask, cur_mask], dim=2).unsqueeze(1)
+        valid_f = valid.unsqueeze(-1).to(x.dtype)
+        x = x * valid_f
+
+        k_layers = []
+        v_layers = []
+        new_cache_layers = []
+        for i in range(self._n_layers):
+            res = x
+            x = self._attn_norms[i](x)
+            Q = self._q_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
+            K_cur = self._k_projs[i](x).reshape(B, T, H,
+                                                D_head).transpose(1, 2)
+            V_cur = self._v_projs[i](x).reshape(B, T, H,
+                                                D_head).transpose(1, 2)
+            Q = self._apply_rope(Q, positions=positions)
+            K_cur = self._apply_rope(K_cur, positions=positions)
+
+            k_cur_flat = K_cur.transpose(1, 2).reshape(B, T, D)
+            v_cur_flat = V_cur.transpose(1, 2).reshape(B, T, D)
+            k_layers.append(k_cur_flat)
+            v_layers.append(v_cur_flat)
+
+            k_mem = carry['kv_cache'][:, i, 0].detach()
+            v_mem = carry['kv_cache'][:, i, 1].detach()
+            k_all = torch.cat([k_mem, k_cur_flat], dim=1)
+            v_all = torch.cat([v_mem, v_cur_flat], dim=1)
+            K_all = k_all.reshape(B, W + T, H, D_head).transpose(1, 2)
+            V_all = v_all.reshape(B, W + T, H, D_head).transpose(1, 2)
+
+            x = F.scaled_dot_product_attention(Q,
+                                               K_all,
+                                               V_all,
+                                               attn_mask=attn_mask)
+            x = x.transpose(1, 2).reshape(B, T, D)
+            x = res + self._o_projs[i](x)
+
+            res = x
+            x = self._ffn_norms[i](x)
+            x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
+            x = res + x
+            x = x * valid_f
+
+            new_k = k_all[:, -W:]
+            new_v = v_all[:, -W:]
+            new_cache_layers.append((new_k, new_v))
+
+        out = self._outnorm(x) * valid_f
+        ks = torch.stack([kv[0] for kv in new_cache_layers], dim=1)
+        vs = torch.stack([kv[1] for kv in new_cache_layers], dim=1)
+        next_kv_cache = torch.stack([ks, vs], dim=2).detach()
+        next_pos = (positions[:, -1] + 1).to(torch.int32)
+        next_carry = {
+            'kv_cache': next_kv_cache,
+            'pos': next_pos,
+            'seg_pos': torch.zeros(B, dtype=torch.int32, device=x.device),
+            'h_prev': out[:, -1].detach(),
+        }
+        return out, {
+            'k': torch.stack(k_layers, dim=1),
+            'v': torch.stack(v_layers, dim=1),
+        }, next_carry
+
     # ------------------------------------------------------------------
     # Imagination (KV-cache transition)
     # ------------------------------------------------------------------
@@ -344,7 +509,7 @@ class TransformerRSSM(nn.Module):
         Returns:
             start_stoch: (B*K, S, Kcat)
             start_deter: (B*K, D)
-            carry: dict with kv_cache (B*K,L,2,W,D), pos (B*K), h_prev (B*K,D)
+            carry: dict with kv_cache (B*K,L,2,W,D), pos, seg_pos, h_prev
         """
         B, T = stoch_seq.shape[:2]
         L = kv_k.shape[1]
@@ -370,6 +535,7 @@ class TransformerRSSM(nn.Module):
         else:
             start_pos = positions.to(device=stoch_seq.device,
                                      dtype=torch.long)[batch_index, starts]
+        start_seg_pos = starts % max(1, self._segment_length)
 
         cache_list = []
         for k in range(K):
@@ -390,6 +556,7 @@ class TransformerRSSM(nn.Module):
         carry = {
             'kv_cache': kv_cache.reshape(B * K, L, 2, W, D),
             'pos': start_pos.reshape(B * K).to(torch.int32),
+            'seg_pos': start_seg_pos.reshape(B * K).to(torch.int32),
             'h_prev': start_deter,
         }
         return start_stoch, start_deter, carry
@@ -433,6 +600,8 @@ class TransformerRSSM(nn.Module):
                             device=self._device),
             'pos':
                 torch.zeros(batch_size, dtype=torch.int32, device=self._device),
+            'seg_pos':
+                torch.zeros(batch_size, dtype=torch.int32, device=self._device),
             'h_prev':
                 torch.zeros(batch_size,
                             D,
@@ -466,7 +635,13 @@ class TransformerRSSM(nn.Module):
         h_prev = carry['h_prev'] * (1.0 - reset_f.unsqueeze(-1))
         kv_cache = carry['kv_cache'] * (1.0 - reset_f.reshape(-1, 1, 1, 1, 1))
         pos = carry['pos'] * (~reset).int()
-        return {'kv_cache': kv_cache, 'pos': pos, 'h_prev': h_prev}
+        seg_pos = carry.get('seg_pos', torch.zeros_like(pos)) * (~reset).int()
+        return {
+            'kv_cache': kv_cache,
+            'pos': pos,
+            'seg_pos': seg_pos,
+            'h_prev': h_prev
+        }
 
     def update_carry(self, carry, stoch, action, reset):
         """Phase 2: KV-cache Transformer step with (stoch, action) -> h_t.
@@ -497,10 +672,15 @@ class TransformerRSSM(nn.Module):
 
         kv_cache = carry['kv_cache']  # (B, L, 2, W, D)
         pos = carry['pos']  # (B,)
+        seg_pos = carry.get('seg_pos', torch.zeros_like(pos))
         ts = pos.unsqueeze(1)  # (B, 1)
 
-        # Valid mask: min(pos+1, W) rightmost entries are valid
-        n_valid = torch.clamp(pos + 1, max=W)
+        # Literal cache length is memory_size + segment_length. At the start
+        # of a segment, only memory_size + current token is visible; visibility
+        # grows until the segment ends, then falls back on the next segment.
+        segment_visible = self._memory_size + seg_pos + 1
+        n_valid = torch.minimum(torch.clamp(pos + 1, max=W),
+                                torch.clamp(segment_visible, max=W))
         j = torch.arange(W, device=x_t.device)
         # (B, W) bool — True = can attend
         valid_mask = (j.unsqueeze(0) >= (W - n_valid).unsqueeze(1))
@@ -564,6 +744,7 @@ class TransformerRSSM(nn.Module):
         return {
             'kv_cache': new_kv_cache,
             'pos': pos + 1,
+            'seg_pos': (seg_pos + 1) % self._segment_length,
             'h_prev': h_t,
         }
 

@@ -33,9 +33,9 @@ def _action_dim(space):
     raise AttributeError("Unsupported action space without 'n' or 'shape'.")
 
 
-def make_atari_memory_env(env_config=None, env_name="montezuma_revenge"):
+def make_atari_expert_env(env_config=None, env_name="montezuma_revenge"):
     if atari.Atari.LOCK is None:
-        # The memory episode is rebuilt in the main process only, so a
+        # The expert episode is rebuilt in the main process only, so a
         # regular thread lock is sufficient and avoids sandbox semlock
         # restrictions from multiprocessing.Lock().
         atari.Atari.LOCK = threading.Lock()
@@ -50,7 +50,7 @@ def make_atari_memory_env(env_config=None, env_name="montezuma_revenge"):
         gray=bool(env_config.gray),
         noops=int(env_config.noops),
         lives=env_config.lives,
-        # Keep sticky actions disabled for memory recovery so the action
+        # Keep sticky actions disabled for expert recovery so the action
         # sequence in ge.json deterministically reproduces the intended run.
         sticky=False,
         actions=str(env_config.actions),
@@ -70,7 +70,7 @@ def make_atari_memory_env(env_config=None, env_name="montezuma_revenge"):
     return env
 
 
-def build_atari_memory_episode(actions,
+def build_atari_expert_episode(actions,
                                expected_score,
                                env_name="montezuma_revenge",
                                reset_seed=0,
@@ -79,10 +79,10 @@ def build_atari_memory_episode(actions,
     actions = np.asarray(actions, dtype=np.int64)
     if actions.ndim != 1 or len(actions) == 0:
         raise ValueError(
-            "Memory episode requires a non-empty 1D action sequence.")
+            "Expert episode requires a non-empty 1D action sequence.")
 
     if env_ctor is None:
-        env_ctor = lambda: make_atari_memory_env(env_config, env_name)
+        env_ctor = lambda: make_atari_expert_env(env_config, env_name)
 
     env = env_ctor()
     episode = []
@@ -122,7 +122,7 @@ def build_atari_memory_episode(actions,
     return _stack_episode(episode)
 
 
-def load_atari_memory_episode(path,
+def load_atari_expert_episode(path,
                               env_name="montezuma_revenge",
                               reset_seed=0,
                               env_config=None,
@@ -130,7 +130,7 @@ def load_atari_memory_episode(path,
     path = pathlib.Path(path)
     with path.open() as f:
         payload = json.load(f)
-    return build_atari_memory_episode(
+    return build_atari_expert_episode(
         payload["actions"],
         payload["score"],
         env_name=env_name,
@@ -138,3 +138,9 @@ def load_atari_memory_episode(path,
         env_config=env_config,
         env_ctor=env_ctor,
     )
+
+
+# Backward-compatible aliases for older scripts/checkpoints.
+make_atari_memory_env = make_atari_expert_env
+build_atari_memory_episode = build_atari_expert_episode
+load_atari_memory_episode = load_atari_expert_episode

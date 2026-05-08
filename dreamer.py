@@ -34,8 +34,7 @@ class Dreamer(nn.Module):
         self.imag_last = int(getattr(config, 'imag_last', 0))
         self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
         self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))
-        self.ac_updates_per_wm = max(
-            1, int(getattr(config, "ac_updates_per_wm", 1)))
+        self.memory_size = int(getattr(config.transformer, "memory_size", 0))
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -71,6 +70,7 @@ class Dreamer(nn.Module):
         for param in self._slow_value.parameters():
             param.requires_grad = False
         self._slow_value_updates = 0
+        self._train_carry = None
 
         self._loss_scales = dict(config.loss_scales)
         self._log_grads = bool(config.log_grads)
@@ -103,21 +103,8 @@ class Dreamer(nn.Module):
             else:
                 for param_name, param in module.named_parameters():
                     self._named_params[f"{name}.{param_name}"] = param
-        self._wm_named_params = OrderedDict(
-            (name, param) for name, param in self._named_params.items()
-            if name.split(".", 1)[0]
-            in ("rssm", "reward", "cont", "encoder", "projector"))
-        self._ac_named_params = OrderedDict(
-            (name, param) for name, param in self._named_params.items()
-            if name.split(".", 1)[0] in ("actor", "value"))
         print(
             f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters."
-        )
-        print(
-            f"World model optimizer has: {sum(p.numel() for p in self._wm_named_params.values())} parameters."
-        )
-        print(
-            f"Actor-critic optimizer has: {sum(p.numel() for p in self._ac_named_params.values())} parameters."
         )
 
         def _agc(params):
@@ -127,30 +114,20 @@ class Dreamer(nn.Module):
                            foreach=True)
 
         self._agc = _agc
-        self._wm_optimizer = LaProp(
-            self._wm_named_params.values(),
+        self._optimizer = LaProp(
+            self._named_params.values(),
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             eps=config.eps,
         )
-        self._ac_optimizer = LaProp(
-            self._ac_named_params.values(),
-            lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-        )
-        self._wm_scaler = GradScaler()
-        self._ac_scaler = GradScaler()
+        self._scaler = GradScaler()
 
         def lr_lambda(step):
             if config.warmup:
                 return min(1.0, (step + 1) / config.warmup)
             return 1.0
 
-        self._wm_scheduler = LambdaLR(self._wm_optimizer,
-                                      lr_lambda=lr_lambda)
-        self._ac_scheduler = LambdaLR(self._ac_optimizer,
-                                      lr_lambda=lr_lambda)
+        self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
 
         self.train()
         self.clone_and_freeze()
@@ -198,6 +175,27 @@ class Dreamer(nn.Module):
                     getattr(self,
                             f"_{name}" if name == "slow_value" else name)))
 
+    @staticmethod
+    def _slice_carry(carry, start, end):
+        return {k: v[start:end] for k, v in carry.items()}
+
+    @staticmethod
+    def _cat_carries(carries):
+        return {
+            key: torch.cat([carry[key] for carry in carries], dim=0)
+            for key in carries[0]
+        }
+
+    @staticmethod
+    def _detach_carry(carry):
+        return {k: v.detach() for k, v in carry.items()}
+
+    def _ensure_train_carry(self, batch_size):
+        if (self._train_carry is None or
+                int(self._train_carry['pos'].shape[0]) != int(batch_size)):
+            self._train_carry = self.rssm.initial(int(batch_size))
+        return self._train_carry
+
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
         # Re-establish shared frozen weights after moving the model to a new device
@@ -216,6 +214,7 @@ class Dreamer(nn.Module):
         carry = {
             'kv_cache': state['kv_cache'],
             'pos': state['pos'],
+            'seg_pos': state['seg_pos'],
             'h_prev': state['h_prev'],
         }
         # Trainer provides (B, 1, *) tensors; squeeze time dim
@@ -233,6 +232,7 @@ class Dreamer(nn.Module):
             {
                 "kv_cache": carry['kv_cache'],
                 "pos": carry['pos'],
+                "seg_pos": carry['seg_pos'],
                 "h_prev": carry['h_prev'],
                 "prev_action": action,
             },
@@ -250,6 +250,7 @@ class Dreamer(nn.Module):
             {
                 "kv_cache": carry['kv_cache'],
                 "pos": carry['pos'],
+                "seg_pos": carry['seg_pos'],
                 "h_prev": carry['h_prev'],
                 "prev_action": action,
             },
@@ -258,8 +259,8 @@ class Dreamer(nn.Module):
     def update(self, replay_buffer, batch_size):
         """Sample a batch from replay and perform one optimization step.
 
-        ReplayY returns fixed-length rows made of complete episodes plus a
-        final episode prefix, so no padding mask is needed.
+        ReplayY returns Transformer-XL rows: detached memory prefix plus one
+        trainable segment.
 
         Args:
             replay_buffer: ReplayY instance.
@@ -282,47 +283,33 @@ class Dreamer(nn.Module):
 
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
+        train_carry = self._ensure_train_carry(p_data.shape[0])
 
-        self._wm_optimizer.zero_grad(set_to_none=True)
-        metrics = self._cal_grad(p_data)
+        self._update_slow_target()
+        self._optimizer.zero_grad(set_to_none=True)
+        metrics, next_train_carry = self._cal_grad(p_data, train_carry)
 
-        self._wm_scaler.unscale_(self._wm_optimizer)
+        self._scaler.unscale_(self._optimizer)
         if self._log_grads:
-            wm_grads = [
-                p.grad for p in self._wm_named_params.values()
+            grads = [
+                p.grad for p in self._named_params.values()
                 if p.grad is not None
             ]
-            metrics["opt/wm_grad_norm"] = tools.compute_global_norm(wm_grads)
-            metrics["opt/wm_grad_rms"] = tools.compute_rms(wm_grads)
-        self._agc(self._wm_named_params.values())
-        self._wm_scaler.step(self._wm_optimizer)
-        self._wm_scaler.update()
-        self._wm_scheduler.step()
-        self._wm_optimizer.zero_grad(set_to_none=True)
-        metrics["opt/wm_lr"] = self._wm_scheduler.get_last_lr()[0]
-        metrics["opt/wm_grad_scale"] = self._wm_scaler.get_scale()
+            metrics["opt/grad_norm"] = tools.compute_global_norm(grads)
+            metrics["opt/grad_rms"] = tools.compute_rms(grads)
+        self._agc(self._named_params.values())
+        self._scaler.step(self._optimizer)
+        self._scaler.update()
+        self._scheduler.step()
+        self._optimizer.zero_grad(set_to_none=True)
+        self._train_carry = self._detach_carry(next_train_carry)
+        metrics["opt/lr"] = self._scheduler.get_last_lr()[0]
+        metrics["opt/grad_scale"] = self._scaler.get_scale()
         return metrics
-
-    def _step_actor_critic_optimizer(self, metrics):
-        self._ac_scaler.unscale_(self._ac_optimizer)
-        if self._log_grads:
-            ac_grads = [
-                p.grad for p in self._ac_named_params.values()
-                if p.grad is not None
-            ]
-            metrics["opt/ac_grad_norm"] = tools.compute_global_norm(ac_grads)
-            metrics["opt/ac_grad_rms"] = tools.compute_rms(ac_grads)
-        self._agc(self._ac_named_params.values())
-        self._ac_scaler.step(self._ac_optimizer)
-        self._ac_scaler.update()
-        self._ac_scheduler.step()
-        self._ac_optimizer.zero_grad(set_to_none=True)
-        metrics["opt/ac_lr"] = self._ac_scheduler.get_last_lr()[0]
-        metrics["opt/ac_grad_scale"] = self._ac_scaler.get_scale()
 
     @staticmethod
     def _barlow_loss(x1, x2, lambd, eps=1e-8):
-        """Compute Barlow Twins loss over a dense no-padding batch."""
+        """Compute Barlow Twins loss over a dense segment batch."""
         count = torch.tensor(x1.shape[0], dtype=x1.dtype, device=x1.device)
         x1_mean = x1.sum(0) / count
         x2_mean = x2.sum(0) / count
@@ -342,16 +329,16 @@ class Dreamer(nn.Module):
         return invariance_loss + lambd * redundancy_loss
 
     def _iter_batch_chunks(self, data, accum_steps):
-        """Yield replay batch chunks and their batch-fraction weights."""
+        """Yield replay batch chunks, slice bounds, and batch-fraction weights."""
         B = data.shape[0]
         splits = min(max(1, int(accum_steps)), int(B))
         if splits <= 1:
-            yield data, 1.0
+            yield 0, B, data, 1.0
             return
         chunk = (B + splits - 1) // splits
         for start in range(0, B, chunk):
             end = min(start + chunk, B)
-            yield data[start:end], float(end - start) / float(B)
+            yield start, end, data[start:end], float(end - start) / float(B)
 
     def _iter_start_chunks(self, starts, accum_steps):
         """Yield sampled imagination-start index chunks and their weights."""
@@ -365,14 +352,8 @@ class Dreamer(nn.Module):
             end = min(start + chunk, K)
             yield starts[:, start:end], float(end - start) / float(K)
 
-    def _ac_updates_for_chunk(self, chunk_index, chunk_count):
-        base = self.ac_updates_per_wm // max(1, int(chunk_count))
-        extra = self.ac_updates_per_wm % max(1, int(chunk_count))
-        return base + int(chunk_index < extra)
-
-    def _world_model_forward(self, data):
+    def _world_model_forward(self, data, memory_carry):
         """World-model losses and detached cache for imagination updates."""
-        seq_mask = data["seq_mask"] if "seq_mask" in data.keys() else None
         positions = data["position"] if "position" in data.keys() else None
         B, T = data.shape
 
@@ -389,7 +370,7 @@ class Dreamer(nn.Module):
                                          action,
                                          data["is_first"],
                                          positions=positions,
-                                         valid=seq_mask)
+                                         memory_carry=memory_carry)
         post_stoch = feat_dict['stoch']  # (B, T, S, K)
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
@@ -434,7 +415,7 @@ class Dreamer(nn.Module):
             "T":
                 T,
         }
-        return losses, metrics, imag_source
+        return losses, metrics, imag_source, feat_dict["next_carry"]
 
     def _actor_critic_forward(self, start_stoch, start_deter, imag_carry):
         """Single actor-critic forward pass from imagination starts."""
@@ -491,12 +472,12 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(imag_action, "action"))
         return losses, metrics
 
-    def _cal_grad(self, data):
-        """Compute world-model grads and run repeated actor-critic updates."""
+    def _cal_grad(self, data, train_carry):
+        """Compute one joint world-model and actor-critic optimization graph."""
         metrics = {}
         losses = {}
-        wm_opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-        ac_opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
+        next_carries = []
 
         def _accum(target, source, weight):
             if not isinstance(weight, torch.Tensor):
@@ -517,69 +498,55 @@ class Dreamer(nn.Module):
                 target[name] = target[name] + value.detach() * weight
 
         wm_chunks = list(self._iter_batch_chunks(data, self.wm_accum_steps))
-        for chunk_index, (wm_data, wm_batch_weight) in enumerate(wm_chunks):
+        for start, end, wm_data, wm_batch_weight in wm_chunks:
+            carry_chunk = self._slice_carry(train_carry, start, end)
             wm_batch_weight = torch.tensor(wm_batch_weight,
                                            dtype=torch.float32,
                                            device=self.device)
             with autocast(device_type=self.device.type, dtype=torch.float16):
-                wm_losses, wm_metrics, imag_source = self._world_model_forward(
-                    wm_data)
+                wm_losses, wm_metrics, imag_source, next_carry = self._world_model_forward(
+                    wm_data, carry_chunk)
+            next_carries.append(self._detach_carry(next_carry))
 
             world_model_loss = sum(self._loss_scales[name] * value
                                    for name, value in wm_losses.items())
-            self._wm_scaler.scale(world_model_loss *
-                                  wm_batch_weight).backward()
-            wm_opt_loss = wm_opt_loss + world_model_loss.detach(
-            ) * wm_batch_weight
+            self._scaler.scale(world_model_loss * wm_batch_weight).backward()
+            opt_loss = opt_loss + world_model_loss.detach() * wm_batch_weight
             _accum(losses, wm_losses, wm_batch_weight)
             _accum(metrics, wm_metrics, wm_batch_weight)
 
-            ac_repeats = self._ac_updates_for_chunk(chunk_index,
-                                                    len(wm_chunks))
-            ac_metric_weight = torch.tensor(1.0 / float(self.ac_updates_per_wm),
-                                            dtype=torch.float32,
-                                            device=self.device)
-            for _ in range(ac_repeats):
-                self._update_slow_target()
-                self._ac_optimizer.zero_grad(set_to_none=True)
-                starts = self._sample_transformer_imag_starts(
-                    imag_source["valid_lens"],
+            starts = self._sample_transformer_imag_starts(
+                imag_source["valid_lens"],
+            )
+            ac_losses = {}
+            ac_metrics = {}
+            for start_chunk, s_weight in self._iter_start_chunks(
+                    starts, self.ac_accum_steps):
+                s_weight = torch.tensor(s_weight,
+                                        dtype=torch.float32,
+                                        device=self.device)
+                s_stoch, s_deter, s_carry = self._prepare_transformer_imag_start(
+                    imag_source["post_stoch"],
+                    imag_source["post_deter"],
+                    imag_source["kv_k"],
+                    imag_source["kv_v"],
+                    imag_source["positions"],
+                    start_chunk,
                 )
-                ac_losses = {}
-                ac_metrics = {}
-                repeat_loss = torch.zeros((),
-                                          dtype=torch.float32,
-                                          device=self.device)
-                for start_chunk, s_weight in self._iter_start_chunks(
-                        starts, self.ac_accum_steps):
-                    s_weight = torch.tensor(s_weight,
-                                            dtype=torch.float32,
-                                            device=self.device)
-                    s_stoch, s_deter, s_carry = self._prepare_transformer_imag_start(
-                        imag_source["post_stoch"],
-                        imag_source["post_deter"],
-                        imag_source["kv_k"],
-                        imag_source["kv_v"],
-                        imag_source["positions"],
-                        start_chunk,
-                    )
-                    with autocast(device_type=self.device.type,
-                                  dtype=torch.float16):
-                        chunk_losses, chunk_metrics = self._actor_critic_forward(
-                            s_stoch, s_deter, s_carry)
-                        ac_total = (
-                            self._loss_scales["policy"] *
-                            chunk_losses["policy"] +
-                            self._loss_scales["value"] *
-                            chunk_losses["value"])
-                    self._ac_scaler.scale(ac_total * s_weight).backward()
-                    repeat_loss = repeat_loss + ac_total.detach() * s_weight
-                    _accum(ac_losses, chunk_losses, s_weight)
-                    _accum(ac_metrics, chunk_metrics, s_weight)
-                self._step_actor_critic_optimizer(metrics)
-                ac_opt_loss = ac_opt_loss + repeat_loss * ac_metric_weight
-                _accum(losses, ac_losses, ac_metric_weight)
-                _accum(metrics, ac_metrics, ac_metric_weight)
+                with autocast(device_type=self.device.type, dtype=torch.float16):
+                    chunk_losses, chunk_metrics = self._actor_critic_forward(
+                        s_stoch, s_deter, s_carry)
+                    ac_total = (self._loss_scales["policy"] *
+                                chunk_losses["policy"] +
+                                self._loss_scales["value"] *
+                                chunk_losses["value"])
+                grad_weight = wm_batch_weight * s_weight
+                self._scaler.scale(ac_total * grad_weight).backward()
+                opt_loss = opt_loss + ac_total.detach() * grad_weight
+                _accum(ac_losses, chunk_losses, s_weight)
+                _accum(ac_metrics, chunk_metrics, s_weight)
+            _accum(losses, ac_losses, wm_batch_weight)
+            _accum(metrics, ac_metrics, wm_batch_weight)
 
         metrics["wm_accum_steps"] = torch.tensor(
             float(self.wm_accum_steps),
@@ -589,17 +556,11 @@ class Dreamer(nn.Module):
             float(self.ac_accum_steps),
             device=self.device,
         )
-        metrics["ac_updates_per_wm"] = torch.tensor(
-            float(self.ac_updates_per_wm),
-            device=self.device,
-        )
         metrics.update({
             f"loss/{name}": loss.detach() for name, loss in losses.items()
         })
-        metrics["opt/wm_loss"] = wm_opt_loss.detach()
-        metrics["opt/ac_loss"] = ac_opt_loss.detach()
-        metrics["opt/loss"] = (wm_opt_loss + ac_opt_loss).detach()
-        return metrics
+        metrics["opt/loss"] = opt_loss.detach()
+        return metrics, self._cat_carries(next_carries)
 
     @torch.no_grad()
     def _prepare_transformer_imag_start(

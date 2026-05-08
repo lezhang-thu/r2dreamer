@@ -46,13 +46,13 @@ for task in "${tasks[@]}"; do
 		CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \
 			env=atari100k \
 			env.task=$task \
-			logdir=logdir/5120-${DATE}_${METHOD}_${task#atari_}_$seed \
+			logdir=logdir/txl-${DATE}_${METHOD}_${task#atari_}_$seed \
 			model.compile=True \
 			device=cuda:0 \
 			buffer.storage_device=cpu \
 			model=size-transformer \
 			model.rep_loss=${METHOD} \
 			seed=$seed \
-			batch_size=16 batch_length=5120
+			batch_size=16 batch_length=64
 	done
 done

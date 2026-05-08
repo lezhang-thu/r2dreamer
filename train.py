@@ -9,7 +9,7 @@ from hydra.utils import to_absolute_path
 
 import tools
 from dreamer import Dreamer
-from episode_memory import load_atari_memory_episode
+from episode_memory import load_atari_expert_episode
 from envs import make_envs
 from replay_y import ReplayY
 from trainer import OnlineTrainer
@@ -80,40 +80,43 @@ def main(config):
     if int(config.batch_length) < 1:
         raise AssertionError("config.batch_length must be >= 1 "
                              f"(got batch_length={int(config.batch_length)}).")
-    if int(config.model.transformer.window_size) != int(config.batch_length):
+    if int(config.model.transformer.segment_length) != int(config.batch_length):
         raise AssertionError(
-            "config.model.transformer.window_size must equal config.batch_length "
-            f"(got window_size={int(config.model.transformer.window_size)}, "
+            "config.model.transformer.segment_length must equal config.batch_length "
+            f"(got segment_length={int(config.model.transformer.segment_length)}, "
             f"batch_length={int(config.batch_length)}).")
+    if int(config.model.transformer.memory_size) < 0:
+        raise AssertionError("config.model.transformer.memory_size must be >= 0 "
+                             f"(got {int(config.model.transformer.memory_size)}).")
 
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
-    memory_path = pathlib.Path(__file__).with_name("ge-14600.json")
-    memory = None
-    if memory_path.exists():
-        print(f"Load memory from {memory_path}.")
+    expert_path = pathlib.Path(__file__).with_name("ge-14600.json")
+    expert = None
+    if expert_path.exists():
+        print(f"Load expert trajectory from {expert_path}.")
         env_task = str(config.env.task)
-        memory_env_name = "montezuma_revenge"
-        memory_env_config = None
+        expert_env_name = "montezuma_revenge"
+        expert_env_config = None
         if env_task.startswith("atari_"):
-            memory_env_name = env_task.split("_", 1)[1]
-            memory_env_config = config.env
-        memory = load_atari_memory_episode(
-            memory_path,
-            env_name=memory_env_name,
-            env_config=memory_env_config,
+            expert_env_name = env_task.split("_", 1)[1]
+            expert_env_config = config.env
+        expert = load_atari_expert_episode(
+            expert_path,
+            env_name=expert_env_name,
+            env_config=expert_env_config,
         )
-        print("Recovered memory episode with "
-              f"{len(memory['reward'])} replay-style steps.")
+        print("Recovered expert episode with "
+              f"{len(expert['reward'])} replay-style steps.")
     else:
-        print(f"Memory file {memory_path} not found; replay.memory=None.")
+        print(f"Expert file {expert_path} not found; replay.expert=None.")
 
     replay_buffer = ReplayY(
         length=int(config.batch_length),
         seed=config.seed,
-        memory=memory,
-        memory_sample_frac=float(config.buffer.memory_sample_frac),
+        expert=expert,
+        expert_sample_frac=float(config.buffer.expert_sample_frac),
     )
     replay_load_path = config.get("replay_load_path", None)
     if replay_load_path is not None:

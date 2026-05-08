@@ -25,8 +25,7 @@ buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   max_size: 5e5
-  #memory_sample_frac: 0.0625
-  memory_sample_frac: 0.0  # legacy; ReplayY includes expert memory exactly once per sampled batch
+  expert_sample_frac: 0.0  # legacy; ReplayY includes expert exactly once per sampled batch
   device: ${device}
   storage_device: 'cuda:0'
 
