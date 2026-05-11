@@ -145,11 +145,12 @@ class TransformerRSSM(nn.Module):
                 tokens,
                 action,
                 reset,
+                *,
+                memory_carry,
                 sample=True,
                 positions=None,
-                valid=None,
-                memory_carry=None):
-        """Transformer training path.
+                valid=None):
+        """Observe one real segment using detached Transformer-XL memory.
 
         Args:
             tokens: (B, T, E) encoder embeddings.
@@ -161,94 +162,18 @@ class TransformerRSSM(nn.Module):
             positions: Optional absolute episode positions, shape (B, T).
             valid: Optional bool mask for real non-padding timesteps, shape
                 (B, T). Invalid keys are hidden from attention.
-            memory_carry: Optional detached Transformer-XL carry for segment
-                training without replay-side prefix tokens.
+            memory_carry: Detached Transformer-XL carry for segment training
+                without replay-side prefix tokens.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
             feat: dict with deter, stoch, post_logit, prior_logit, and
                 trajectory KV tensors for imagination starts.
         """
-        if memory_carry is not None:
-            return self._observe_with_carry(tokens,
-                                            action,
-                                            reset,
-                                            memory_carry,
-                                            sample=sample,
-                                            positions=positions,
-                                            valid=valid)
-
-        # Normalize action magnitude
-        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
-
-        # Posterior: conditioned on tokens only
-        post_logit = self._post_head(tokens)  # (B, T, S, K)
-        post_dist = self.get_dist(post_logit)
-        if sample:
-            stoch = post_dist.rsample()  # (B, T, S, K)
-        else:
-            stoch = post_dist.base_dist.mode
-
-        # Input projection: cat(stoch, action) -> d_model
-        stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)
-        x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
-
-        # Causal Transformer forward
-        h, kv = self._fwd(x, return_kv=True, positions=positions,
-                          valid=valid, reset=reset)  # (B, T, D)
-
-        # Shift right: h_prev[t] = h[t-1], h_prev[0] = 0
-        h_prev = torch.cat([torch.zeros_like(h[:, :1]), h[:, :-1]], dim=1)
-
-        # Zero h_prev at episode resets
-        reset_mask = reset.unsqueeze(-1).float()  # (B, T, 1)
-        h_prev = h_prev * (1.0 - reset_mask)
-        if valid is not None:
-            h_prev = h_prev * valid.unsqueeze(-1).to(h_prev.dtype)
-
-        # Prior: conditioned on h_prev only
-        prior_logit = self._prior_head(h_prev)  # (B, T, S, K)
-
-        entries = {'deter': h_prev, 'stoch': stoch}
-        B, L, T, D = kv['k'].shape
-        dummy_k = torch.zeros(B,
-                              L,
-                              self._window_size,
-                              D,
-                              dtype=kv['k'].dtype,
-                              device=kv['k'].device)
-        dummy_v = torch.zeros(B,
-                              L,
-                              self._window_size,
-                              D,
-                              dtype=kv['v'].dtype,
-                              device=kv['v'].device)
-        feat = {
-            'deter': h_prev,
-            'stoch': stoch,
-            'post_logit': post_logit,
-            'prior_logit': prior_logit,
-            # Detached to avoid expanding the autograd graph.
-            # Prepend W dummy zero-KV slots to match initial() cache style.
-            'kv_k': torch.cat([dummy_k, kv['k']],
-                              dim=2).detach(),  # (B, L, T+W, D)
-            'kv_v': torch.cat([dummy_v, kv['v']],
-                              dim=2).detach(),  # (B, L, T+W, D)
-        }
-        return entries, feat
-
-    def _observe_with_carry(self,
-                            tokens,
-                            action,
-                            reset,
-                            carry,
-                            sample=True,
-                            positions=None,
-                            valid=None):
-        """Observe one real segment using detached Transformer-XL memory."""
         B, T = tokens.shape[:2]
         if positions is None:
             positions = torch.arange(T, device=tokens.device,
-                                     dtype=torch.long).unsqueeze(0).expand(B, -1)
+                                     dtype=torch.long).unsqueeze(0).expand(
+                                         B, -1)
         else:
             positions = positions.to(device=tokens.device, dtype=torch.long)
         if valid is None:
@@ -256,7 +181,7 @@ class TransformerRSSM(nn.Module):
         else:
             valid = valid.to(device=tokens.device, dtype=torch.bool)
 
-        carry = self._mask_carry(carry, reset[:, 0])
+        carry = self._mask_carry(memory_carry, reset[:, 0])
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
         post_logit = self._post_head(tokens)
         post_dist = self.get_dist(post_logit)
@@ -303,97 +228,16 @@ class TransformerRSSM(nn.Module):
                                                     dtype=torch.long))
         return x_t.transpose(1, 2)
 
-    def _fwd(self, x, return_kv=False, positions=None, valid=None, reset=None):
-        """Pre-norm causal Transformer with RoPE.
-
-        Args:
-            x: (B, T, D) input sequence.
-            positions: Optional absolute episode positions, shape (B, T).
-            valid: Optional bool mask for real non-padding timesteps, shape
-                (B, T). Invalid keys are hidden from attention.
-            reset: Optional bool mask for episode starts, shape (B, T).
-        Returns:
-            (B, T, D) transformed sequence.
-        """
-        B, T, D = x.shape
-        H = self._n_heads
-        D_head = self._d_head
-        W = self._window_size
-        # Windowed causal mask by episode position, not just sequence index.
-        # This lets a training row contain multiple complete episodes while
-        # preventing attention across episode boundaries.
-        if positions is None:
-            pos = torch.arange(T, device=x.device,
-                               dtype=torch.long).unsqueeze(0).expand(B, -1)
-        else:
-            pos = positions.to(device=x.device, dtype=torch.long)
-        if reset is None:
-            episode = torch.zeros(B, T, dtype=torch.long, device=x.device)
-        else:
-            episode = reset.to(device=x.device, dtype=torch.long).cumsum(dim=1)
-        q_pos = pos.unsqueeze(2)
-        k_pos = pos.unsqueeze(1)
-        same_episode = episode.unsqueeze(2) == episode.unsqueeze(1)
-        attn_mask = same_episode & (k_pos <= q_pos) & ((q_pos - k_pos) < W)
-        attn_mask = attn_mask.unsqueeze(1)  # (B, 1, T, T)
-        valid_f = None
-        if valid is not None:
-            valid = valid.to(dtype=torch.bool, device=x.device)
-            valid_f = valid.unsqueeze(-1).to(dtype=x.dtype)
-            x = x * valid_f
-            attn_mask = attn_mask & valid.unsqueeze(1).unsqueeze(2)
-            invalid_query = (~valid).unsqueeze(1).unsqueeze(-1)
-            diag = torch.eye(T, dtype=torch.bool,
-                             device=x.device).unsqueeze(0).unsqueeze(0)
-            attn_mask = attn_mask | (invalid_query & diag)
-        if return_kv:
-            k_layers = []
-            v_layers = []
-
-        for i in range(self._n_layers):
-            # Self-attention sublayer (pre-norm)
-            res = x
-            x = self._attn_norms[i](x)
-            Q = self._q_projs[i](x).reshape(B, T, H, D_head).transpose(
-                1, 2)  # (B, H, T, D_head)
-            K = self._k_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            V = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            Q = self._apply_rope(Q, positions=positions)
-            K = self._apply_rope(K, positions=positions)
-            if return_kv:
-                # Match cache storage layout used by update_carry.
-                k_layers.append(K.transpose(1, 2).reshape(B, T, D))
-                v_layers.append(V.transpose(1, 2).reshape(B, T, D))
-            x = F.scaled_dot_product_attention(
-                Q, K, V, attn_mask=attn_mask)  # (B, H, T, D_head)
-            x = x.transpose(1, 2).reshape(B, T, D)
-            x = res + self._o_projs[i](x)
-
-            # FFN sublayer (pre-norm)
-            res = x
-            x = self._ffn_norms[i](x)
-            x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
-            x = res + x
-            if valid_f is not None:
-                x = x * valid_f
-
-        out = self._outnorm(x)
-        if valid_f is not None:
-            out = out * valid_f
-        if return_kv:
-            return out, {
-                'k': torch.stack(k_layers, dim=1),  # (B, L, T, D)
-                'v': torch.stack(v_layers, dim=1),  # (B, L, T, D)
-            }
-        return out
-
     def _fwd_segment_with_carry(self, x, carry, positions, reset, valid):
-        """Forward a segment against detached fixed-length TXL cache."""
+        """Forward a segment against detached Transformer-XL memory."""
         B, T, D = x.shape
         H = self._n_heads
         D_head = self._d_head
-        W = self._window_size
         M = self._memory_size
+        C = int(carry['kv_cache'].shape[3])
+        if C != M:
+            raise AssertionError("TransformerRSSM.observe expects a compact "
+                                 f"memory carry of length {M}, got {C}.")
         positions = positions.to(device=x.device, dtype=torch.long)
         reset = reset.to(device=x.device, dtype=torch.bool)
         valid = valid.to(device=x.device, dtype=torch.bool)
@@ -401,16 +245,16 @@ class TransformerRSSM(nn.Module):
         # Memory keys represent the previous episode context only until a reset
         # appears inside the current segment.
         reset_count = reset.to(dtype=torch.long).cumsum(dim=1)
-        n_mem = torch.clamp(carry['pos'].to(device=x.device), min=0, max=M)
-        j_mem = torch.arange(W, device=x.device)
-        mem_mask = j_mem.unsqueeze(0) >= (W - n_mem).unsqueeze(1)
+        n_mem = torch.clamp(carry['pos'].to(device=x.device), min=0, max=C)
+        j_mem = torch.arange(C, device=x.device)
+        mem_mask = j_mem.unsqueeze(0) >= (C - n_mem).unsqueeze(1)
         mem_mask = mem_mask[:, None, :] & (reset_count == 0)[:, :, None]
 
         episode = reset_count
         q_index = torch.arange(T, device=x.device).view(1, T, 1)
         k_index = torch.arange(T, device=x.device).view(1, 1, T)
-        cur_mask = (k_index <= q_index) & (
-            episode.unsqueeze(2) == episode.unsqueeze(1))
+        cur_mask = (k_index <= q_index) & (episode.unsqueeze(2)
+                                           == episode.unsqueeze(1))
         cur_mask = cur_mask & valid.unsqueeze(1)
         attn_mask = torch.cat([mem_mask, cur_mask], dim=2).unsqueeze(1)
         valid_f = valid.unsqueeze(-1).to(x.dtype)
@@ -423,10 +267,8 @@ class TransformerRSSM(nn.Module):
             res = x
             x = self._attn_norms[i](x)
             Q = self._q_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            K_cur = self._k_projs[i](x).reshape(B, T, H,
-                                                D_head).transpose(1, 2)
-            V_cur = self._v_projs[i](x).reshape(B, T, H,
-                                                D_head).transpose(1, 2)
+            K_cur = self._k_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
+            V_cur = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
             Q = self._apply_rope(Q, positions=positions)
             K_cur = self._apply_rope(K_cur, positions=positions)
 
@@ -439,8 +281,8 @@ class TransformerRSSM(nn.Module):
             v_mem = carry['kv_cache'][:, i, 1].detach()
             k_all = torch.cat([k_mem, k_cur_flat], dim=1)
             v_all = torch.cat([v_mem, v_cur_flat], dim=1)
-            K_all = k_all.reshape(B, W + T, H, D_head).transpose(1, 2)
-            V_all = v_all.reshape(B, W + T, H, D_head).transpose(1, 2)
+            K_all = k_all.reshape(B, C + T, H, D_head).transpose(1, 2)
+            V_all = v_all.reshape(B, C + T, H, D_head).transpose(1, 2)
 
             x = F.scaled_dot_product_attention(Q,
                                                K_all,
@@ -455,8 +297,12 @@ class TransformerRSSM(nn.Module):
             x = res + x
             x = x * valid_f
 
-            new_k = k_all[:, -W:]
-            new_v = v_all[:, -W:]
+            if M > 0:
+                new_k = k_all[:, -M:]
+                new_v = v_all[:, -M:]
+            else:
+                new_k = k_all[:, :0]
+                new_v = v_all[:, :0]
             new_cache_layers.append((new_k, new_v))
 
         out = self._outnorm(x) * valid_f
@@ -502,8 +348,10 @@ class TransformerRSSM(nn.Module):
         Args:
             stoch_seq: (B, T, S, Kcat)
             deter_seq: (B, T, D) h_prev sequence
-            kv_k: (B, L, T+W, D) cached keys with W prepended dummy slots
-            kv_v: (B, L, T+W, D) cached values with W prepended dummy slots
+            kv_k: (B, L, M+T, D) cached keys with M memory slots followed by
+                current-segment keys.
+            kv_v: (B, L, M+T, D) cached values with M memory slots followed by
+                current-segment values.
             starts: (B, K) integer start indices, all valid per episode
             positions: Optional (B, T) absolute episode positions for starts.
         Returns:
@@ -514,10 +362,11 @@ class TransformerRSSM(nn.Module):
         B, T = stoch_seq.shape[:2]
         L = kv_k.shape[1]
         W = self._window_size
+        M = self._memory_size
         starts = starts.to(device=stoch_seq.device, dtype=torch.long)
         assert starts.ndim == 2 and starts.shape[0] == B
-        assert kv_k.shape == (B, L, T + W, self._deter)
-        assert kv_v.shape == (B, L, T + W, self._deter)
+        assert kv_k.shape == (B, L, M + T, self._deter)
+        assert kv_v.shape == (B, L, M + T, self._deter)
         if positions is not None:
             assert positions.shape == (B, T)
         assert torch.all(starts >= 0)
@@ -535,19 +384,25 @@ class TransformerRSSM(nn.Module):
         else:
             start_pos = positions.to(device=stoch_seq.device,
                                      dtype=torch.long)[batch_index, starts]
-        start_seg_pos = starts % max(1, self._segment_length)
+        start_seg_pos = start_pos % max(1, self._segment_length)
 
         cache_list = []
         for k in range(K):
             s = starts[:, k]  # (B,)
-            # Gather the W keys/values immediately before start s. kv_k/kv_v
-            # are stored with W dummy slots prepended, so adding W to
-            # [s-W, ..., s-1] simplifies to [s, ..., s+W-1].
-            left_time = s[:, None] - W + offsets[None, :]  # (B, W)
-            gather_time = left_time + W
+            # Gather the fixed literal cache immediately before start s. Times
+            # in [-M, -1] address the detached memory; times [0, s-1] address
+            # current segment tokens. Earlier times are zero-padded so acting
+            # and imagination keep the same literal cache shape.
+            left_time = s[:, None] - W + offsets[None, :]
+            gather_time = left_time + M
+            valid_time = gather_time >= 0
+            gather_time = torch.clamp(gather_time, min=0, max=M + T - 1)
             gather_index = gather_time[:, None, :, None].expand(B, L, W, D)
             k_slice = kv_k.gather(2, gather_index)  # (B, L, W, D)
             v_slice = kv_v.gather(2, gather_index)  # (B, L, W, D)
+            valid_time = valid_time[:, None, :, None].to(k_slice.dtype)
+            k_slice = k_slice * valid_time
+            v_slice = v_slice * valid_time
             cache_list.append(torch.stack([k_slice, v_slice], dim=2))
 
         kv_cache = torch.stack(cache_list, dim=1)  # (B, K, L, 2, W, D)
@@ -585,16 +440,14 @@ class TransformerRSSM(nn.Module):
     # KV-cache policy inference
     # ------------------------------------------------------------------
 
-    def initial(self, batch_size):
-        """Return initial carry dict for KV-cache inference."""
+    def _initial_carry(self, batch_size, cache_size):
         D = self._deter
-        W = self._window_size
         return {
             'kv_cache':
                 torch.zeros(batch_size,
                             self._n_layers,
                             2,
-                            W,
+                            cache_size,
                             D,
                             dtype=torch.float32,
                             device=self._device),
@@ -608,6 +461,14 @@ class TransformerRSSM(nn.Module):
                             dtype=torch.float32,
                             device=self._device),
         }
+
+    def initial(self, batch_size):
+        """Return initial carry dict for KV-cache inference/imagination."""
+        return self._initial_carry(batch_size, self._window_size)
+
+    def initial_memory(self, batch_size):
+        """Return compact initial carry for Transformer-XL segment training."""
+        return self._initial_carry(batch_size, self._memory_size)
 
     def get_feat_step(self, carry, tokens, reset):
         """Phase 1: posterior from tokens. No action needed.

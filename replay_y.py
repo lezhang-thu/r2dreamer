@@ -124,10 +124,9 @@ class ReplayY:
         with self.lock:
             has_replay = any(ep is not None for ep in self.eps)
         has_expert = self.expert is not None
-        if not has_replay and not has_expert:
-            return False
-        non_expert_rows = batch - int(has_expert)
-        return non_expert_rows <= 0 or has_replay
+        if has_replay:
+            return True
+        return has_expert and self.expert_sample_frac >= 1.0
 
     def add(self, step, worker=0):
         step = {k: v for k, v in step.items() if not k.startswith('log_')}
@@ -170,25 +169,33 @@ class ReplayY:
             "offset": 0,
         }
 
-    def _ensure_streams(self, batch, replay_episodes):
-        sources = []
-        if self.expert is not None and batch > 0:
-            sources.append("expert")
-        sources.extend(["replay"] * (batch - len(sources)))
-        needs_reset = len(self.streams) != batch
-        if not needs_reset:
-            needs_reset = any(stream["source"] != source
-                              for stream, source in zip(self.streams, sources))
-        if needs_reset:
-            self.streams = [
-                self._new_stream(source, replay_episodes)
-                for source in sources
-            ]
+    def _choose_source(self, replay_episodes):
+        has_replay = bool(replay_episodes)
+        has_expert = self.expert is not None and self.expert_sample_frac > 0.0
+        if has_replay and has_expert:
+            return ("expert" if self.rng.random() < self.expert_sample_frac else
+                    "replay")
+        if has_expert and self.expert_sample_frac >= 1.0:
+            return "expert"
+        if has_replay:
+            return "replay"
+        raise RuntimeError(
+            "ReplayY.sample() requested a stream before replay or expert data "
+            "were available.")
 
-    def _next_episode_for_stream(self, stream, replay_episodes):
-        if stream["source"] == "expert":
-            return self.expert
-        return self._sample_episode(replay_episodes)
+    def _new_sampled_stream(self, replay_episodes):
+        return self._new_stream(self._choose_source(replay_episodes),
+                                replay_episodes)
+
+    def _ensure_streams(self, batch, replay_episodes):
+        if len(self.streams) > batch:
+            self.streams = self.streams[:batch]
+        while len(self.streams) < batch:
+            self.streams.append(self._new_sampled_stream(replay_episodes))
+
+    def _replace_exhausted_stream(self, stream, replay_episodes):
+        stream.clear()
+        stream.update(self._new_sampled_stream(replay_episodes))
 
     @staticmethod
     def _step_at(episode, offset):
@@ -202,26 +209,25 @@ class ReplayY:
         while len(items) < L:
             episode = stream["episode"]
             if stream["offset"] >= self._episode_length(episode):
-                episode = self._next_episode_for_stream(stream,
-                                                        replay_episodes)
-                stream["episode"] = episode
-                stream["offset"] = 0
+                self._replace_exhausted_stream(stream, replay_episodes)
+                episode = stream["episode"]
 
             offset = int(stream["offset"])
             step = self._step_at(episode, offset)
             if offset == 0 and "is_first" in step:
-                step["is_first"] = np.asarray(True, dtype=step["is_first"].dtype)
+                step["is_first"] = np.asarray(True,
+                                              dtype=step["is_first"].dtype)
             items.append(step)
             positions.append(offset)
 
             stream["offset"] = offset + 1
             is_last = bool(step.get("is_last", False))
             if is_last or stream["offset"] >= self._episode_length(episode):
-                stream["episode"] = self._next_episode_for_stream(
-                    stream, replay_episodes)
-                stream["offset"] = 0
+                self._replace_exhausted_stream(stream, replay_episodes)
 
-        seq = {k: np.stack([item[k] for item in items], axis=0) for k in items[0]}
+        seq = {
+            k: np.stack([item[k] for item in items], axis=0) for k in items[0]
+        }
         return seq, np.asarray(positions, dtype=np.int64)
 
     def sample(self, batch):

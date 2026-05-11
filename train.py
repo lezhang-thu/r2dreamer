@@ -86,8 +86,9 @@ def main(config):
             f"(got segment_length={int(config.model.transformer.segment_length)}, "
             f"batch_length={int(config.batch_length)}).")
     if int(config.model.transformer.memory_size) < 0:
-        raise AssertionError("config.model.transformer.memory_size must be >= 0 "
-                             f"(got {int(config.model.transformer.memory_size)}).")
+        raise AssertionError(
+            "config.model.transformer.memory_size must be >= 0 "
+            f"(got {int(config.model.transformer.memory_size)}).")
 
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)

@@ -43,18 +43,24 @@ contain padding.
 - No replay-side memory prefix is emitted.
 - `t_mask`, `seq_mask`, and `target_start` are not part of the sampled batch.
 
-If an expert episode is available, `ReplayY` reserves exactly one sampled row
-for the expert stream. The remaining rows come from regular replay episodes.
-The legacy `expert_sample_frac` setting is kept only for configuration
-compatibility.
+If an expert episode is available, `expert_sample_frac` is the probability used
+when a row needs a new stream. For example, `expert_sample_frac: 0.5` means
+that each newly initialized row, or each exhausted row being replaced, has a
+50% chance to use the expert episode when regular replay is also available.
+The source is not re-sampled on every `ReplayY.sample()` call. A row keeps
+consuming its current episode until that episode is exhausted. If a row switches
+between replay and expert after exhaustion, the new stream starts at episode
+offset `0`, so the RSSM carry is reset by `is_first`.
 
 ## World-Model Training
 
-`Dreamer` owns a persistent detached training carry, `self._train_carry`, with
-the same structure as the inference carry:
+`Dreamer` owns a persistent detached training carry, `self._train_carry`.
+Unlike the inference/imagination carry, this training carry only stores the
+Transformer-XL memory tokens, because world-model training receives the full
+current segment in parallel:
 
 ```text
-kv_cache: (B, n_layers, 2, memory_size + segment_length, deter)
+kv_cache: (B, n_layers, 2, memory_size, deter)
 pos:      (B,)
 seg_pos:  (B,)
 h_prev:   (B, deter)
@@ -65,14 +71,16 @@ For each update:
 1. `ReplayY.sample()` returns one real segment per batch row.
 2. `Dreamer._world_model_forward()` passes that segment plus the matching slice
    of `self._train_carry` into `rssm.observe(..., memory_carry=...)`.
-3. `TransformerRSSM._fwd_segment_with_carry()` attends from current segment
-   queries to detached memory keys plus causal current-segment keys.
+3. `TransformerRSSM.observe()` attends from current segment queries to detached
+   memory keys plus causal current-segment keys.
 4. Losses are computed only on real current-segment tokens.
 5. `feat_dict["next_carry"]` is detached and stored back into
    `self._train_carry` after the optimizer step.
 
 The training carry is not a replay prefix. It is a detached model-side cache
-from the previous segment processed by the same stream row.
+from the previous segment processed by the same stream row. `rssm.observe()`
+requires this carry; the old no-carry full-sequence training path is not part
+of the current implementation.
 
 ## Episode Boundary Masking
 
@@ -126,14 +134,14 @@ This gives Transformer-XL segment behavior:
 - At the last token of a segment, it can see memory plus the whole segment.
 - At the next segment boundary, visibility falls back to memory plus one token.
 
-The literal cache length stays fixed, so the implementation can use one cache
-shape everywhere. Unused slots are zero-filled and hidden by the attention mask.
+The literal cache length stays fixed for acting and imagination. Unused slots
+are zero-filled and hidden by the attention mask.
 
 `build_imag_starts()` constructs imagination carries from observed trajectory
-KV tensors by gathering the fixed literal cache window immediately before each
-sampled start. The sampled start's `seg_pos` is derived from
-`start % segment_length`, so imagined rollouts follow the same segment-visible
-window rule as policy inference.
+KV tensors by combining compact memory KV with the current-segment KV prefix
+immediately before each sampled start. The sampled start's `seg_pos` is derived
+from the episode-local start position, so imagined rollouts follow the same
+segment-visible window rule as policy inference.
 
 ## Optimizer Structure
 
@@ -156,6 +164,9 @@ overall update step.
 - Episode boundaries are explicit through `is_first`.
 - `position` is the source of truth for RoPE positions during training.
 - Fixed-size padded cache slots exist only inside RSSM carries, not in replay.
-- Training, acting, and imagination all use the same literal cache shape.
+- Acting and imagination use the same literal cache shape.
+- World-model training uses a compact `memory_size` cache and reconstructs
+  literal imagination caches from compact memory plus current-segment KV
+  tensors.
 - The actual visible attention context follows Transformer-XL segment semantics:
   memory plus the current segment prefix.

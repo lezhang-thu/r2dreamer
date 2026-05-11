@@ -133,8 +133,8 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         if config.compile:
             print("Compiling forward loss functions with torch.compile...")
-            self._world_model_forward = torch.compile(
-                self._world_model_forward, mode="default")
+            self._world_model_forward = torch.compile(self._world_model_forward,
+                                                      mode="default")
             self._actor_critic_forward = torch.compile(
                 self._actor_critic_forward, mode="default")
 
@@ -193,7 +193,7 @@ class Dreamer(nn.Module):
     def _ensure_train_carry(self, batch_size):
         if (self._train_carry is None or
                 int(self._train_carry['pos'].shape[0]) != int(batch_size)):
-            self._train_carry = self.rssm.initial(int(batch_size))
+            self._train_carry = self.rssm.initial_memory(int(batch_size))
         return self._train_carry
 
     def to(self, *args, **kwargs):
@@ -259,8 +259,8 @@ class Dreamer(nn.Module):
     def update(self, replay_buffer, batch_size):
         """Sample a batch from replay and perform one optimization step.
 
-        ReplayY returns Transformer-XL rows: detached memory prefix plus one
-        trainable segment.
+        ReplayY returns Transformer-XL rows containing one real trainable
+        segment. Detached memory is kept in self._train_carry.
 
         Args:
             replay_buffer: ReplayY instance.
@@ -292,7 +292,8 @@ class Dreamer(nn.Module):
         self._scaler.unscale_(self._optimizer)
         if self._log_grads:
             grads = [
-                p.grad for p in self._named_params.values()
+                p.grad
+                for p in self._named_params.values()
                 if p.grad is not None
             ]
             metrics["opt/grad_norm"] = tools.compute_global_norm(grads)
@@ -516,8 +517,7 @@ class Dreamer(nn.Module):
             _accum(metrics, wm_metrics, wm_batch_weight)
 
             starts = self._sample_transformer_imag_starts(
-                imag_source["valid_lens"],
-            )
+                imag_source["valid_lens"],)
             ac_losses = {}
             ac_metrics = {}
             for start_chunk, s_weight in self._iter_start_chunks(
@@ -533,13 +533,13 @@ class Dreamer(nn.Module):
                     imag_source["positions"],
                     start_chunk,
                 )
-                with autocast(device_type=self.device.type, dtype=torch.float16):
+                with autocast(device_type=self.device.type,
+                              dtype=torch.float16):
                     chunk_losses, chunk_metrics = self._actor_critic_forward(
                         s_stoch, s_deter, s_carry)
-                    ac_total = (self._loss_scales["policy"] *
-                                chunk_losses["policy"] +
-                                self._loss_scales["value"] *
-                                chunk_losses["value"])
+                    ac_total = (
+                        self._loss_scales["policy"] * chunk_losses["policy"] +
+                        self._loss_scales["value"] * chunk_losses["value"])
                 grad_weight = wm_batch_weight * s_weight
                 self._scaler.scale(ac_total * grad_weight).backward()
                 opt_loss = opt_loss + ac_total.detach() * grad_weight
@@ -576,7 +576,7 @@ class Dreamer(nn.Module):
         B = post_stoch.shape[0]
         K = starts.shape[1]
 
-        # observe() already returns KV with W prepended dummy zero slots.
+        # observe() returns compact memory KV plus current-segment KV.
         start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
             post_stoch, post_deter, kv_k, kv_v, starts, positions=positions)
         return start_stoch, start_deter, imag_carry
