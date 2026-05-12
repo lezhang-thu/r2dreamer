@@ -214,7 +214,6 @@ class Dreamer(nn.Module):
         carry = {
             'kv_cache': state['kv_cache'],
             'pos': state['pos'],
-            'seg_pos': state['seg_pos'],
             'h_prev': state['h_prev'],
         }
         # Trainer provides (B, 1, *) tensors; squeeze time dim
@@ -232,7 +231,6 @@ class Dreamer(nn.Module):
             {
                 "kv_cache": carry['kv_cache'],
                 "pos": carry['pos'],
-                "seg_pos": carry['seg_pos'],
                 "h_prev": carry['h_prev'],
                 "prev_action": action,
             },
@@ -250,7 +248,6 @@ class Dreamer(nn.Module):
             {
                 "kv_cache": carry['kv_cache'],
                 "pos": carry['pos'],
-                "seg_pos": carry['seg_pos'],
                 "h_prev": carry['h_prev'],
                 "prev_action": action,
             },

@@ -41,19 +41,19 @@ Training (observe path):
 
 ## Three operational modes
 
-### 1. Training: full-sequence causal attention
+### 1. Training: segment sliding-window attention
 
 `TransformerRSSM.observe(tokens, action, reset)`:
 
 1. `post_logit = _post_head(tokens)` and sample posterior `stoch`.
 2. Build transformer inputs from `(stoch, action)`.
-3. Run windowed-causal transformer (`_fwd`) over the full sequence, where each
-   step attends to at most `window_size` recent steps (including itself).
+3. Run windowed-causal transformer over the segment, where each step attends
+   to at most `memory_size` previous steps plus itself.
 4. Shift-right to get `h_prev`.
 5. `prior_logit = _prior_head(h_prev)`.
-6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) with `window_size`
-   prepended dummy zero slots for efficient imagination-start construction
-   without replaying history.
+6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) with `memory_size`
+   memory slots followed by current-segment keys for efficient
+   imagination-start construction without replaying history.
 
 Posterior is conditioned on `tokens` only. It does **not** take `h_prev`.
 
@@ -66,7 +66,8 @@ Given current latent `(stoch_t, h_prev_t)` and action `a_t`:
 2. New deterministic context is `h_t = carry['h_prev']`.
 3. `prior_head(h_t)` predicts `stoch_{t+1}`.
 
-Carry keeps only `window_size` past steps, matching inference memory behavior.
+Carry keeps only `memory_size` previous steps, matching inference memory
+behavior.
 During training, starts are built from `observe()`-returned trajectory KV tensors
 for `B*K` parallel starts with two sampling modes:
 - if an episode has at least `K` valid steps, one contiguous block of `K`
@@ -74,11 +75,9 @@ for `B*K` parallel starts with two sampling modes:
 - if an episode is shorter than `K`, `K` valid indices are sampled
   independently with replacement, so starts may repeat or be out of order.
 
-`build_imag_starts()` handles both cases by gathering latent state and KV-cache
-windows independently for each sampled start, so no extra history replay is
-needed in `_cal_grad`. `window_size` dummy all-zero KV slots are prepended
-before start-window extraction so imagination uses the same zero-cache style as
-`initial()` in policy inference.
+`build_imag_starts()` handles both cases by gathering latent state and the
+previous `memory_size` KV entries independently for each sampled start, so no
+extra history replay is needed in `_cal_grad`.
 
 ### 3. Policy inference: two-phase KV-cache
 
@@ -115,7 +114,8 @@ transformer:
   n_heads: 8
   n_layers: 4
   d_ff: 4096
-  window_size: 64
+  memory_size: 64
+  segment_length: ${batch_length}
 ```
 
 Usage:
@@ -126,13 +126,13 @@ python3 train.py model.compile=False batch_length=500
 
 ## Practical notes
 
-- Full-sequence training still uses parallel causal attention.
-- Training attention is windowed to `window_size`, matching inference and
+- Segment training still uses parallel causal attention.
+- Training attention is windowed to `memory_size`, matching inference and
   imagination context limits.
 - In imagination/inference, dynamics are rolled with a bounded KV window to
   control memory.
-- Training samples contiguous trajectory segments and never concatenates
-  different trajectories inside one sampled sequence.
+- `ReplayY` streams real episode chunks and may concatenate episode fragments
+  inside a sampled segment; `is_first` and `position` define the boundaries.
 - RoPE uses a modern cached implementation with dynamic cache growth if
   positions exceed `rope_max_seq_len`.
 - `post_head` and `prior_head` are now multi-layer MLP heads (Linear + RMSNorm

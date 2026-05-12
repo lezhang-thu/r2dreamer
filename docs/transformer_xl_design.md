@@ -18,15 +18,15 @@ model:
     segment_length: ${batch_length}
 ```
 
-Inside `TransformerRSSM`, the literal KV-cache length is:
+Inside `TransformerRSSM`, every carry stores only previous-token memory:
 
 ```text
-window_size = memory_size + segment_length
+cache_size = memory_size
 ```
 
-With the current Atari defaults, the literal cache length is `512 + 64 = 576`.
-The literal cache may contain unused zero slots, but replay samples do not
-contain padding.
+With the current Atari defaults, the carry length is `512`. `segment_length`
+controls how many real tokens are processed in one parallel training segment;
+it does not expand the policy or imagination KV cache.
 
 ## Replay Semantics
 
@@ -62,7 +62,6 @@ current segment in parallel:
 ```text
 kv_cache: (B, n_layers, 2, memory_size, deter)
 pos:      (B,)
-seg_pos:  (B,)
 h_prev:   (B, deter)
 ```
 
@@ -72,7 +71,8 @@ For each update:
 2. `Dreamer._world_model_forward()` passes that segment plus the matching slice
    of `self._train_carry` into `rssm.observe(..., memory_carry=...)`.
 3. `TransformerRSSM.observe()` attends from current segment queries to detached
-   memory keys plus causal current-segment keys.
+   memory keys plus causal current-segment keys, with a sliding window of
+   `memory_size` previous tokens plus the current token.
 4. Losses are computed only on real current-segment tokens.
 5. `feat_dict["next_carry"]` is detached and stored back into
    `self._train_carry` after the optimizer step.
@@ -109,7 +109,7 @@ Transformer-XL relative positional encoding.
 - Training applies RoPE with those absolute per-episode positions.
 - Acting keeps `pos` in the RSSM carry and increments it after each
   environment step.
-- `_mask_carry()` resets `pos`, `seg_pos`, `kv_cache`, and `h_prev` on episode
+- `_mask_carry()` resets `pos`, `kv_cache`, and `h_prev` on episode
   reset.
 - Imagination starts inherit positions from the observed segment when available.
 
@@ -118,30 +118,29 @@ global replay indices.
 
 ## Acting and Imagination
 
-Acting and imagination use a fixed literal cache of
-`memory_size + segment_length` slots, but the number of visible slots changes
-with the current segment position:
+Acting and imagination use the same `memory_size` previous-token cache as
+training:
 
 ```text
-visible = min(pos + 1, memory_size + seg_pos + 1, window_size)
-seg_pos = (seg_pos + 1) % segment_length
+visible_previous = min(pos, memory_size)
+attention_keys = visible_previous cached keys + current key
 ```
 
-This gives Transformer-XL segment behavior:
+This gives one aligned sliding-window behavior:
 
-- At the first token of a segment, the token can see memory plus itself.
-- As the segment advances, it can see memory plus the current segment prefix.
-- At the last token of a segment, it can see memory plus the whole segment.
-- At the next segment boundary, visibility falls back to memory plus one token.
+- A carry contains only previous tokens, never current-segment slack slots.
+- Each update appends the current key/value and keeps the newest
+  `memory_size` entries for the next step.
+- No `seg_pos` is tracked, so there is no segment-boundary visibility reset in
+  policy inference or imagination.
 
-The literal cache length stays fixed for acting and imagination. Unused slots
-are zero-filled and hidden by the attention mask.
+Unused cache slots before an episode has enough history are zero-filled and
+hidden by the attention mask.
 
 `build_imag_starts()` constructs imagination carries from observed trajectory
-KV tensors by combining compact memory KV with the current-segment KV prefix
-immediately before each sampled start. The sampled start's `seg_pos` is derived
-from the episode-local start position, so imagined rollouts follow the same
-segment-visible window rule as policy inference.
+KV tensors by gathering the previous `memory_size` keys immediately before each
+sampled start. Episode-local positions hide gathered keys that would cross an
+episode boundary inside a streamed replay segment.
 
 ## Optimizer Structure
 
@@ -164,9 +163,9 @@ overall update step.
 - Episode boundaries are explicit through `is_first`.
 - `position` is the source of truth for RoPE positions during training.
 - Fixed-size padded cache slots exist only inside RSSM carries, not in replay.
-- Acting and imagination use the same literal cache shape.
+- Acting, imagination, and world-model training use the same carry shape.
 - World-model training uses a compact `memory_size` cache and reconstructs
-  literal imagination caches from compact memory plus current-segment KV
-  tensors.
-- The actual visible attention context follows Transformer-XL segment semantics:
-  memory plus the current segment prefix.
+  imagination caches by gathering the previous `memory_size` keys from compact
+  memory plus current-segment KV tensors.
+- The actual visible attention context is a sliding window of at most
+  `memory_size` previous tokens plus the current token.
