@@ -163,10 +163,13 @@ class ReplayY:
             episode = self.expert
         else:
             episode = self._sample_episode(replay_episodes)
+        offset_limit = min(self.length, self._episode_length(episode))
+        offset = int(self.rng.integers(0, offset_limit))
         return {
             "source": source,
             "episode": episode,
-            "offset": 0,
+            "offset": offset,
+            "position": 0,
         }
 
     def _choose_source(self, replay_episodes):
@@ -213,14 +216,16 @@ class ReplayY:
                 episode = stream["episode"]
 
             offset = int(stream["offset"])
+            position = int(stream["position"])
             step = self._step_at(episode, offset)
-            if offset == 0 and "is_first" in step:
+            if position == 0 and "is_first" in step:
                 step["is_first"] = np.asarray(True,
                                               dtype=step["is_first"].dtype)
             items.append(step)
-            positions.append(offset)
+            positions.append(position)
 
             stream["offset"] = offset + 1
+            stream["position"] = position + 1
             is_last = bool(step.get("is_last", False))
             if is_last or stream["offset"] >= self._episode_length(episode):
                 self._replace_exhausted_stream(stream, replay_episodes)

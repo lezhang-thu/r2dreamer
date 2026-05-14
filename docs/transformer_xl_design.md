@@ -37,8 +37,8 @@ it does not expand the policy or imagination KV cache.
   the row continues immediately.
 - `is_first=True` marks every new episode boundary, including boundaries inside
   a sampled segment.
-- `position` stores the absolute position within the current episode and resets
-  to `0` at every episode boundary.
+- `position` stores the logical position within the shifted stream and resets
+  to `0` at every shifted episode boundary.
 - No replay-side padding is emitted.
 - No replay-side memory prefix is emitted.
 - `t_mask`, `seq_mask`, and `target_start` are not part of the sampled batch.
@@ -49,8 +49,9 @@ that each newly initialized row, or each exhausted row being replaced, has a
 50% chance to use the expert episode when regular replay is also available.
 The source is not re-sampled on every `ReplayY.sample()` call. A row keeps
 consuming its current episode until that episode is exhausted. If a row switches
-between replay and expert after exhaustion, the new stream starts at episode
-offset `0`, so the RSSM carry is reset by `is_first`.
+between replay and expert after exhaustion, the new stream starts at a random
+episode offset below `batch_length` and reports logical position `0`, so the
+RSSM carry is reset by `is_first`.
 
 ## World-Model Training
 
@@ -106,15 +107,15 @@ The implementation keeps the existing RoPE encoding. It does not add
 Transformer-XL relative positional encoding.
 
 - Replay provides `position` for every real token.
-- Training applies RoPE with those absolute per-episode positions.
+- Training applies RoPE with those shifted-stream positions.
 - Acting keeps `pos` in the RSSM carry and increments it after each
   environment step.
 - `_mask_carry()` resets `pos`, `kv_cache`, and `h_prev` on episode
   reset.
 - Imagination starts inherit positions from the observed segment when available.
 
-The invariant is that positions are episode-local absolute positions, not
-global replay indices.
+The invariant is that positions are stream-local positions, not global replay
+indices.
 
 ## Acting and Imagination
 
