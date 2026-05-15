@@ -385,8 +385,8 @@ class Dreamer(nn.Module):
         x2 = embed.reshape(B * T, -1).detach()
         losses["barlow"] = self._barlow_loss(x1, x2, self.barlow_lambd)
 
-        rew_loss = -self.reward(feat).log_prob(
-            to_f32(data["reward"]).unsqueeze(-1))  # (B, T)
+        reward = torch.clamp(to_f32(data["reward"]), -1.0, 1.0)
+        rew_loss = -self.reward(feat).log_prob(reward.unsqueeze(-1))  # (B, T)
         losses["rew"] = rew_loss.mean()
         cont = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         con_loss = -self.cont(feat).log_prob(cont)  # (B, T)
@@ -425,7 +425,8 @@ class Dreamer(nn.Module):
         imag_feat = imag_feat.detach()
         imag_action = imag_action.detach()
 
-        imag_reward = self._frozen_reward(imag_feat).mode()
+        imag_reward_raw = self._frozen_reward(imag_feat).mode()
+        imag_reward = torch.clamp(imag_reward_raw, -1.0, 1.0)
         imag_cont = self._frozen_cont(imag_feat).mean
         imag_value = self._frozen_value(imag_feat).mode()
         imag_slow_value = self._frozen_slow_value(imag_feat).mode()
@@ -461,6 +462,7 @@ class Dreamer(nn.Module):
         metrics["adv"] = torch.mean(adv)
         metrics["adv_std"] = torch.std(adv)
         metrics["con"] = torch.mean(imag_cont)
+        metrics["rew_raw"] = torch.mean(imag_reward_raw)
         metrics["rew"] = torch.mean(imag_reward)
         metrics["val"] = torch.mean(imag_value)
         metrics["tar"] = torch.mean(ret)
