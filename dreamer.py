@@ -438,6 +438,7 @@ class Dreamer(nn.Module):
                                   imag_value, disc,
                                   self.lamb)  # (N, T_imag-1, 1)
         ret_offset, ret_scale = self.return_ema(ret)
+        ret_scale = torch.clamp(ret_scale, max=5.0)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
         policy = self.actor(imag_feat)
@@ -459,6 +460,7 @@ class Dreamer(nn.Module):
         metrics["ret"] = torch.mean(ret_normed)
         metrics["ret_005"] = self.return_ema.ema_vals[0]
         metrics["ret_095"] = self.return_ema.ema_vals[1]
+        metrics["ret_scale"] = ret_scale
         metrics["adv"] = torch.mean(adv)
         metrics["adv_std"] = torch.std(adv)
         metrics["con"] = torch.mean(imag_cont)
