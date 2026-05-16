@@ -50,6 +50,7 @@ transformer:
   post_layers: 1
   prior_layers: 2
   n_heads: 8
+  attn_output_gate: headwise
   #n_layers: 4
   n_layers: 6
   #d_ff: 4096

@@ -24,6 +24,11 @@ class TransformerRSSM(nn.Module):
         self._n_layers = int(config.n_layers)
         self._d_ff = int(config.d_ff)
         self._memory_size = int(getattr(config, "memory_size", 0))
+        self._attn_output_gate = str(getattr(config, "attn_output_gate",
+                                             "none")).lower()
+        if self._attn_output_gate not in ("none", "headwise"):
+            raise AssertionError("attn_output_gate must be 'none' or "
+                                 f"'headwise', got {self._attn_output_gate!r}.")
         configured_segment = getattr(config, "segment_length", None)
         if configured_segment is None:
             configured_segment = getattr(config, "window_size", None)
@@ -79,7 +84,8 @@ class TransformerRSSM(nn.Module):
         for _ in range(self._n_layers):
             self._attn_norms.append(
                 nn.RMSNorm(D, eps=1e-04, dtype=torch.float32))
-            self._q_projs.append(nn.Linear(D, D, bias=False))
+            q_out_dim = D + H if self._attn_output_gate == "headwise" else D
+            self._q_projs.append(nn.Linear(D, q_out_dim, bias=False))
             self._k_projs.append(nn.Linear(D, D, bias=False))
             self._v_projs.append(nn.Linear(D, D, bias=False))
             self._o_projs.append(nn.Linear(D, D, bias=False))
@@ -223,6 +229,25 @@ class TransformerRSSM(nn.Module):
                                                     dtype=torch.long))
         return x_t.transpose(1, 2)
 
+    def _split_query_and_gate(self, q_proj_out, batch, length):
+        """Split q_proj output into query and optional headwise gate logits."""
+        H = self._n_heads
+        D_head = self._d_head
+        if self._attn_output_gate == "none":
+            query = q_proj_out.reshape(batch, length, H, D_head).transpose(1, 2)
+            return query, None
+        query, gate = torch.split(q_proj_out, [H * D_head, H], dim=-1)
+        query = query.reshape(batch, length, H, D_head).transpose(1, 2)
+        gate = gate.reshape(batch, length, H, 1)
+        return query, gate
+
+    def _apply_attn_output_gate(self, attn_out, gate):
+        """Apply query-dependent headwise gate to SDPA output."""
+        if gate is None:
+            return attn_out
+        gate = torch.sigmoid(gate).transpose(1, 2).to(dtype=attn_out.dtype)
+        return attn_out * gate
+
     def _fwd_segment_with_carry(self, x, carry, positions, reset):
         """Forward a segment against detached sliding-window memory."""
         B, T, D = x.shape
@@ -260,10 +285,13 @@ class TransformerRSSM(nn.Module):
         new_cache_layers = []
         for i in range(self._n_layers):
             res = x
-            x = self._attn_norms[i](x)
-            Q = self._q_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            K_cur = self._k_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
-            V_cur = self._v_projs[i](x).reshape(B, T, H, D_head).transpose(1, 2)
+            x_norm = self._attn_norms[i](x)
+            q_proj_out = self._q_projs[i](x_norm)
+            Q, gate = self._split_query_and_gate(q_proj_out, B, T)
+            K_cur = self._k_projs[i](x_norm).reshape(B, T, H,
+                                                     D_head).transpose(1, 2)
+            V_cur = self._v_projs[i](x_norm).reshape(B, T, H,
+                                                     D_head).transpose(1, 2)
             Q = self._apply_rope(Q, positions=positions)
             K_cur = self._apply_rope(K_cur, positions=positions)
 
@@ -279,11 +307,12 @@ class TransformerRSSM(nn.Module):
             K_all = k_all.reshape(B, C + T, H, D_head).transpose(1, 2)
             V_all = v_all.reshape(B, C + T, H, D_head).transpose(1, 2)
 
-            x = F.scaled_dot_product_attention(Q,
-                                               K_all,
-                                               V_all,
-                                               attn_mask=attn_mask)
-            x = x.transpose(1, 2).reshape(B, T, D)
+            attn_out = F.scaled_dot_product_attention(Q,
+                                                      K_all,
+                                                      V_all,
+                                                      attn_mask=attn_mask)
+            attn_out = self._apply_attn_output_gate(attn_out, gate)
+            x = attn_out.transpose(1, 2).reshape(B, T, D)
             x = res + self._o_projs[i](x)
 
             res = x
@@ -540,15 +569,15 @@ class TransformerRSSM(nn.Module):
         new_kv_cache_layers = []
         for i in range(self._n_layers):
             res = x_t
-            x_t = self._attn_norms[i](x_t)
+            x_norm = self._attn_norms[i](x_t)
 
             # Project Q, K_new, V_new
-            Q = self._q_projs[i](x_t).reshape(B, 1, H, D_head).transpose(
-                1, 2)  # (B, H, 1, D_head)
-            K_new = self._k_projs[i](x_t).reshape(B, 1, H,
-                                                  D_head).transpose(1, 2)
-            V_new = self._v_projs[i](x_t).reshape(B, 1, H,
-                                                  D_head).transpose(1, 2)
+            q_proj_out = self._q_projs[i](x_norm)
+            Q, gate = self._split_query_and_gate(q_proj_out, B, 1)
+            K_new = self._k_projs[i](x_norm).reshape(B, 1, H,
+                                                     D_head).transpose(1, 2)
+            V_new = self._v_projs[i](x_norm).reshape(B, 1, H,
+                                                     D_head).transpose(1, 2)
 
             # Apply RoPE at current position
             Q = self._apply_rope(Q, ts)
@@ -575,11 +604,12 @@ class TransformerRSSM(nn.Module):
             V_cached = v_all.reshape(B, M + 1, H, D_head).transpose(1, 2)
 
             # Cross-attend Q to cached K/V
-            x_t = F.scaled_dot_product_attention(Q,
-                                                 K_cached,
-                                                 V_cached,
-                                                 attn_mask=attn_mask)
-            x_t = x_t.transpose(1, 2).reshape(B, 1, D)
+            attn_out = F.scaled_dot_product_attention(Q,
+                                                      K_cached,
+                                                      V_cached,
+                                                      attn_mask=attn_mask)
+            attn_out = self._apply_attn_output_gate(attn_out, gate)
+            x_t = attn_out.transpose(1, 2).reshape(B, 1, D)
             x_t = res + self._o_projs[i](x_t)
 
             # FFN sublayer
