@@ -15,9 +15,7 @@ ac_accum_steps: 1      # split imagination starts for actor-critic grad accumula
 lr: 4e-5
 agc: 0.3
 pmin: 1e-3
-eps: 1e-20
-beta1: 0.9
-beta2: 0.999
+weight_decay: 1e-2
 warmup: 1000
 slow_target_update: 1
 slow_target_fraction: 0.02

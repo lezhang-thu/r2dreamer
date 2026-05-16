@@ -5,13 +5,14 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 import networks
 import rssm
 import tools
 from networks import Projector
-from optim import LaProp, clip_grad_agc_
+from optim import clip_grad_agc_
 from tools import to_f32
 
 
@@ -114,11 +115,25 @@ class Dreamer(nn.Module):
                            foreach=True)
 
         self._agc = _agc
-        self._optimizer = LaProp(
-            self._named_params.values(),
-            lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
+        decay_params = []
+        no_decay_params = []
+        for _, param in self._named_params.items():
+            if param.ndim >= 2:
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+        self._optimizer = AdamW(
+            [
+                {
+                    "params": decay_params,
+                    "weight_decay": float(config.weight_decay),
+                },
+                {
+                    "params": no_decay_params,
+                    "weight_decay": 0.0,
+                },
+            ],
+            lr=float(config.lr),
         )
         self._scaler = GradScaler()
 
