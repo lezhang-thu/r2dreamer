@@ -217,20 +217,22 @@ class ReplayY:
 
             offset = int(stream["offset"])
             position = int(stream["position"])
+            effective_position = position
             step = self._step_at(episode, offset)
             if "is_first" in step:
                 force_is_first = position == 0
                 if (not force_is_first and stream["source"] == "expert" and
                         not positions and self.rng.random() < 0.5):
                     force_is_first = True
+                    effective_position = 0
                 if force_is_first:
                     step["is_first"] = np.asarray(True,
                                                   dtype=step["is_first"].dtype)
             items.append(step)
-            positions.append(position)
+            positions.append(effective_position)
 
             stream["offset"] = offset + 1
-            stream["position"] = position + 1
+            stream["position"] = effective_position + 1
             is_last = bool(step.get("is_last", False))
             if is_last or stream["offset"] >= self._episode_length(episode):
                 self._replace_exhausted_stream(stream, replay_episodes)
