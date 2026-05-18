@@ -308,18 +308,10 @@ class Dreamer(nn.Module):
     @staticmethod
     def _barlow_loss(x1, x2, lambd, eps=1e-8):
         """Compute Barlow Twins loss over a dense segment batch."""
-        count = torch.tensor(x1.shape[0], dtype=x1.dtype, device=x1.device)
-        x1_mean = x1.sum(0) / count
-        x2_mean = x2.sum(0) / count
-        x1_centered = x1 - x1_mean
-        x2_centered = x2 - x2_mean
+        x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + eps)
+        x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + eps)
 
-        x1_var = x1_centered.pow(2).sum(0) / count
-        x2_var = x2_centered.pow(2).sum(0) / count
-        x1_norm = x1_centered / torch.sqrt(x1_var + eps)
-        x2_norm = x2_centered / torch.sqrt(x2_var + eps)
-
-        c = torch.mm(x1_norm.T, x2_norm) / count
+        c = torch.mm(x1_norm.T, x2_norm) / x1.shape[0]
         invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
         off_diag_mask = ~torch.eye(
             c.shape[0], dtype=torch.bool, device=c.device)

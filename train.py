@@ -93,7 +93,7 @@ def main(config):
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
-    expert_path = pathlib.Path(__file__).with_name("ge-14600.json")
+    expert_path = pathlib.Path(__file__).with_name("ge.json")
     expert = None
     if expert_path.exists():
         print(f"Load expert trajectory from {expert_path}.")

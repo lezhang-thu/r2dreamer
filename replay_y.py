@@ -218,9 +218,14 @@ class ReplayY:
             offset = int(stream["offset"])
             position = int(stream["position"])
             step = self._step_at(episode, offset)
-            if position == 0 and "is_first" in step:
-                step["is_first"] = np.asarray(True,
-                                              dtype=step["is_first"].dtype)
+            if "is_first" in step:
+                force_is_first = position == 0
+                if (not force_is_first and stream["source"] == "expert" and
+                        not positions and self.rng.random() < 0.5):
+                    force_is_first = True
+                if force_is_first:
+                    step["is_first"] = np.asarray(True,
+                                                  dtype=step["is_first"].dtype)
             items.append(step)
             positions.append(position)
 
