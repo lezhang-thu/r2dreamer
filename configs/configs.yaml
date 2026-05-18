@@ -25,7 +25,7 @@ buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   max_size: 5e5
-  expert_sample_frac: 0.5  # Probability that a newly chosen stream is expert.
+  expert_sample_frac: 0.01  # Replay stream probability for expert data.
   device: ${device}
   storage_device: 'cuda:0'
 

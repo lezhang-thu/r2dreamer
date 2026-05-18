@@ -133,6 +133,8 @@ def main(config):
         config.model,
         obs_space,
         act_space,
+        expert=expert,
+        expert_ac_batch_size=int(config.batch_size),
     ).to(config.device)
     if config.agent_load_path is not None:
         agent_load_path = resolve_config_path(config.agent_load_path)
