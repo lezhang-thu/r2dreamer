@@ -379,6 +379,24 @@ class Dreamer(nn.Module):
             end = min(start + chunk, K)
             yield starts[:, start:end], float(end - start) / float(K)
 
+    @staticmethod
+    def _ensure_value_seq(tensor):
+        tensor = to_f32(tensor)
+        if tensor.ndim == 2:
+            return tensor.unsqueeze(-1)
+        if tensor.ndim == 3 and int(tensor.shape[-1]) == 1:
+            return tensor
+        raise AssertionError(
+            f"Expected a (B,T) or (B,T,1) value sequence, got {tuple(tensor.shape)}."
+        )
+
+    @staticmethod
+    def _gather_time(tensor, starts):
+        """Gather per-batch time indices from a (B,T,...) tensor."""
+        index = starts.reshape(*starts.shape, *([1] * (tensor.ndim - 2)))
+        index = index.expand(*starts.shape, *tensor.shape[2:])
+        return tensor.gather(1, index)
+
     def _expert_window(self, start, end):
         data = {
             key: value[start:end].unsqueeze(0)
@@ -546,6 +564,8 @@ class Dreamer(nn.Module):
                 None if positions is None else positions.detach(),
             "T":
                 T,
+            "feat":
+                feat,
         }
         return losses, metrics, imag_source, feat_dict["next_carry"]
 
@@ -602,7 +622,39 @@ class Dreamer(nn.Module):
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
-        return losses, metrics
+        return losses, metrics, ret[:, 0].detach()
+
+    def _replay_value_forward(self, data, feat, starts, boot):
+        """Replay value loss over contiguous imagined replay starts."""
+        if int(starts.shape[1]) < 2:
+            zero = feat.sum() * 0.0
+            return zero, {}
+
+        last = self._gather_time(self._ensure_value_seq(data["is_last"]),
+                                 starts)
+        term = self._gather_time(self._ensure_value_seq(data["is_terminal"]),
+                                 starts)
+        reward = self._gather_time(self._ensure_value_seq(data["reward"]),
+                                   starts)
+        feat = self._gather_time(feat, starts)
+
+        value = self._frozen_value(feat).mode()
+        slow_value = self._frozen_slow_value(feat).mode()
+        disc = 1 - 1 / self.horizon
+        ret = self._lambda_return(last, term, reward, value, boot, disc,
+                                  self.lamb)
+        ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+
+        value_dist = self.value(feat)
+        value_loss = (
+            (1.0 - last[:, :-1]) *
+            (-value_dist.log_prob(ret_padded.detach()) -
+             value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1))
+        metrics = {}
+        metrics.update(tools.tensorstats(ret, "ret_replay"))
+        metrics.update(tools.tensorstats(value, "value_replay"))
+        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
+        return value_loss.mean(), metrics
 
     def _cal_grad(self, data, train_carry):
         """Compute one joint world-model and actor-critic optimization graph."""
@@ -640,17 +692,11 @@ class Dreamer(nn.Module):
                     wm_data, carry_chunk)
             next_carries.append(self._detach_carry(next_carry))
 
-            world_model_loss = sum(self._loss_scales[name] * value
-                                   for name, value in wm_losses.items())
-            self._scaler.scale(world_model_loss * wm_batch_weight).backward()
-            opt_loss = opt_loss + world_model_loss.detach() * wm_batch_weight
-            _accum(losses, wm_losses, wm_batch_weight)
-            _accum(metrics, wm_metrics, wm_batch_weight)
-
             starts = self._sample_transformer_imag_starts(
                 imag_source["valid_lens"],)
             ac_losses = {}
             ac_metrics = {}
+            replay_boots = []
             for start_chunk, s_weight in self._iter_start_chunks(
                     starts, self.ac_accum_steps):
                 s_weight = torch.tensor(s_weight,
@@ -666,20 +712,39 @@ class Dreamer(nn.Module):
                 )
                 with autocast(device_type=self.device.type,
                               dtype=torch.float16):
-                    chunk_losses, chunk_metrics = self._actor_critic_forward(
+                    chunk_losses, chunk_metrics, chunk_boot = self._actor_critic_forward(
                         s_stoch, s_deter, s_carry)
                     ac_total = (
                         self._loss_scales["policy"] * chunk_losses["policy"] +
                         self._loss_scales["value"] * chunk_losses["value"])
+                replay_boots.append(
+                    chunk_boot.reshape(wm_data.shape[0],
+                                       start_chunk.shape[1],
+                                       -1).detach())
                 grad_weight = wm_batch_weight * s_weight
                 self._scaler.scale(ac_total * grad_weight).backward()
                 opt_loss = opt_loss + ac_total.detach() * grad_weight
                 _accum(ac_losses, chunk_losses, s_weight)
                 _accum(ac_metrics, chunk_metrics, s_weight)
                 del s_stoch, s_deter, s_carry, chunk_losses, chunk_metrics
-                del ac_total
+                del chunk_boot, ac_total
             _accum(losses, ac_losses, wm_batch_weight)
             _accum(metrics, ac_metrics, wm_batch_weight)
+
+            if replay_boots:
+                replay_boot = torch.cat(replay_boots, dim=1)
+                with autocast(device_type=self.device.type,
+                              dtype=torch.float16):
+                    wm_losses["repval"], repval_metrics = self._replay_value_forward(
+                        wm_data, imag_source["feat"], starts, replay_boot)
+                wm_metrics.update(repval_metrics)
+
+            world_model_loss = sum(self._loss_scales[name] * value
+                                   for name, value in wm_losses.items())
+            self._scaler.scale(world_model_loss * wm_batch_weight).backward()
+            opt_loss = opt_loss + world_model_loss.detach() * wm_batch_weight
+            _accum(losses, wm_losses, wm_batch_weight)
+            _accum(metrics, wm_metrics, wm_batch_weight)
 
         expert_source = self._expert_forward_episode()
         expert_starts = (None if expert_source is None else
@@ -697,7 +762,7 @@ class Dreamer(nn.Module):
                     expert_source, start_chunk)
                 with autocast(device_type=self.device.type,
                               dtype=torch.float16):
-                    chunk_losses, chunk_metrics = self._actor_critic_forward(
+                    chunk_losses, chunk_metrics, _ = self._actor_critic_forward(
                         s_stoch, s_deter, s_carry)
                     expert_total = (
                         self._loss_scales["policy"] * chunk_losses["policy"] +
