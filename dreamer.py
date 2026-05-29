@@ -301,17 +301,6 @@ class Dreamer(nn.Module):
         redundancy_loss = c[off_diag_mask].pow(2).sum()
         return invariance_loss + lambd * redundancy_loss
 
-    @staticmethod
-    def _ensure_value_seq(tensor):
-        tensor = to_f32(tensor)
-        if tensor.ndim == 2:
-            return tensor.unsqueeze(-1)
-        if tensor.ndim == 3 and int(tensor.shape[-1]) == 1:
-            return tensor
-        raise AssertionError(
-            f"Expected a (B,T) or (B,T,1) value sequence, got {tuple(tensor.shape)}."
-        )
-
     def _world_model_forward(self, data, memory_carry):
         """World-model losses and detached cache for imagination updates."""
         positions = data["position"] if "position" in data.keys() else None
@@ -422,35 +411,7 @@ class Dreamer(nn.Module):
         metrics["weight"] = torch.mean(weight)
         metrics["action_entropy"] = torch.mean(entropy)
         metrics.update(tools.tensorstats(imag_action, "action"))
-        return losses, metrics, ret[:, 0].detach()
-
-    def _replay_value_forward(self, data, feat, boot):
-        """Replay value loss over the full replay segment."""
-        if int(boot.shape[1]) < 2:
-            zero = feat.sum() * 0.0
-            return zero, {}
-
-        last = self._ensure_value_seq(data["is_last"])
-        term = self._ensure_value_seq(data["is_terminal"])
-        reward = self._ensure_value_seq(data["reward"])
-
-        value = self._frozen_value(feat).mode()
-        slow_value = self._frozen_slow_value(feat).mode()
-        disc = 1 - 1 / self.horizon
-        ret = self._lambda_return(last, term, reward, value, boot, disc,
-                                  self.lamb)
-        ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
-
-        value_dist = self.value(feat)
-        value_loss = (
-            (1.0 - last[:, :-1]) *
-            (-value_dist.log_prob(ret_padded.detach()) -
-             value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1))
-        metrics = {}
-        metrics.update(tools.tensorstats(ret, "ret_replay"))
-        metrics.update(tools.tensorstats(value, "value_replay"))
-        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
-        return value_loss.mean(), metrics
+        return losses, metrics
 
     def _loss_forward(self, data, train_carry):
         """Compute the joint world-model and actor-critic forward loss."""
@@ -461,7 +422,6 @@ class Dreamer(nn.Module):
             wm_losses, wm_metrics, imag_source, next_carry = self._world_model_forward(
                 data, train_carry)
 
-        B, T = data.shape
         s_stoch, s_deter, s_carry = self._frozen_rssm.build_imag_starts(
             imag_source["post_stoch"],
             imag_source["post_deter"],
@@ -470,18 +430,12 @@ class Dreamer(nn.Module):
             positions=imag_source["positions"],
         )
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            ac_losses, ac_metrics, replay_boot = self._actor_critic_forward(
+            ac_losses, ac_metrics = self._actor_critic_forward(
                 s_stoch, s_deter, s_carry)
             ac_total = (self._loss_scales["policy"] * ac_losses["policy"] +
                         self._loss_scales["value"] * ac_losses["value"])
         losses.update(ac_losses)
         metrics.update(ac_metrics)
-
-        replay_boot = replay_boot.reshape(B, T, -1).detach()
-        with autocast(device_type=self.device.type, dtype=torch.float16):
-            wm_losses["repval"], repval_metrics = self._replay_value_forward(
-                data, imag_source["feat"], replay_boot)
-        wm_metrics.update(repval_metrics)
 
         world_model_loss = sum(self._loss_scales[name] * value
                                for name, value in wm_losses.items())
