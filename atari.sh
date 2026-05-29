@@ -12,7 +12,7 @@ METHOD=r2dreamer
 # ==== Tasks ====
 tasks=(
 	#    "atari_alien"
-	    "atari_amidar"
+	#    "atari_amidar"
 	#    "atari_assault"
 	#    "atari_asterix"
 	#    "atari_bank_heist"
@@ -24,7 +24,7 @@ tasks=(
 	#    "atari_demon_attack"
 	#    "atari_freeway"
 	#    "atari_frostbite"
-	#    "atari_gopher"
+	    "atari_gopher"
 	#    "atari_hero"
 	#    "atari_jamesbond"
 	#    "atari_kangaroo"

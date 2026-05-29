@@ -126,8 +126,7 @@ class OnlineTrainer:
 
         while step < self.steps:
             # Evaluation
-            # if self._should_eval(step) and self.eval_episode_num > 0:
-            if False:
+            if self._should_eval(step) and self.eval_episode_num > 0:
                 self.eval(agent, step)
             # Save metrics
             if done.any():
