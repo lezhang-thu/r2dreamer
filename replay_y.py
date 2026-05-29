@@ -5,29 +5,18 @@ import numpy as np
 
 class ReplayY:
 
-    def __init__(self,
-                 length,
-                 capacity=1000,
-                 seed=0,
-                 expert=None,
-                 expert_sample_frac=0.0):
+    def __init__(self, length, capacity=1000, seed=0):
         self.length = int(length)
         if self.length < 1:
             raise ValueError(f"length must be >= 1, got {self.length}.")
         self.capacity = int(capacity)
         self.rng = np.random.default_rng(seed)
-        self.expert_sample_frac = float(expert_sample_frac)
-        if not 0.0 <= self.expert_sample_frac <= 1.0:
-            raise ValueError("expert_sample_frac must be in [0, 1], got "
-                             f"{self.expert_sample_frac}.")
 
         # Cyclic list of complete episodes; each slot is None or a dict of
         # arrays with shape (ep_len, *field_shape).
         self.eps = [None] * self.capacity
         self.write_pos = 0
         self.num_eps = 0  # episodes stored so far (capped at capacity)
-        self.expert = self._sanitize_episode(
-            expert) if expert is not None else None
 
         # Per-worker buffers accumulate steps until episode end.
         self.local = {}
@@ -36,8 +25,7 @@ class ReplayY:
         self.lock = threading.Lock()
 
     def __len__(self):
-        return sum(1 for ep in self.eps if ep is not None) + int(
-            self.expert is not None)
+        return sum(1 for ep in self.eps if ep is not None)
 
     @staticmethod
     def _copy_episode(episode):
@@ -46,13 +34,13 @@ class ReplayY:
         return {k: np.array(v, copy=True) for k, v in episode.items()}
 
     def state_dict(self):
-        """Return a serializable ReplayY state without expert data."""
+        """Return a serializable ReplayY state."""
         with self.lock:
             eps = [self._copy_episode(ep) for ep in self.eps]
         return {"eps": eps}
 
     def load_state_dict(self, state_dict):
-        """Load completed replay episodes, leaving self.expert untouched."""
+        """Load completed replay episodes."""
         if isinstance(state_dict, dict):
             if "eps" not in state_dict:
                 raise KeyError("ReplayY state_dict must contain an 'eps' key.")
@@ -112,8 +100,6 @@ class ReplayY:
         with self.lock:
             valid = [ep for ep in self.eps if ep is not None]
         total = sum(self._episode_segment_count(ep) for ep in valid)
-        if self.expert is not None:
-            total += self._episode_segment_count(self.expert)
         return int(total)
 
     def can_sample(self, batch):
@@ -123,10 +109,7 @@ class ReplayY:
             return False
         with self.lock:
             has_replay = any(ep is not None for ep in self.eps)
-        has_expert = self.expert is not None
-        if has_replay:
-            return True
-        return has_expert and self.expert_sample_frac >= 1.0
+        return has_replay
 
     def add(self, step, worker=0):
         step = {k: v for k, v in step.items() if not k.startswith('log_')}
@@ -155,40 +138,18 @@ class ReplayY:
                                "empty source.")
         return episodes[int(self.rng.integers(0, len(episodes)))]
 
-    def _new_stream(self, source, replay_episodes):
-        if source == "expert":
-            if self.expert is None:
-                raise RuntimeError("ReplayY requested an expert stream without "
-                                   "an expert episode.")
-            episode = self.expert
-        else:
-            episode = self._sample_episode(replay_episodes)
+    def _new_stream(self, replay_episodes):
+        episode = self._sample_episode(replay_episodes)
         offset_limit = min(self.length, self._episode_length(episode))
         offset = int(self.rng.integers(0, offset_limit))
         return {
-            "source": source,
             "episode": episode,
             "offset": offset,
             "position": 0,
         }
 
-    def _choose_source(self, replay_episodes):
-        has_replay = bool(replay_episodes)
-        has_expert = self.expert is not None and self.expert_sample_frac > 0.0
-        if has_replay and has_expert:
-            return ("expert" if self.rng.random() < self.expert_sample_frac else
-                    "replay")
-        if has_expert and self.expert_sample_frac >= 1.0:
-            return "expert"
-        if has_replay:
-            return "replay"
-        raise RuntimeError(
-            "ReplayY.sample() requested a stream before replay or expert data "
-            "were available.")
-
     def _new_sampled_stream(self, replay_episodes):
-        return self._new_stream(self._choose_source(replay_episodes),
-                                replay_episodes)
+        return self._new_stream(replay_episodes)
 
     def _ensure_streams(self, batch, replay_episodes):
         if len(self.streams) > batch:
@@ -221,10 +182,6 @@ class ReplayY:
             step = self._step_at(episode, offset)
             if "is_first" in step:
                 force_is_first = position == 0
-                #if (not force_is_first and stream["source"] == "expert" and
-                #        not positions and self.rng.random() < 0.5):
-                #    force_is_first = True
-                #    effective_position = 0
                 if force_is_first:
                     step["is_first"] = np.asarray(True,
                                                   dtype=step["is_first"].dtype)

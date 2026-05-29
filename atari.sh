@@ -12,7 +12,7 @@ METHOD=r2dreamer
 # ==== Tasks ====
 tasks=(
 	#    "atari_alien"
-	#    "atari_amidar"
+	    "atari_amidar"
 	#    "atari_assault"
 	#    "atari_asterix"
 	#    "atari_bank_heist"
@@ -37,7 +37,7 @@ tasks=(
 	#    "atari_road_runner"
 	#    "atari_seaquest"
 	#    "atari_up_n_down"
-	"atari_montezuma_revenge"
+	#"atari_montezuma_revenge"
 )
 
 # ==== Loop ====

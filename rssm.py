@@ -334,9 +334,8 @@ class TransformerRSSM(nn.Module):
                           deter_seq,
                           kv_k,
                           kv_v,
-                          starts,
                           positions=None):
-        """Build imagination starts from trajectory KV tensors.
+        """Build one imagination start for every trajectory position.
 
         Args:
             stoch_seq: (B, T, S, Kcat)
@@ -345,56 +344,46 @@ class TransformerRSSM(nn.Module):
                 current-segment keys.
             kv_v: (B, L, M+T, D) cached values with M memory slots followed by
                 current-segment values.
-            starts: (B, K) integer start indices, all valid per episode
-            positions: Optional (B, T) absolute episode positions for starts.
+            positions: Optional (B, T) absolute episode positions.
         Returns:
-            start_stoch: (B*K, S, Kcat)
-            start_deter: (B*K, D)
-            carry: dict with kv_cache (B*K,L,2,M,D), pos, h_prev
+            start_stoch: (B*T, S, Kcat)
+            start_deter: (B*T, D)
+            carry: dict with kv_cache (B*T,L,2,M,D), pos, h_prev
         """
         B, T = stoch_seq.shape[:2]
         L = kv_k.shape[1]
         M = self._memory_size
-        starts = starts.to(device=stoch_seq.device, dtype=torch.long)
-        assert starts.ndim == 2 and starts.shape[0] == B
         assert kv_k.shape == (B, L, M + T, self._deter)
         assert kv_v.shape == (B, L, M + T, self._deter)
         if positions is not None:
             assert positions.shape == (B, T)
-        assert torch.all(starts >= 0)
-        assert torch.all(starts < T)
 
-        K = starts.shape[1]
         D = self._deter
-        batch_index = torch.arange(B, device=stoch_seq.device)[:, None]
         offsets = torch.arange(M, device=stoch_seq.device)
 
-        start_stoch = stoch_seq[batch_index, starts]  # (B, K, S, Kcat)
-        start_deter = deter_seq[batch_index, starts]  # (B, K, D)
         if positions is None:
-            start_pos = starts
+            start_pos = torch.arange(T, device=stoch_seq.device).expand(B, T)
         else:
-            start_pos = positions.to(device=stoch_seq.device,
-                                     dtype=torch.long)[batch_index, starts]
+            start_pos = positions.to(device=stoch_seq.device, dtype=torch.long)
 
         cache_list = []
-        for k in range(K):
-            s = starts[:, k]  # (B,)
+        for start in range(T):
             if M == 0:
                 cache_list.append(kv_k.new_zeros(B, L, 2, 0, D))
                 continue
-            # Gather the previous M tokens immediately before start s. Times in
-            # [-M, -1] address detached memory; times [0, s-1] address current
-            # segment tokens. Positions, when available, hide keys from a
-            # previous episode after a boundary inside a streamed segment.
-            left_time = s[:, None] - M + offsets[None, :]
-            gather_time = left_time + M
-            valid_time = gather_time >= 0
+            # Gather the previous M tokens immediately before this start.
+            # Indices [0, M) address detached memory; [M, M+T) address the
+            # current segment. Positions hide tokens from a previous episode
+            # after a boundary inside a streamed segment.
+            gather_time = start + offsets
+            valid_time = torch.ones(B,
+                                    M,
+                                    dtype=torch.bool,
+                                    device=stoch_seq.device)
             if positions is not None:
-                left_pos = start_pos[:, k:k + 1] - M + offsets[None, :]
-                valid_time = valid_time & (left_pos >= 0)
-            gather_time = torch.clamp(gather_time, min=0, max=M + T - 1)
-            gather_index = gather_time[:, None, :, None].expand(B, L, M, D)
+                left_pos = start_pos[:, start:start + 1] - M + offsets[None, :]
+                valid_time = left_pos >= 0
+            gather_index = gather_time[None, None, :, None].expand(B, L, M, D)
             k_slice = kv_k.gather(2, gather_index)  # (B, L, M, D)
             v_slice = kv_v.gather(2, gather_index)  # (B, L, M, D)
             valid_time = valid_time[:, None, :, None].to(k_slice.dtype)
@@ -402,12 +391,12 @@ class TransformerRSSM(nn.Module):
             v_slice = v_slice * valid_time
             cache_list.append(torch.stack([k_slice, v_slice], dim=2))
 
-        kv_cache = torch.stack(cache_list, dim=1)  # (B, K, L, 2, M, D)
-        start_stoch = start_stoch.reshape(B * K, *stoch_seq.shape[2:])
-        start_deter = start_deter.reshape(B * K, deter_seq.shape[-1])
+        kv_cache = torch.stack(cache_list, dim=1)  # (B, T, L, 2, M, D)
+        start_stoch = stoch_seq.reshape(B * T, *stoch_seq.shape[2:])
+        start_deter = deter_seq.reshape(B * T, deter_seq.shape[-1])
         carry = {
-            'kv_cache': kv_cache.reshape(B * K, L, 2, M, D),
-            'pos': start_pos.reshape(B * K).to(torch.int32),
+            'kv_cache': kv_cache.reshape(B * T, L, 2, M, D),
+            'pos': start_pos.reshape(B * T).to(torch.int32),
             'h_prev': start_deter,
         }
         return start_stoch, start_deter, carry

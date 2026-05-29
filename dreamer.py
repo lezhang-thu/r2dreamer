@@ -17,12 +17,7 @@ from tools import to_f32
 
 class Dreamer(nn.Module):
 
-    def __init__(self,
-                 config,
-                 obs_space,
-                 act_space,
-                 expert=None,
-                 expert_ac_batch_size=16):
+    def __init__(self, config, obs_space, act_space):
         super().__init__()
         self.device = torch.device(config.device)
         self.act_entropy = float(config.act_entropy)
@@ -36,14 +31,6 @@ class Dreamer(nn.Module):
         if str(config.rep_loss) != "r2dreamer":
             raise AssertionError("config.rep_loss must be 'r2dreamer' "
                                  f"(got {str(config.rep_loss)!r}).")
-        self.imag_last = int(getattr(config, 'imag_last', 0))
-        self.wm_accum_steps = max(1, int(getattr(config, "wm_accum_steps", 1)))
-        self.ac_accum_steps = max(1, int(getattr(config, "ac_accum_steps", 1)))
-        self.memory_size = int(getattr(config.transformer, "memory_size", 0))
-        self.segment_length = int(
-            getattr(config.transformer, "segment_length", self.memory_size))
-        self.expert_ac_batch_size = max(0, int(expert_ac_batch_size))
-        self._expert_episode = self._to_expert_tensordict(expert)
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -141,11 +128,9 @@ class Dreamer(nn.Module):
         self.train()
         self.clone_and_freeze()
         if config.compile:
-            print("Compiling forward loss functions with torch.compile...")
-            self._world_model_forward = torch.compile(self._world_model_forward,
-                                                      mode="default")
-            self._actor_critic_forward = torch.compile(
-                self._actor_critic_forward, mode="default")
+            print("Compiling forward loss function with torch.compile...")
+            self._loss_forward = torch.compile(self._loss_forward,
+                                               mode="default")
 
     def _update_slow_target(self):
         """Update slow-moving value target network."""
@@ -185,17 +170,6 @@ class Dreamer(nn.Module):
                             f"_{name}" if name == "slow_value" else name)))
 
     @staticmethod
-    def _slice_carry(carry, start, end):
-        return {k: v[start:end] for k, v in carry.items()}
-
-    @staticmethod
-    def _cat_carries(carries):
-        return {
-            key: torch.cat([carry[key] for carry in carries], dim=0)
-            for key in carries[0]
-        }
-
-    @staticmethod
     def _detach_carry(carry):
         return {k: v.detach() for k, v in carry.items()}
 
@@ -210,34 +184,6 @@ class Dreamer(nn.Module):
         # Re-establish shared frozen weights after moving the model to a new device
         self.clone_and_freeze()
         return self
-
-    def _to_expert_tensordict(self, expert):
-        if expert is None:
-            return None
-        tensors = {}
-        lengths = set()
-        for key, value in expert.items():
-            if str(key).startswith("log_"):
-                continue
-            tensor = torch.as_tensor(value)
-            if tensor.ndim < 1:
-                raise ValueError(
-                    f"Expert field {key!r} must have a leading time dimension.")
-            lengths.add(int(tensor.shape[0]))
-            tensor = tensor.to(self.device)
-            tensors[key] = tensor
-        if not tensors:
-            raise ValueError("Expert episode cannot be empty.")
-        if len(lengths) != 1:
-            raise ValueError("Expert episode fields must share the same "
-                             f"leading length, got {sorted(lengths)}.")
-        length = next(iter(lengths))
-        if length <= 0:
-            raise ValueError("Expert episode length must be positive.")
-        for key in ("action", "is_first"):
-            if key not in tensors:
-                raise KeyError(f"Expert episode must contain {key!r}.")
-        return TensorDict(tensors, batch_size=(length,))
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
@@ -355,30 +301,6 @@ class Dreamer(nn.Module):
         redundancy_loss = c[off_diag_mask].pow(2).sum()
         return invariance_loss + lambd * redundancy_loss
 
-    def _iter_batch_chunks(self, data, accum_steps):
-        """Yield replay batch chunks, slice bounds, and batch-fraction weights."""
-        B = data.shape[0]
-        splits = min(max(1, int(accum_steps)), int(B))
-        if splits <= 1:
-            yield 0, B, data, 1.0
-            return
-        chunk = (B + splits - 1) // splits
-        for start in range(0, B, chunk):
-            end = min(start + chunk, B)
-            yield start, end, data[start:end], float(end - start) / float(B)
-
-    def _iter_start_chunks(self, starts, accum_steps):
-        """Yield sampled imagination-start index chunks and their weights."""
-        K = int(starts.shape[1])
-        splits = min(max(1, int(accum_steps)), max(1, K))
-        if splits <= 1:
-            yield starts, 1.0
-            return
-        chunk = (K + splits - 1) // splits
-        for start in range(0, K, chunk):
-            end = min(start + chunk, K)
-            yield starts[:, start:end], float(end - start) / float(K)
-
     @staticmethod
     def _ensure_value_seq(tensor):
         tensor = to_f32(tensor)
@@ -389,118 +311,6 @@ class Dreamer(nn.Module):
         raise AssertionError(
             f"Expected a (B,T) or (B,T,1) value sequence, got {tuple(tensor.shape)}."
         )
-
-    @staticmethod
-    def _gather_time(tensor, starts):
-        """Gather per-batch time indices from a (B,T,...) tensor."""
-        index = starts.reshape(*starts.shape, *([1] * (tensor.ndim - 2)))
-        index = index.expand(*starts.shape, *tensor.shape[2:])
-        return tensor.gather(1, index)
-
-    def _expert_window(self, start, end):
-        data = {
-            key: value[start:end].unsqueeze(0)
-            for key, value in self._expert_episode.items()
-        }
-        data["position"] = torch.arange(start,
-                                        end,
-                                        dtype=torch.long,
-                                        device=self.device).unsqueeze(0)
-        return TensorDict(data, batch_size=(1, int(end - start)))
-
-    @torch.no_grad()
-    def _expert_forward_episode(self):
-        """Run a no-grad Transformer-XL scan over the full expert episode."""
-        if self._expert_episode is None:
-            return None
-        episode_len = int(self._expert_episode.batch_size[0])
-        if episode_len <= 0:
-            return None
-
-        window = max(1, int(self.segment_length))
-        carry = self.rssm.initial_memory(1)
-        post_stoch = []
-        post_deter = []
-        kv_k = []
-        kv_v = []
-        positions = []
-
-        for start in range(0, episode_len, window):
-            end = min(start + window, episode_len)
-            data = self.preprocess(self._expert_window(start, end))
-            with autocast(device_type=self.device.type, dtype=torch.float16):
-                embed = self.encoder(data)
-                _, feat = self.rssm.observe(embed,
-                                            data["action"],
-                                            data["is_first"],
-                                            positions=data["position"],
-                                            memory_carry=carry)
-            carry = self._detach_carry(feat["next_carry"])
-            post_stoch.append(feat["stoch"].detach().squeeze(0))
-            post_deter.append(feat["deter"].detach().squeeze(0))
-            kv_k.append(feat["kv_k"].detach()[0, :, self.memory_size:, :])
-            kv_v.append(feat["kv_v"].detach()[0, :, self.memory_size:, :])
-            positions.append(data["position"].detach().squeeze(0))
-
-        return {
-            "post_stoch": torch.cat(post_stoch, dim=0),
-            "post_deter": torch.cat(post_deter, dim=0),
-            "kv_k": torch.cat(kv_k, dim=1),
-            "kv_v": torch.cat(kv_v, dim=1),
-            "positions": torch.cat(positions, dim=0),
-            "length": episode_len,
-        }
-
-    @torch.no_grad()
-    def _sample_expert_ac_starts(self, episode_len):
-        if self.expert_ac_batch_size <= 0 or episode_len <= 0:
-            return None
-        segment_len = min(max(1, int(self.segment_length)), int(episode_len))
-        max_start = max(0, int(episode_len) - segment_len)
-        bases = torch.randint(0,
-                              max_start + 1, (self.expert_ac_batch_size,),
-                              device=self.device)
-        offsets = torch.arange(segment_len, device=self.device)
-        return bases[:, None] + offsets[None, :]
-
-    @torch.no_grad()
-    def _prepare_expert_imag_start(self, expert_source, starts):
-        """Prepare imagination starts from a full-episode expert KV scan."""
-        starts = starts.to(device=self.device, dtype=torch.long)
-        flat_starts = starts.reshape(-1)
-        post_stoch = expert_source["post_stoch"][flat_starts]
-        post_deter = expert_source["post_deter"][flat_starts]
-        kv_k = expert_source["kv_k"]
-        kv_v = expert_source["kv_v"]
-        positions = expert_source["positions"]
-
-        n_layers, episode_len, deter = kv_k.shape
-        M = self.memory_size
-        N = int(flat_starts.shape[0])
-        if M == 0:
-            kv_cache = kv_k.new_zeros(N, n_layers, 2, 0, deter)
-        else:
-            offsets = torch.arange(M, device=self.device)
-            left = flat_starts[:, None] - M + offsets[None, :]
-            valid = left >= 0
-            gather_time = torch.clamp(left, min=0, max=episode_len - 1)
-            gather_index = gather_time[:, None, :,
-                                       None].expand(N, n_layers, M, deter)
-            k_source = kv_k.unsqueeze(0).expand(N, -1, -1, -1)
-            v_source = kv_v.unsqueeze(0).expand(N, -1, -1, -1)
-            k_slice = k_source.gather(2, gather_index)
-            v_slice = v_source.gather(2, gather_index)
-            valid = valid[:, None, :, None].to(k_slice.dtype)
-            k_slice = k_slice * valid
-            v_slice = v_slice * valid
-            kv_cache = torch.stack([k_slice, v_slice], dim=2)
-
-        carry = {
-            "kv_cache": kv_cache,
-            "pos": positions[flat_starts].to(torch.int32),
-            "h_prev": post_deter,
-        }
-        return post_stoch, post_deter, carry
 
     def _world_model_forward(self, data, memory_carry):
         """World-model losses and detached cache for imagination updates."""
@@ -550,22 +360,12 @@ class Dreamer(nn.Module):
             self.rssm.get_dist(post_logit).entropy())
 
         imag_source = {
-            "post_stoch":
-                post_stoch.detach(),
-            "post_deter":
-                post_deter.detach(),
-            "kv_k":
-                feat_dict["kv_k"].detach(),
-            "kv_v":
-                feat_dict["kv_v"].detach(),
-            "valid_lens":
-                torch.full((B,), T, dtype=torch.int64, device=self.device),
-            "positions":
-                None if positions is None else positions.detach(),
-            "T":
-                T,
-            "feat":
-                feat,
+            "post_stoch": post_stoch.detach(),
+            "post_deter": post_deter.detach(),
+            "kv_k": feat_dict["kv_k"].detach(),
+            "kv_v": feat_dict["kv_v"].detach(),
+            "positions": None if positions is None else positions.detach(),
+            "feat": feat,
         }
         return losses, metrics, imag_source, feat_dict["next_carry"]
 
@@ -624,19 +424,15 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(imag_action, "action"))
         return losses, metrics, ret[:, 0].detach()
 
-    def _replay_value_forward(self, data, feat, starts, boot):
-        """Replay value loss over contiguous imagined replay starts."""
-        if int(starts.shape[1]) < 2:
+    def _replay_value_forward(self, data, feat, boot):
+        """Replay value loss over the full replay segment."""
+        if int(boot.shape[1]) < 2:
             zero = feat.sum() * 0.0
             return zero, {}
 
-        last = self._gather_time(self._ensure_value_seq(data["is_last"]),
-                                 starts)
-        term = self._gather_time(self._ensure_value_seq(data["is_terminal"]),
-                                 starts)
-        reward = self._gather_time(self._ensure_value_seq(data["reward"]),
-                                   starts)
-        feat = self._gather_time(feat, starts)
+        last = self._ensure_value_seq(data["is_last"])
+        term = self._ensure_value_seq(data["is_terminal"])
+        reward = self._ensure_value_seq(data["reward"])
 
         value = self._frozen_value(feat).mode()
         slow_value = self._frozen_slow_value(feat).mode()
@@ -656,190 +452,60 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
         return value_loss.mean(), metrics
 
-    def _cal_grad(self, data, train_carry):
-        """Compute one joint world-model and actor-critic optimization graph."""
-        metrics = {}
+    def _loss_forward(self, data, train_carry):
+        """Compute the joint world-model and actor-critic forward loss."""
         losses = {}
-        opt_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-        next_carries = []
+        metrics = {}
 
-        def _accum(target, source, weight):
-            if not isinstance(weight, torch.Tensor):
-                weight = torch.tensor(weight,
-                                      dtype=torch.float32,
-                                      device=self.device)
-            else:
-                weight = weight.to(dtype=torch.float32, device=self.device)
-            for name, value in source.items():
-                if not isinstance(value, torch.Tensor):
-                    value = torch.tensor(value,
-                                         dtype=torch.float32,
-                                         device=self.device)
-                target[name] = target.get(
-                    name,
-                    torch.zeros((), dtype=torch.float32, device=self.device),
-                )
-                target[name] = target[name] + value.detach() * weight
+        with autocast(device_type=self.device.type, dtype=torch.float16):
+            wm_losses, wm_metrics, imag_source, next_carry = self._world_model_forward(
+                data, train_carry)
 
-        wm_chunks = list(self._iter_batch_chunks(data, self.wm_accum_steps))
-        for start, end, wm_data, wm_batch_weight in wm_chunks:
-            carry_chunk = self._slice_carry(train_carry, start, end)
-            wm_batch_weight = torch.tensor(wm_batch_weight,
-                                           dtype=torch.float32,
-                                           device=self.device)
-            with autocast(device_type=self.device.type, dtype=torch.float16):
-                wm_losses, wm_metrics, imag_source, next_carry = self._world_model_forward(
-                    wm_data, carry_chunk)
-            next_carries.append(self._detach_carry(next_carry))
-
-            starts = self._sample_transformer_imag_starts(
-                imag_source["valid_lens"],)
-            ac_losses = {}
-            ac_metrics = {}
-            replay_boots = []
-            for start_chunk, s_weight in self._iter_start_chunks(
-                    starts, self.ac_accum_steps):
-                s_weight = torch.tensor(s_weight,
-                                        dtype=torch.float32,
-                                        device=self.device)
-                s_stoch, s_deter, s_carry = self._prepare_transformer_imag_start(
-                    imag_source["post_stoch"],
-                    imag_source["post_deter"],
-                    imag_source["kv_k"],
-                    imag_source["kv_v"],
-                    imag_source["positions"],
-                    start_chunk,
-                )
-                with autocast(device_type=self.device.type,
-                              dtype=torch.float16):
-                    chunk_losses, chunk_metrics, chunk_boot = self._actor_critic_forward(
-                        s_stoch, s_deter, s_carry)
-                    ac_total = (
-                        self._loss_scales["policy"] * chunk_losses["policy"] +
-                        self._loss_scales["value"] * chunk_losses["value"])
-                replay_boots.append(
-                    chunk_boot.reshape(wm_data.shape[0],
-                                       start_chunk.shape[1],
-                                       -1).detach())
-                grad_weight = wm_batch_weight * s_weight
-                self._scaler.scale(ac_total * grad_weight).backward()
-                opt_loss = opt_loss + ac_total.detach() * grad_weight
-                _accum(ac_losses, chunk_losses, s_weight)
-                _accum(ac_metrics, chunk_metrics, s_weight)
-                del s_stoch, s_deter, s_carry, chunk_losses, chunk_metrics
-                del chunk_boot, ac_total
-            _accum(losses, ac_losses, wm_batch_weight)
-            _accum(metrics, ac_metrics, wm_batch_weight)
-
-            if replay_boots:
-                replay_boot = torch.cat(replay_boots, dim=1)
-                with autocast(device_type=self.device.type,
-                              dtype=torch.float16):
-                    wm_losses["repval"], repval_metrics = self._replay_value_forward(
-                        wm_data, imag_source["feat"], starts, replay_boot)
-                wm_metrics.update(repval_metrics)
-
-            world_model_loss = sum(self._loss_scales[name] * value
-                                   for name, value in wm_losses.items())
-            self._scaler.scale(world_model_loss * wm_batch_weight).backward()
-            opt_loss = opt_loss + world_model_loss.detach() * wm_batch_weight
-            _accum(losses, wm_losses, wm_batch_weight)
-            _accum(metrics, wm_metrics, wm_batch_weight)
-
-        expert_source = self._expert_forward_episode()
-        expert_starts = (None if expert_source is None else
-                         self._sample_expert_ac_starts(
-                             int(expert_source["length"])))
-        if expert_source is not None and expert_starts is not None:
-            expert_losses = {}
-            expert_metrics = {}
-            for start_chunk, s_weight in self._iter_start_chunks(
-                    expert_starts, self.ac_accum_steps):
-                s_weight = torch.tensor(s_weight,
-                                        dtype=torch.float32,
-                                        device=self.device)
-                s_stoch, s_deter, s_carry = self._prepare_expert_imag_start(
-                    expert_source, start_chunk)
-                with autocast(device_type=self.device.type,
-                              dtype=torch.float16):
-                    chunk_losses, chunk_metrics, _ = self._actor_critic_forward(
-                        s_stoch, s_deter, s_carry)
-                    expert_total = (
-                        self._loss_scales["policy"] * chunk_losses["policy"] +
-                        self._loss_scales["value"] * chunk_losses["value"])
-                self._scaler.scale(expert_total * s_weight).backward()
-                opt_loss = opt_loss + expert_total.detach() * s_weight
-                _accum(expert_losses, chunk_losses, s_weight)
-                _accum(
-                    expert_metrics,
-                    {
-                        f"expert/{k}": v for k, v in chunk_metrics.items()
-                    },
-                    s_weight,
-                )
-                del s_stoch, s_deter, s_carry, chunk_losses, chunk_metrics
-                del expert_total
-            _accum(losses, {
-                f"expert_{k}": v for k, v in expert_losses.items()
-            }, 1.0)
-            _accum(metrics, expert_metrics, 1.0)
-            metrics["expert/ac_starts"] = torch.tensor(float(
-                expert_starts.numel()),
-                                                       device=self.device)
-
-        metrics["wm_accum_steps"] = torch.tensor(
-            float(self.wm_accum_steps),
-            device=self.device,
+        B, T = data.shape
+        s_stoch, s_deter, s_carry = self._frozen_rssm.build_imag_starts(
+            imag_source["post_stoch"],
+            imag_source["post_deter"],
+            imag_source["kv_k"],
+            imag_source["kv_v"],
+            positions=imag_source["positions"],
         )
-        metrics["ac_accum_steps"] = torch.tensor(
-            float(self.ac_accum_steps),
-            device=self.device,
-        )
+        with autocast(device_type=self.device.type, dtype=torch.float16):
+            ac_losses, ac_metrics, replay_boot = self._actor_critic_forward(
+                s_stoch, s_deter, s_carry)
+            ac_total = (self._loss_scales["policy"] * ac_losses["policy"] +
+                        self._loss_scales["value"] * ac_losses["value"])
+        losses.update(ac_losses)
+        metrics.update(ac_metrics)
+
+        replay_boot = replay_boot.reshape(B, T, -1).detach()
+        with autocast(device_type=self.device.type, dtype=torch.float16):
+            wm_losses["repval"], repval_metrics = self._replay_value_forward(
+                data, imag_source["feat"], replay_boot)
+        wm_metrics.update(repval_metrics)
+
+        world_model_loss = sum(self._loss_scales[name] * value
+                               for name, value in wm_losses.items())
+        opt_loss = ac_total + world_model_loss
+        losses.update(wm_losses)
+        metrics.update(wm_metrics)
+        return opt_loss, losses, metrics, next_carry
+
+    def _cal_grad(self, data, train_carry):
+        """Compute gradients for one joint world-model and actor-critic update."""
+        opt_loss, losses, metrics, next_carry = self._loss_forward(
+            data, train_carry)
+        self._scaler.scale(opt_loss).backward()
+
+        metrics = {
+            name: value.detach() if isinstance(value, torch.Tensor) else value
+            for name, value in metrics.items()
+        }
+
         metrics.update({
             f"loss/{name}": loss.detach() for name, loss in losses.items()
         })
         metrics["opt/loss"] = opt_loss.detach()
-        return metrics, self._cat_carries(next_carries)
-
-    @torch.no_grad()
-    def _prepare_transformer_imag_start(
-        self,
-        post_stoch,
-        post_deter,
-        kv_k,
-        kv_v,
-        positions,
-        starts,
-    ):
-        """Prepare transformer imagination starts from trajectory KV tensors."""
-        B = post_stoch.shape[0]
-        K = starts.shape[1]
-
-        # observe() returns compact memory KV plus current-segment KV.
-        start_stoch, start_deter, imag_carry = self._frozen_rssm.build_imag_starts(
-            post_stoch, post_deter, kv_k, kv_v, starts, positions=positions)
-        return start_stoch, start_deter, imag_carry
-
-    @torch.no_grad()
-    def _sample_transformer_imag_starts(self, valid_lens):
-        """Sample all imagination start indices for one actor-critic update."""
-        target_T = int(valid_lens.max().item())
-        K = min(self.imag_last if self.imag_last > 0 else target_T, target_T)
-        return self._sample_valid_imag_starts(valid_lens, K, valid_lens.device)
-
-    @torch.no_grad()
-    def _sample_valid_imag_starts(self, valid_lens, K, device):
-        """Sample K valid imagination starts independently per episode."""
-        offsets = torch.arange(K, device=device)
-        starts = []
-        for valid_len_t in valid_lens:
-            valid_len = int(valid_len_t.item())
-            if valid_len >= K:
-                start0 = torch.randint(0, valid_len - K + 1, (), device=device)
-                starts.append(start0 + offsets)
-            else:
-                starts.append(torch.randint(0, valid_len, (K,), device=device))
-        return torch.stack(starts, dim=0)
+        return metrics, self._detach_carry(next_carry)
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon, imag_carry=None):
