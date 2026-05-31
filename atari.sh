@@ -24,7 +24,7 @@ tasks=(
 	#    "atari_demon_attack"
 	#    "atari_freeway"
 	#    "atari_frostbite"
-	    "atari_gopher"
+	"atari_gopher"
 	#    "atari_hero"
 	#    "atari_jamesbond"
 	#    "atari_kangaroo"
@@ -53,6 +53,6 @@ for task in "${tasks[@]}"; do
 			model=size-transformer \
 			model.rep_loss=${METHOD} \
 			seed=$seed \
-			batch_size=16 batch_length=64
+			batch_size=8 batch_length=64
 	done
 done

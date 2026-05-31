@@ -19,10 +19,7 @@ Run training on default settings:
 python3 train.py logdir=./logdir/test
 ```
 
-Monitoring results:
-```bash
-tensorboard --logdir ./logdir
-```
+Training progress is logged to stdout.
 
 The representation loss is fixed to `r2dreamer`.
 

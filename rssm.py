@@ -22,20 +22,7 @@ class TransformerRSSM(nn.Module):
         self._n_heads = int(config.n_heads)
         self._n_layers = int(config.n_layers)
         self._d_ff = int(config.d_ff)
-        self._memory_size = int(getattr(config, "memory_size", 0))
-        configured_segment = getattr(config, "segment_length", None)
-        if configured_segment is None:
-            configured_segment = getattr(config, "window_size", None)
-        if configured_segment is None:
-            raise AttributeError(
-                "TransformerRSSM config requires segment_length.")
-        self._segment_length = int(configured_segment)
-        if self._memory_size < 0:
-            raise AssertionError("memory_size must be >= 0.")
-        if self._segment_length < 1:
-            raise AssertionError("segment_length must be >= 1.")
-        # Carries store only previous-token memory. Segment length remains a
-        # training sequence/config property, not part of cache length.
+        self._memory_size = int(getattr(config, "memory_size", None))
         self._cache_size = self._memory_size
         act_fn = getattr(torch.nn, config.act)
 
@@ -49,10 +36,8 @@ class TransformerRSSM(nn.Module):
         assert self._d_head % 2 == 0, (
             f"d_head ({self._d_head}) must be even for RoPE")
 
-        self._rope_base = float(getattr(config, 'rope_base', 1_000_000.0))
-        self._rope_max_seq_len = int(
-            getattr(config, 'rope_max_seq_len',
-                    max(self._cache_size, self._segment_length, 4096)))
+        self._rope_base = float(getattr(config, 'rope_base', None))
+        self._rope_max_seq_len = int(getattr(config, 'rope_max_seq_len', None))
         self._rope = Qwen2RotaryPositionalEmbeddings(
             dim=self._d_head,
             max_seq_len=self._rope_max_seq_len,

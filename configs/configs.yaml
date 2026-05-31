@@ -7,9 +7,7 @@ defaults:
 
 logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 #agent_load_path: /home/ubuntu/lezhang.thu/claude/r2dreamer/agent_interrupted_state_dict.pt  # Optional .pt containing only Dreamer.state_dict().
-#replay_load_path: /home/ubuntu/lezhang.thu/claude/r2dreamer/replay_y_interrupted_state_dict.pt  # Optional .pt containing ReplayY.state_dict() eps only.
 agent_load_path: null  # Optional .pt containing only Dreamer.state_dict().
-replay_load_path: null  # Optional .pt containing ReplayY.state_dict() eps only.
 seed: 0
 deterministic_run: False
 device: 'cuda:0'
@@ -30,12 +28,13 @@ buffer:
 
 trainer:
   steps: ${env.steps}
-  pretrain: 0
   eval_every: 4e5
   eval_episode_num: ${env.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
+  grad_accum_steps: ${model.grad_accum_steps}
+  # Counted in environment interactions; trainer maps this to its frame step.
+  random_action_steps: 1e4
   train_ratio: ${env.train_ratio}
-  params_hist_log: False
   update_log_every: 5e3
   action_repeat: ${env.action_repeat}

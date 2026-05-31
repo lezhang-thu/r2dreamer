@@ -1,4 +1,3 @@
-import atexit
 import pathlib
 import sys
 import warnings
@@ -10,7 +9,7 @@ from hydra.utils import to_absolute_path
 import tools
 from dreamer import Dreamer
 from envs import make_envs
-from replay_y import ReplayY
+from replay import Replay
 from trainer import OnlineTrainer
 
 warnings.filterwarnings("ignore")
@@ -37,20 +36,6 @@ def load_agent_state_dict(agent, path):
     print(f"Loaded Dreamer agent state_dict from {path}.")
 
 
-def save_replay_state_dict(replay_buffer, path):
-    torch.save(replay_buffer.state_dict(), path)
-    print(f"Saved ReplayY eps state_dict to {path}.")
-
-
-def load_replay_state_dict(replay_buffer, path):
-    try:
-        state_dict = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        state_dict = torch.load(path, map_location="cpu")
-    replay_buffer.load_state_dict(state_dict)
-    print(f"Loaded ReplayY eps state_dict from {path}.")
-
-
 def resolve_config_path(path_value):
     path = pathlib.Path(str(path_value)).expanduser()
     if path.is_absolute():
@@ -66,46 +51,19 @@ def main(config):
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
 
-    # Mirror stdout/stderr to a file under logdir while keeping console output.
-    console_f = tools.setup_console_log(logdir, filename="console.log")
-    atexit.register(lambda: console_f.close())
+    logger = tools.setup_logging(logdir, "{}.txt".format("train"))
 
-    print("Logdir", logdir)
+    logger.info("Logdir %s", logdir)
 
-    logger = tools.Logger(logdir)
-    # save config
-    logger.log_hydra_config(config)
-
-    if int(config.batch_length) < 1:
-        raise AssertionError("config.batch_length must be >= 1 "
-                             f"(got batch_length={int(config.batch_length)}).")
-    if int(config.model.transformer.segment_length) != int(config.batch_length):
-        raise AssertionError(
-            "config.model.transformer.segment_length must equal config.batch_length "
-            f"(got segment_length={int(config.model.transformer.segment_length)}, "
-            f"batch_length={int(config.batch_length)}).")
-    if int(config.model.transformer.memory_size) < 0:
-        raise AssertionError(
-            "config.model.transformer.memory_size must be >= 0 "
-            f"(got {int(config.model.transformer.memory_size)}).")
-
-    print("Create envs.")
+    logger.info("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
-    replay_buffer = ReplayY(
+    replay_buffer = Replay(
         length=int(config.batch_length),
         seed=config.seed,
     )
-    replay_load_path = config.get("replay_load_path", None)
-    if replay_load_path is not None:
-        replay_load_path = resolve_config_path(replay_load_path)
-        if not replay_load_path.exists():
-            raise FileNotFoundError(
-                f"Configured replay_load_path does not exist: {replay_load_path}"
-            )
-        load_replay_state_dict(replay_buffer, replay_load_path)
 
-    print("Simulate agent.")
+    logger.info("Simulate agent.")
     agent = Dreamer(
         config.model,
         obs_space,
@@ -119,15 +77,13 @@ def main(config):
         load_agent_state_dict(agent, agent_load_path)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger,
-                                   logdir, train_envs, eval_envs)
+                                   train_envs, eval_envs)
     interrupted_agent_path = logdir / "agent_interrupted_state_dict.pt"
-    interrupted_replay_path = logdir / "replay_y_interrupted_state_dict.pt"
     try:
         policy_trainer.begin(agent)
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received during training.")
         save_agent_state_dict(agent, interrupted_agent_path)
-        #save_replay_state_dict(replay_buffer, interrupted_replay_path)
         raise
 
 

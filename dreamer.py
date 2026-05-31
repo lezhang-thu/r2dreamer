@@ -28,6 +28,7 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
+        self._act_space_shape = tuple(map(int, getattr(act_space, "shape", ())))
         if str(config.rep_loss) != "r2dreamer":
             raise AssertionError("config.rep_loss must be 'r2dreamer' "
                                  f"(got {str(config.rep_loss)!r}).")
@@ -47,14 +48,27 @@ class Dreamer(nn.Module):
         config.actor.shape = (act_space.n,) if hasattr(
             act_space, "n") else tuple(map(int, act_space.shape))
         self.act_discrete = False
+        self.act_multi_discrete = False
         if hasattr(act_space, "multi_discrete"):
             config.actor.dist = config.actor.dist.multi_disc
             self.act_discrete = True
+            self.act_multi_discrete = True
         elif hasattr(act_space, "discrete"):
             config.actor.dist = config.actor.dist.disc
             self.act_discrete = True
         else:
             config.actor.dist = config.actor.dist.cont
+            self.register_buffer(
+                "_act_low",
+                torch.as_tensor(act_space.low, dtype=torch.float32).reshape(-1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_act_high",
+                torch.as_tensor(act_space.high,
+                                dtype=torch.float32).reshape(-1),
+                persistent=False,
+            )
 
         # Actor-critic components
         self.rl_feat_size = self.rssm.feat_size
@@ -70,6 +84,7 @@ class Dreamer(nn.Module):
 
         self._loss_scales = dict(config.loss_scales)
         self._log_grads = bool(config.log_grads)
+        self._grad_accum_steps = int(config.get("grad_accum_steps", 1))
 
         modules = {
             "rssm": self.rssm,
@@ -185,8 +200,26 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         return self
 
+    def _random_action(self, batch_size):
+        if self.act_discrete:
+            if self.act_multi_discrete:
+                parts = []
+                for dim in self._act_space_shape:
+                    index = torch.randint(dim, (batch_size,),
+                                          device=self.device)
+                    part = torch.zeros(batch_size, dim, device=self.device)
+                    parts.append(part.scatter_(1, index.unsqueeze(1), 1.0))
+                return torch.cat(parts, dim=-1)
+            index = torch.randint(self.act_dim, (batch_size,),
+                                  device=self.device)
+            action = torch.zeros(batch_size, self.act_dim, device=self.device)
+            return action.scatter_(1, index.unsqueeze(1), 1.0)
+        return self._act_low + torch.rand(
+            batch_size, self.act_dim,
+            device=self.device) * (self._act_high - self._act_low)
+
     @torch.no_grad()
-    def act(self, obs, state, eval=False):
+    def act(self, obs, state, eval=False, random=False):
         """Policy inference step."""
         torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs)
@@ -206,8 +239,11 @@ class Dreamer(nn.Module):
         carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
             carry, embed_sq, is_first)
         rl_feat = self._frozen_rssm.get_feat(stoch, h_prev)
-        action_dist = self._frozen_actor(rl_feat)
-        action = action_dist.mode if eval else action_dist.rsample()
+        if random and not eval:
+            action = self._random_action(int(rl_feat.shape[0]))
+        else:
+            action_dist = self._frozen_actor(rl_feat)
+            action = action_dist.mode if eval else action_dist.rsample()
         # Phase 2: update KV-cache with (stoch, action)
         carry = self._frozen_rssm.update_carry(carry, stoch, action, is_first)
         return action, TensorDict(
@@ -236,38 +272,61 @@ class Dreamer(nn.Module):
             },
             batch_size=(B,))
 
-    def update(self, replay_buffer, batch_size):
-        """Sample a batch from replay and perform one optimization step.
-
-        ReplayY returns Transformer-XL rows containing one real trainable
-        segment. Detached memory is kept in self._train_carry.
-
-        Args:
-            replay_buffer: ReplayY instance.
-            batch_size: Number of replay segments to sample.
-
-        Returns:
-            metrics: Dict of training metrics.
-        """
+    def _sample_replay_batch(self, replay_buffer, batch_size):
         np_data = replay_buffer.sample(int(batch_size))
-        # Convert numpy data to torch tensors on device.
-        data = {}
-        for k, v in np_data.items():
-            t = torch.from_numpy(v)
-            if t.is_floating_point():
-                t = t.to(self.device, non_blocking=True)
-            else:
-                t = t.to(self.device)
-            data[k] = t
-        data = TensorDict(data, batch_size=data["reward"].shape[:2])
+        data = {
+            k: torch.from_numpy(v).to(self.device, non_blocking=True)
+            for k, v in np_data.items()
+        }
+        return TensorDict(data, batch_size=data["reward"].shape[:2])
 
-        torch.compiler.cudagraph_mark_step_begin()
-        p_data = self.preprocess(data)
-        train_carry = self._ensure_train_carry(p_data.shape[0])
+    @staticmethod
+    def _accumulate_metrics(metric_sums, metrics):
+        for name, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach()
+            metric_sums[name] = value if name not in metric_sums else (
+                metric_sums[name] + value)
 
+    @staticmethod
+    def _slice_carry(carry, start, end):
+        return {k: v[start:end] for k, v in carry.items()}
+
+    @staticmethod
+    def _cat_carry(carries):
+        return {
+            k: torch.cat([carry[k] for carry in carries], dim=0)
+            for k in carries[0]
+        }
+
+    def update(self, replay_buffer, batch_size):
         self._update_slow_target()
         self._optimizer.zero_grad(set_to_none=True)
-        metrics, next_train_carry = self._cal_grad(p_data, train_carry)
+
+        batch_size = int(batch_size)
+        effective_batch_size = batch_size * self._grad_accum_steps
+        data = self._sample_replay_batch(replay_buffer, effective_batch_size)
+        train_carry = self._ensure_train_carry(effective_batch_size)
+
+        metric_sums = {}
+        next_carry_chunks = []
+        for accum_idx in range(self._grad_accum_steps):
+            start = accum_idx * batch_size
+            end = start + batch_size
+            torch.compiler.cudagraph_mark_step_begin()
+            p_data = self.preprocess(data[start:end])
+            metrics, next_carry = self._cal_grad(
+                p_data,
+                self._slice_carry(train_carry, start, end),
+                loss_scale=1.0 / self._grad_accum_steps,
+            )
+            next_carry_chunks.append(next_carry)
+            self._accumulate_metrics(metric_sums, metrics)
+
+        metrics = {
+            name: value / self._grad_accum_steps
+            for name, value in metric_sums.items()
+        }
 
         self._scaler.unscale_(self._optimizer)
         if self._log_grads:
@@ -283,9 +342,11 @@ class Dreamer(nn.Module):
         self._scaler.update()
         self._scheduler.step()
         self._optimizer.zero_grad(set_to_none=True)
-        self._train_carry = self._detach_carry(next_train_carry)
+        self._train_carry = self._detach_carry(
+            self._cat_carry(next_carry_chunks))
         metrics["opt/lr"] = self._scheduler.get_last_lr()[0]
         metrics["opt/grad_scale"] = self._scaler.get_scale()
+        metrics["opt/grad_accum_steps"] = float(self._grad_accum_steps)
         return metrics
 
     @staticmethod
@@ -444,11 +505,11 @@ class Dreamer(nn.Module):
         metrics.update(wm_metrics)
         return opt_loss, losses, metrics, next_carry
 
-    def _cal_grad(self, data, train_carry):
+    def _cal_grad(self, data, train_carry, loss_scale=1.0):
         """Compute gradients for one joint world-model and actor-critic update."""
         opt_loss, losses, metrics, next_carry = self._loss_forward(
             data, train_carry)
-        self._scaler.scale(opt_loss).backward()
+        self._scaler.scale(opt_loss * loss_scale).backward()
 
         metrics = {
             name: value.detach() if isinstance(value, torch.Tensor) else value

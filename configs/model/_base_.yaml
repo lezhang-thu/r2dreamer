@@ -5,6 +5,7 @@ horizon: 333
 lamb: 0.95
 compile: True
 log_grads: False
+grad_accum_steps: 2
 device: ${device}
 rep_loss: "r2dreamer"  # only supported rep loss
 
@@ -51,7 +52,6 @@ transformer:
   #d_ff: 4096
   d_ff: 2048
   memory_size: ${batch_length}
-  segment_length: ${batch_length}
   device: ${device}
 
 encoder:
