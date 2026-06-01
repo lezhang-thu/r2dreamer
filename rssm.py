@@ -11,7 +11,7 @@ from tools import weight_init_
 
 class TransformerRSSM(nn.Module):
 
-    def __init__(self, config, embed_size, act_dim):
+    def __init__(self, config, embed_size, act_dim, hidden):
         super().__init__()
         self._stoch = int(config.stoch)
         self._deter = int(config.deter)
@@ -22,6 +22,7 @@ class TransformerRSSM(nn.Module):
         self._n_heads = int(config.n_heads)
         self._n_layers = int(config.n_layers)
         self._d_ff = int(config.d_ff)
+        self._dropout = float(getattr(config, "dropout", 0.0))
         self._memory_size = int(getattr(config, "memory_size", None))
         self._cache_size = self._memory_size
         act_fn = getattr(torch.nn, config.act)
@@ -76,23 +77,22 @@ class TransformerRSSM(nn.Module):
         self._outnorm = nn.RMSNorm(D, eps=1e-04, dtype=torch.float32)
 
         # Richer posterior/prior heads, analogous to RSSM obs/img heads.
-        self._head_hidden = int(getattr(config, 'head_hidden', D))
+        self._hidden = int(hidden)
         self._post_layers = int(getattr(config, 'post_layers', 1))
         self._prior_layers = int(getattr(config, 'prior_layers', 2))
 
         self._post_head = nn.Sequential()
         inp_dim = embed_size
         for i in range(self._post_layers):
-            self._post_head.add_module(
-                f"post_{i}", nn.Linear(inp_dim, self._head_hidden, bias=True))
+            self._post_head.add_module(f"post_{i}",
+                                       nn.Linear(inp_dim, self._hidden))
             self._post_head.add_module(
                 f"post_n_{i}",
-                nn.RMSNorm(self._head_hidden, eps=1e-04, dtype=torch.float32))
+                nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
             self._post_head.add_module(f"post_a_{i}", act_fn())
-            inp_dim = self._head_hidden
+            inp_dim = self._hidden
         self._post_head.add_module(
-            "post_logit",
-            nn.Linear(inp_dim, self._stoch * self._discrete, bias=True))
+            "post_logit", nn.Linear(inp_dim, self._stoch * self._discrete))
         self._post_head.add_module(
             "post_lambda",
             LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
@@ -102,16 +102,15 @@ class TransformerRSSM(nn.Module):
         self._prior_head = nn.Sequential()
         inp_dim = D
         for i in range(self._prior_layers):
-            self._prior_head.add_module(
-                f"prior_{i}", nn.Linear(inp_dim, self._head_hidden, bias=True))
+            self._prior_head.add_module(f"prior_{i}",
+                                        nn.Linear(inp_dim, self._hidden))
             self._prior_head.add_module(
                 f"prior_n_{i}",
-                nn.RMSNorm(self._head_hidden, eps=1e-04, dtype=torch.float32))
+                nn.RMSNorm(self._hidden, eps=1e-04, dtype=torch.float32))
             self._prior_head.add_module(f"prior_a_{i}", act_fn())
-            inp_dim = self._head_hidden
+            inp_dim = self._hidden
         self._prior_head.add_module(
-            "prior_logit",
-            nn.Linear(inp_dim, self._stoch * self._discrete, bias=True))
+            "prior_logit", nn.Linear(inp_dim, self._stoch * self._discrete))
         self._prior_head.add_module(
             "prior_lambda",
             LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self.
@@ -203,6 +202,9 @@ class TransformerRSSM(nn.Module):
                                                     dtype=torch.long))
         return x_t.transpose(1, 2)
 
+    def _dropout_p(self):
+        return self._dropout if self.training else 0.0
+
     def _fwd_segment_with_carry(self, x, carry, positions, reset):
         """Forward a segment against detached sliding-window memory."""
         B, T, D = x.shape
@@ -262,14 +264,16 @@ class TransformerRSSM(nn.Module):
             x = F.scaled_dot_product_attention(Q,
                                                K_all,
                                                V_all,
-                                               attn_mask=attn_mask)
+                                               attn_mask=attn_mask,
+                                               dropout_p=self._dropout_p())
             x = x.transpose(1, 2).reshape(B, T, D)
-            x = res + self._o_projs[i](x)
+            x = res + F.dropout(
+                self._o_projs[i](x), p=self._dropout, training=self.training)
 
             res = x
             x = self._ffn_norms[i](x)
             x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
-            x = res + x
+            x = res + F.dropout(x, p=self._dropout, training=self.training)
 
             if M > 0:
                 new_k = k_all[:, -M:]
@@ -547,15 +551,17 @@ class TransformerRSSM(nn.Module):
             x_t = F.scaled_dot_product_attention(Q,
                                                  K_cached,
                                                  V_cached,
-                                                 attn_mask=attn_mask)
+                                                 attn_mask=attn_mask,
+                                                 dropout_p=self._dropout_p())
             x_t = x_t.transpose(1, 2).reshape(B, 1, D)
-            x_t = res + self._o_projs[i](x_t)
+            x_t = res + F.dropout(
+                self._o_projs[i](x_t), p=self._dropout, training=self.training)
 
             # FFN sublayer
             res = x_t
             x_t = self._ffn_norms[i](x_t)
             x_t = self._ff2s[i](self._act_fn(self._ff1s[i](x_t)))
-            x_t = res + x_t
+            x_t = res + F.dropout(x_t, p=self._dropout, training=self.training)
 
         x_t = self._outnorm(x_t)
         h_t = x_t[:, 0]  # (B, D)

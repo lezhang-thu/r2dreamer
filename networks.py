@@ -1,3 +1,4 @@
+import math
 import re
 from functools import partial
 
@@ -106,58 +107,6 @@ class RMSNorm2D(nn.RMSNorm):
         return super().forward(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
 
-def _maybe_norm_2d(ch: int, use_norm: bool) -> nn.Module:
-    if use_norm:
-        return RMSNorm2D(ch, eps=1e-04, dtype=torch.float32)
-    return nn.Identity()
-
-
-class ResNetBasicBlock(nn.Module):
-    """Small-image ResNet basic block with stride-based downsampling."""
-
-    def __init__(self,
-                 in_ch: int,
-                 out_ch: int,
-                 kernel_size: int,
-                 act,
-                 use_norm: bool,
-                 stride: int = 1):
-        super().__init__()
-        bias = not use_norm
-        self.conv1 = Conv2dSamePad(in_ch,
-                                   out_ch,
-                                   kernel_size,
-                                   stride=stride,
-                                   bias=bias)
-        self.norm1 = _maybe_norm_2d(out_ch, use_norm)
-        self.act1 = act()
-        self.conv2 = Conv2dSamePad(out_ch,
-                                   out_ch,
-                                   kernel_size,
-                                   stride=1,
-                                   bias=bias)
-        self.norm2 = _maybe_norm_2d(out_ch, use_norm)
-        if stride != 1 or in_ch != out_ch:
-            skip_layers = [
-                Conv2dSamePad(in_ch, out_ch, 1, stride=stride, bias=bias)
-            ]
-            if use_norm:
-                skip_layers.append(_maybe_norm_2d(out_ch, use_norm))
-            self.skip = nn.Sequential(*skip_layers)
-        else:
-            self.skip = nn.Identity()
-        self.out_act = act()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.skip(x)
-        x = self.conv1(x)
-        x = self.norm1(x)
-        x = self.act1(x)
-        x = self.conv2(x)
-        x = self.norm2(x)
-        return self.out_act(x + residual)
-
-
 class MultiEncoder(nn.Module):
 
     def __init__(
@@ -219,72 +168,92 @@ class MultiEncoder(nn.Module):
             [enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
 
 
+class MultiDecoder(nn.Module):
+
+    def __init__(self, config, deter, flat_stoch, shapes):
+        super().__init__()
+        excluded = ("is_first", "is_last", "is_terminal")
+        shapes = {k: v for k, v in shapes.items() if k not in excluded}
+        self.cnn_shapes = {
+            k: v
+            for k, v in shapes.items()
+            if len(v) == 3 and re.match(config.cnn_keys, k)
+        }
+        self.mlp_shapes = {
+            k: v
+            for k, v in shapes.items()
+            if len(v) in (1, 2) and re.match(config.mlp_keys, k)
+        }
+        print("Decoder CNN shapes:", self.cnn_shapes)
+        print("Decoder MLP shapes:", self.mlp_shapes)
+        self.all_keys = list(self.mlp_shapes.keys()) + list(
+            self.cnn_shapes.keys())
+
+        if self.cnn_shapes:
+            some_shape = list(self.cnn_shapes.values())[0]
+            shape = (sum(
+                x[-1] for x in self.cnn_shapes.values()),) + some_shape[:-1]
+            self._cnn = ConvDecoder(config.cnn, deter, flat_stoch, shape)
+            self._image_dist = partial(
+                getattr(dists, str(config.cnn_dist.name)), **config.cnn_dist)
+        if self.mlp_shapes:
+            shape = (sum(sum(x) for x in self.mlp_shapes.values()),)
+            config.mlp.shape = shape
+            self._mlp = MLPHead(config.mlp, deter + flat_stoch)
+            self._mlp_dist = partial(getattr(dists, str(config.mlp_dist.name)),
+                                     **config.mlp_dist)
+
+    def forward(self, stoch, deter):
+        dists_out = {}
+        if self.cnn_shapes:
+            split_sizes = [v[-1] for v in self.cnn_shapes.values()]
+            outputs = self._cnn(stoch, deter)
+            outputs = torch.split(outputs, split_sizes, -1)
+            dists_out.update({
+                key: self._image_dist(output)
+                for key, output in zip(self.cnn_shapes.keys(), outputs)
+            })
+        if self.mlp_shapes:
+            split_sizes = [v[0] for v in self.mlp_shapes.values()]
+            feat = torch.cat([stoch.reshape(*deter.shape[:-1], -1), deter], -1)
+            outputs = self._mlp(feat)
+            outputs = torch.split(outputs, split_sizes, -1)
+            dists_out.update({
+                key: self._mlp_dist(output)
+                for key, output in zip(self.mlp_shapes.keys(), outputs)
+            })
+        return dists_out
+
+
 class ConvEncoder(nn.Module):
 
     def __init__(self, config, input_shape):
         super().__init__()
         act = getattr(torch.nn, config.act)
         h, w, input_ch = input_shape
-        self._minres = int(config.minres)
         self.depths = tuple(
             int(config.depth) * int(mult) for mult in list(config.mults))
-        self.blocks = tuple(
-            int(blocks)
-            for blocks in getattr(config, "blocks", [1] * len(self.depths)))
-        if len(self.blocks) != len(self.depths):
-            raise AssertionError(
-                "ConvEncoder config.blocks must match config.mults length "
-                f"(got {len(self.blocks)} blocks for {len(self.depths)} stages)."
-            )
-        if any(blocks < 1 for blocks in self.blocks):
-            raise AssertionError("ConvEncoder config.blocks must be >= 1.")
-        kernel_size = int(config.kernel_size)
-        stem_stride = int(getattr(config, "stem_stride", 2))
-        if stem_stride < 1:
-            raise AssertionError("ConvEncoder config.stem_stride must be >= 1.")
-        use_norm = bool(config.norm)
-        bias = not use_norm
-        self.stem = nn.Sequential(
-            Conv2dSamePad(input_ch,
-                          self.depths[0],
-                          kernel_size,
-                          stride=stem_stride,
-                          bias=bias),
-            _maybe_norm_2d(self.depths[0], use_norm),
-            act(),
-        )
-        h, w = self._downsample_dims(h, w, stem_stride)
-        in_dim = self.depths[0]
-        stages = []
-        for stage_idx, (depth,
-                        block_count) in enumerate(zip(self.depths,
-                                                      self.blocks)):
-            blocks = []
-            for block_idx in range(block_count):
-                stride = 1 if stage_idx == 0 or block_idx > 0 else 2
-                blocks.append(
-                    ResNetBasicBlock(in_dim,
-                                     depth,
-                                     kernel_size,
-                                     act,
-                                     use_norm,
-                                     stride=stride))
-                in_dim = depth
-                h, w = self._downsample_dims(h, w, stride)
-            stages.append(nn.Sequential(*blocks))
-        if h < self._minres or w < self._minres:
-            raise AssertionError(
-                "ConvEncoder output resolution fell below config.minres "
-                f"(got {(h, w)}, minres={self._minres}).")
+        self.kernel_size = int(config.kernel_size)
+        in_dim = input_ch
+        layers = []
+        for depth in self.depths:
+            layers.append(
+                Conv2dSamePad(
+                    in_channels=in_dim,
+                    out_channels=depth,
+                    kernel_size=self.kernel_size,
+                    stride=1,
+                    bias=True,
+                ))
+            layers.append(nn.MaxPool2d(2, 2))
+            if config.norm:
+                layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
+            layers.append(act())
+            in_dim = depth
+            h, w = h // 2, w // 2
 
         self.out_dim = self.depths[-1] * h * w
-        self.layers = nn.Sequential(*stages)
-
-    @staticmethod
-    def _downsample_dims(h: int, w: int, stride: int):
-        if stride == 1:
-            return h, w
-        return (h + stride - 1) // stride, (w + stride - 1) // stride
+        self.layers = nn.Sequential(*layers)
 
     def forward(self, obs):
         """Encode image-like observations with a CNN."""
@@ -294,13 +263,83 @@ class ConvEncoder(nn.Module):
         x = obs.reshape(-1, *obs.shape[-3:])
         # (B*T, C, H, W)
         x = x.permute(0, 3, 1, 2)
-        x = self.stem(x)
         # (B*T, C_feat, H_feat, W_feat)
         x = self.layers(x)
         # (B*T, C_feat*H_feat*W_feat)
         x = x.reshape(x.shape[0], -1)
         # (B, T, C_feat*H_feat*W_feat)
         return x.reshape(*obs.shape[:-3], x.shape[-1])
+
+
+class ConvDecoder(nn.Module):
+
+    def __init__(self, config, deter, flat_stoch, shape=(3, 64, 64)):
+        super().__init__()
+        act = getattr(torch.nn, config.act)
+        self._shape = shape
+        self.depths = tuple(
+            int(config.depth) * int(mult) for mult in list(config.mults))
+        factor = 2**len(self.depths)
+        minres = [int(x // factor) for x in shape[1:]]
+        self.min_shape = (*minres, self.depths[-1])
+        self.bspace = int(config.bspace)
+        self.kernel_size = int(config.kernel_size)
+        self.units = int(config.units)
+        u, g = math.prod(self.min_shape), self.bspace
+        self.sp0 = BlockLinear(deter, u, g)
+        self.sp1 = nn.Sequential(
+            nn.Linear(flat_stoch, 2 * self.units),
+            nn.RMSNorm(2 * self.units, eps=1e-04, dtype=torch.float32),
+            act(),
+        )
+        self.sp2 = nn.Linear(2 * self.units, math.prod(self.min_shape))
+        self.sp_norm = nn.Sequential(
+            nn.RMSNorm(self.depths[-1], eps=1e-04, dtype=torch.float32),
+            act(),
+        )
+
+        layers = []
+        in_dim = self.depths[-1]
+        for depth in reversed(self.depths[:-1]):
+            layers.append(nn.Upsample(scale_factor=2, mode="nearest"))
+            layers.append(
+                Conv2dSamePad(in_dim,
+                              depth,
+                              self.kernel_size,
+                              stride=1,
+                              bias=True))
+            layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
+            layers.append(act())
+            in_dim = depth
+        layers.append(nn.Upsample(scale_factor=2, mode="nearest"))
+        layers.append(
+            Conv2dSamePad(in_dim,
+                          self._shape[0],
+                          self.kernel_size,
+                          stride=1,
+                          bias=True))
+        self.layers = nn.Sequential(*layers)
+        self.apply(weight_init_)
+
+    def forward(self, stoch, deter):
+        B_T = deter.shape[:-1]
+        x0 = deter.reshape(B_T.numel(), deter.shape[-1])
+        x1 = stoch.reshape(B_T.numel(), -1)
+
+        H_feat, W_feat, C_feat = self.min_shape
+        x0 = self.sp0(x0)
+        x0 = x0.reshape(-1, self.bspace, H_feat, W_feat, C_feat // self.bspace)
+        x0 = x0.permute(0, 2, 3, 1, 4).reshape(-1, H_feat, W_feat, C_feat)
+
+        x1 = self.sp1(x1)
+        x1 = self.sp2(x1).reshape(-1, H_feat, W_feat, C_feat)
+
+        x = self.sp_norm(x0 + x1)
+        x = x.permute(0, 3, 1, 2)
+        x = self.layers(x)
+        x = x.permute(0, 2, 3, 1)
+        x = torch.sigmoid(x)
+        return x.reshape(*B_T, *x.shape[1:])
 
 
 class MLP(nn.Module):

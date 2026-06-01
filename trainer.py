@@ -123,9 +123,9 @@ class OnlineTrainer:
                     log_metrics[key] += value[:, 0] * ~once_done
             once_done |= done
         metrics = {
-            "t": train_step,
-            "eval_score": returns.mean(),
-            "eval_length": steps.to(torch.float32).mean(),
+            "step": train_step,
+            "score": returns.mean(),
+            "len": steps.to(torch.float32).mean(),
         }
         for key, value in log_metrics.items():
             if key == "log_success":
@@ -169,9 +169,9 @@ class OnlineTrainer:
                         self.logger.info(
                             "episode: %s",
                             self._format_metrics({
-                                "t": step + i,
-                                "ep_ret": returns[i],
-                                "ep_len": lengths[i],
+                                "step": step + i,
+                                "score": returns[i],
+                                "len": lengths[i],
                             }))
                         returns[i] = lengths[i] = 0
             step += int((

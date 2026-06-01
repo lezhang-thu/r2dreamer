@@ -1,13 +1,11 @@
 task: atari_alien
-#steps: 4.1e5
-steps: 4.1e6
+steps: 4.1e5
 env_num: 1
 #eval_episode_num: 100
 eval_episode_num: 10
 action_repeat: 4
 train_ratio: 128
-#time_limit: 108000
-time_limit: 20476
+time_limit: 108000
 
 seed: ${seed}
 device: ${device}
@@ -16,15 +14,15 @@ size: [64, 64]
 encoder:
   mlp_keys: '$^'
   cnn_keys: 'image'
+decoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
 
 gray: False
 noops: 30
-#noops: 0
 lives: unused
 sticky: False
-#sticky: True
 actions: needed
-#actions: all
 pooling: 2
 aggregate: max
 resize: pillow

@@ -5,9 +5,9 @@ horizon: 333
 lamb: 0.95
 compile: True
 log_grads: False
-grad_accum_steps: 2
+grad_accum_steps: 1
 device: ${device}
-rep_loss: "r2dreamer"  # only supported rep loss
+rep_loss: "r2dreamer"
 
 lr: 4e-5
 agc: 0.3
@@ -20,6 +20,7 @@ slow_target_update: 1
 slow_target_fraction: 0.02
 
 loss_scales:
+  recon: 1.0
   barlow: 0.05
   rew: 1.0
   con: 1.0
@@ -31,26 +32,20 @@ loss_scales:
 r2dreamer:
   lambd: 5e-4
 
-rssm:
-  stoch: 32
-  unimix_ratio: 0.01
-
 transformer:
-  stoch: ${model.rssm.stoch}
-  deter: ${model.deter}
-  discrete: ${model.discrete}
-  unimix_ratio: ${model.rssm.unimix_ratio}
+  stoch: 32
+  discrete: 48
+  unimix_ratio: 0.01
   act: ${model.act}
   rope_base: 1000000.0
   rope_max_seq_len: 32768
-  head_hidden: ${model.hidden}
   post_layers: 1
   prior_layers: 2
+  deter: 512
   n_heads: 8
-  #n_layers: 4
-  n_layers: 6
-  #d_ff: 4096
   d_ff: 2048
+  n_layers: 6
+  dropout: 0.1
   memory_size: ${batch_length}
   device: ${device}
 
@@ -70,12 +65,40 @@ encoder:
   cnn:
     act: ${model.act}
     norm: ${model.norm}
-    kernel_size: 3
-    stem_stride: 2
+    kernel_size: 5
     minres: 4
-    depth: ${model.depth}  # base channel width; stage widths are depth * mults
+    depth: ${model.depth}
     mults: [2, 3, 4, 4]
-    blocks: [1, 1, 1, 1]  # one BasicBlock per stage = 8 main-path convs
+
+decoder:
+  mlp_keys: ${env.decoder.mlp_keys}
+  cnn_keys: ${env.decoder.cnn_keys}
+  mlp_dist:
+    name: 'symlog_mse'
+  cnn_dist:
+    name: 'mse'
+  mlp:
+    shape: null
+    layers: 3
+    units: ${model.units}
+    act: ${model.act}
+    norm: ${model.norm}
+    dist:
+      name: 'identity'
+    device: ${device}
+    outscale: 1.0
+    symlog_inputs: False
+    name: 'mlp_decoder'
+  cnn:
+    depth: ${model.depth}
+    units: ${model.units}
+    bspace: 8
+    mults: [2, 3, 4, 4]
+    act: ${model.act}
+    norm: ${model.norm}
+    kernel_size: 5
+    minres: 4
+    outscale: 1.0
 
 reward:
   shape: [255,]

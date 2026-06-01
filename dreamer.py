@@ -29,9 +29,10 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(
             act_space.shape)
         self._act_space_shape = tuple(map(int, getattr(act_space, "shape", ())))
-        if str(config.rep_loss) != "r2dreamer":
-            raise AssertionError("config.rep_loss must be 'r2dreamer' "
-                                 f"(got {str(config.rep_loss)!r}).")
+        self.rep_loss = str(config.rep_loss)
+        if self.rep_loss not in ("dreamer", "r2dreamer"):
+            raise AssertionError("config.rep_loss must be 'dreamer' or "
+                                 f"'r2dreamer' (got {self.rep_loss!r}).")
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -41,6 +42,7 @@ class Dreamer(nn.Module):
             config.transformer,
             self.embed_size,
             self.act_dim,
+            hidden=int(config.hidden),
         )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
@@ -71,9 +73,8 @@ class Dreamer(nn.Module):
             )
 
         # Actor-critic components
-        self.rl_feat_size = self.rssm.feat_size
-        self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
-        self.value = networks.MLPHead(config.critic, self.rl_feat_size)
+        self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
+        self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -95,10 +96,21 @@ class Dreamer(nn.Module):
             "encoder": self.encoder,
         }
 
-        # R2-Dreamer redundancy-reduction head.
-        self.prj = Projector(self.rssm.feat_size, self.embed_size)
-        modules.update({"projector": self.prj})
-        self.barlow_lambd = float(config.r2dreamer.lambd)
+        if self.rep_loss == "dreamer":
+            self.decoder = networks.MultiDecoder(
+                config.decoder,
+                self.rssm._deter,
+                self.rssm.flat_stoch,
+                shapes,
+            )
+            recon = self._loss_scales.pop("recon")
+            self._loss_scales.update({k: recon for k in self.decoder.all_keys})
+            modules.update({"decoder": self.decoder})
+        else:
+            # R2-Dreamer redundancy-reduction head.
+            self.prj = Projector(self.rssm.feat_size, self.embed_size)
+            modules.update({"projector": self.prj})
+            self.barlow_lambd = float(config.r2dreamer.lambd)
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -393,9 +405,18 @@ class Dreamer(nn.Module):
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
-        x1 = self.prj(feat.reshape(B * T, -1))
-        x2 = embed.reshape(B * T, -1).detach()
-        losses["barlow"] = self._barlow_loss(x1, x2, self.barlow_lambd)
+        if self.rep_loss == "dreamer":
+            recon_losses = {
+                key: -dist.log_prob(data[key]).mean()
+                for key, dist in self.decoder(post_stoch, post_deter).items()
+            }
+            losses.update(recon_losses)
+        elif self.rep_loss == "r2dreamer":
+            x1 = self.prj(feat.reshape(B * T, -1))
+            x2 = embed.reshape(B * T, -1).detach()
+            losses["barlow"] = self._barlow_loss(x1, x2, self.barlow_lambd)
+        else:
+            raise NotImplementedError(self.rep_loss)
 
         rew_loss = -self.reward(feat).log_prob(
             to_f32(data["reward"]).unsqueeze(-1))  # (B, T)

@@ -7,7 +7,8 @@ SEED_START=0
 #SEED_END=400
 SEED_END=0
 SEED_STEP=100
-METHOD=r2dreamer
+#METHOD=r2dreamer
+METHOD=dreamer
 
 # ==== Tasks ====
 tasks=(
@@ -53,6 +54,6 @@ for task in "${tasks[@]}"; do
 			model=size-transformer \
 			model.rep_loss=${METHOD} \
 			seed=$seed \
-			batch_size=8 batch_length=64
+			batch_size=16 batch_length=64
 	done
 done
