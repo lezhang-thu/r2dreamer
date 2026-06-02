@@ -5,7 +5,7 @@ horizon: 333
 lamb: 0.95
 compile: True
 log_grads: False
-grad_accum_steps: 1
+grad_accum_steps: 2
 device: ${device}
 rep_loss: "r2dreamer"
 
@@ -34,18 +34,17 @@ r2dreamer:
 
 transformer:
   stoch: 32
-  discrete: 48
+  discrete: 64
   unimix_ratio: 0.01
   act: ${model.act}
   rope_base: 1000000.0
   rope_max_seq_len: 32768
   post_layers: 1
   prior_layers: 2
-  deter: 512
-  n_heads: 8
-  d_ff: 2048
+  deter: 1024
+  n_heads: 16
+  d_ff: 3072
   n_layers: 6
-  dropout: 0.1
   memory_size: ${batch_length}
   device: ${device}
 
@@ -65,10 +64,12 @@ encoder:
   cnn:
     act: ${model.act}
     norm: ${model.norm}
-    kernel_size: 5
+    kernel_size: 3
+    stem_stride: 2
     minres: 4
-    depth: ${model.depth}
+    depth: ${model.depth}  # base channel width; stage widths are depth * mults
     mults: [2, 3, 4, 4]
+    blocks: [1, 1, 1, 1]  # one BasicBlock per stage = 8 main-path convs
 
 decoder:
   mlp_keys: ${env.decoder.mlp_keys}

@@ -22,7 +22,6 @@ class TransformerRSSM(nn.Module):
         self._n_heads = int(config.n_heads)
         self._n_layers = int(config.n_layers)
         self._d_ff = int(config.d_ff)
-        self._dropout = float(getattr(config, "dropout", 0.0))
         self._memory_size = int(getattr(config, "memory_size", None))
         self._cache_size = self._memory_size
         act_fn = getattr(torch.nn, config.act)
@@ -202,9 +201,6 @@ class TransformerRSSM(nn.Module):
                                                     dtype=torch.long))
         return x_t.transpose(1, 2)
 
-    def _dropout_p(self):
-        return self._dropout if self.training else 0.0
-
     def _fwd_segment_with_carry(self, x, carry, positions, reset):
         """Forward a segment against detached sliding-window memory."""
         B, T, D = x.shape
@@ -264,16 +260,14 @@ class TransformerRSSM(nn.Module):
             x = F.scaled_dot_product_attention(Q,
                                                K_all,
                                                V_all,
-                                               attn_mask=attn_mask,
-                                               dropout_p=self._dropout_p())
+                                               attn_mask=attn_mask)
             x = x.transpose(1, 2).reshape(B, T, D)
-            x = res + F.dropout(
-                self._o_projs[i](x), p=self._dropout, training=self.training)
+            x = res + self._o_projs[i](x)
 
             res = x
             x = self._ffn_norms[i](x)
             x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
-            x = res + F.dropout(x, p=self._dropout, training=self.training)
+            x = res + x
 
             if M > 0:
                 new_k = k_all[:, -M:]
@@ -551,17 +545,15 @@ class TransformerRSSM(nn.Module):
             x_t = F.scaled_dot_product_attention(Q,
                                                  K_cached,
                                                  V_cached,
-                                                 attn_mask=attn_mask,
-                                                 dropout_p=self._dropout_p())
+                                                 attn_mask=attn_mask)
             x_t = x_t.transpose(1, 2).reshape(B, 1, D)
-            x_t = res + F.dropout(
-                self._o_projs[i](x_t), p=self._dropout, training=self.training)
+            x_t = res + self._o_projs[i](x_t)
 
             # FFN sublayer
             res = x_t
             x_t = self._ffn_norms[i](x_t)
             x_t = self._ff2s[i](self._act_fn(self._ff1s[i](x_t)))
-            x_t = res + F.dropout(x_t, p=self._dropout, training=self.training)
+            x_t = res + x_t
 
         x_t = self._outnorm(x_t)
         h_t = x_t[:, 0]  # (B, D)
