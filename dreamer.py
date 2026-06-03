@@ -5,14 +5,13 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 from torch.amp import GradScaler, autocast
-from torch.nn.utils import clip_grad_norm_
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 import networks
 import rssm
 import tools
 from networks import Projector
+from optim import DreamerV3Optimizer
 from tools import to_f32
 
 
@@ -105,12 +104,16 @@ class Dreamer(nn.Module):
             f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters."
         )
 
-        self._grad_clip = float(getattr(config, "grad_clip", 1.0))
-        self._optimizer = AdamW(
-            self._adamw_param_groups(modules),
+        self._optimizer = DreamerV3Optimizer(
+            self._optimizer_param_groups(modules, config.weight_decay),
             lr=config.lr,
+            agc=config.agc,
+            pmin=config.pmin,
+            betas=(config.beta1, config.beta2),
+            eps=config.eps,
+            weight_decay=config.weight_decay,
         )
-        self._scaler = GradScaler()
+        self._scaler = GradScaler(init_scale=1e4, growth_interval=1000)
 
         def lr_lambda(step):
             if config.warmup:
@@ -157,7 +160,7 @@ class Dreamer(nn.Module):
             nn.SyncBatchNorm,
         )
 
-    def _adamw_param_groups(self, modules):
+    def _optimizer_param_groups(self, modules, weight_decay):
         no_decay_ids = set()
         for module in modules.values():
             if isinstance(module, nn.Parameter):
@@ -178,15 +181,18 @@ class Dreamer(nn.Module):
             else:
                 decay_params.append(param)
 
-        return [
-            {
-                "params": decay_params
-            },
-            {
+        groups = []
+        if decay_params:
+            groups.append({
+                "params": decay_params,
+                "weight_decay": weight_decay,
+            })
+        if no_decay_params:
+            groups.append({
                 "params": no_decay_params,
-                "weight_decay": 0.0
-            },
-        ]
+                "weight_decay": 0.0,
+            })
+        return groups
 
     def _freeze_copy(self, module):
         """Deepcopy then share .data so the clone always sees latest weights.
@@ -318,14 +324,18 @@ class Dreamer(nn.Module):
             ]
             metrics["opt/grad_norm"] = tools.compute_global_norm(grads)
             metrics["opt/grad_rms"] = tools.compute_rms(grads)
-        clip_grad_norm_(self._named_params.values(), self._grad_clip)
+        scale_before = self._scaler.get_scale()
         self._scaler.step(self._optimizer)
         self._scaler.update()
-        self._scheduler.step()
+        scale_after = self._scaler.get_scale()
+        grad_overflow = scale_after < scale_before
+        if not grad_overflow:
+            self._scheduler.step()
         self._optimizer.zero_grad(set_to_none=True)
         self._train_carry = self._detach_carry(next_train_carry)
         metrics["opt/lr"] = self._scheduler.get_last_lr()[0]
-        metrics["opt/grad_scale"] = self._scaler.get_scale()
+        metrics["opt/grad_scale"] = scale_after
+        metrics["opt/grad_overflow"] = float(grad_overflow)
         return metrics
 
     @staticmethod
