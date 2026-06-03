@@ -5,13 +5,14 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 from torch.amp import GradScaler, autocast
+from torch.nn.utils import clip_grad_norm_
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 import networks
 import rssm
 import tools
 from networks import Projector
-from optim import LaProp, clip_grad_agc_
 from tools import to_f32
 
 
@@ -104,18 +105,10 @@ class Dreamer(nn.Module):
             f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters."
         )
 
-        def _agc(params):
-            clip_grad_agc_(params,
-                           float(config.agc),
-                           float(config.pmin),
-                           foreach=True)
-
-        self._agc = _agc
-        self._optimizer = LaProp(
-            self._named_params.values(),
+        self._grad_clip = float(getattr(config, "grad_clip", 1.0))
+        self._optimizer = AdamW(
+            self._adamw_param_groups(modules),
             lr=config.lr,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
         )
         self._scaler = GradScaler()
 
@@ -148,6 +141,52 @@ class Dreamer(nn.Module):
         # slow_value should be always eval mode
         self._slow_value.train(False)
         return self
+
+    @staticmethod
+    def _norm_module_types():
+        return (
+            nn.BatchNorm1d,
+            nn.BatchNorm2d,
+            nn.BatchNorm3d,
+            nn.GroupNorm,
+            nn.InstanceNorm1d,
+            nn.InstanceNorm2d,
+            nn.InstanceNorm3d,
+            nn.LayerNorm,
+            nn.RMSNorm,
+            nn.SyncBatchNorm,
+        )
+
+    def _adamw_param_groups(self, modules):
+        no_decay_ids = set()
+        for module in modules.values():
+            if isinstance(module, nn.Parameter):
+                continue
+            for submodule in module.modules():
+                if isinstance(submodule, self._norm_module_types()):
+                    no_decay_ids.update(
+                        id(param)
+                        for param in submodule.parameters(recurse=False))
+
+        decay_params = []
+        no_decay_params = []
+        for name, param in self._named_params.items():
+            if not param.requires_grad:
+                continue
+            if name.endswith(".bias") or id(param) in no_decay_ids:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        return [
+            {
+                "params": decay_params
+            },
+            {
+                "params": no_decay_params,
+                "weight_decay": 0.0
+            },
+        ]
 
     def _freeze_copy(self, module):
         """Deepcopy then share .data so the clone always sees latest weights.
@@ -279,7 +318,7 @@ class Dreamer(nn.Module):
             ]
             metrics["opt/grad_norm"] = tools.compute_global_norm(grads)
             metrics["opt/grad_rms"] = tools.compute_rms(grads)
-        self._agc(self._named_params.values())
+        clip_grad_norm_(self._named_params.values(), self._grad_clip)
         self._scaler.step(self._optimizer)
         self._scaler.update()
         self._scheduler.step()

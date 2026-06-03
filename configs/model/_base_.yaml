@@ -9,11 +9,7 @@ device: ${device}
 rep_loss: "r2dreamer"  # only supported rep loss
 
 lr: 4e-5
-agc: 0.3
-pmin: 1e-3
-eps: 1e-20
-beta1: 0.9
-beta2: 0.999
+grad_clip: 1.0
 warmup: 1000
 slow_target_update: 1
 slow_target_fraction: 0.02
@@ -47,7 +43,7 @@ transformer:
   post_layers: 1
   prior_layers: 2
   n_heads: 8
-  n_layers: 6
+  n_layers: 10
   d_ff: 2048
   memory_size: ${batch_length}
   segment_length: ${batch_length}
