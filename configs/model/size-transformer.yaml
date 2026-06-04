@@ -8,3 +8,7 @@ depth: 64
 units: 1024
 act: 'SiLU'
 norm: True
+
+transformer:
+  feat_deter_dim: 1024
+  feat_stoch_dim: 512

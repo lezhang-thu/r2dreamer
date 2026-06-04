@@ -40,7 +40,7 @@ class TransformerRSSM(nn.Module):
         act_fn = getattr(torch.nn, config.act)
 
         self.flat_stoch = self._stoch * self._discrete
-        self.feat_size = self.flat_stoch + self._deter
+        self.raw_feat_size = self.flat_stoch + self._deter
 
         D = self._deter
         H = self._n_heads
@@ -61,6 +61,37 @@ class TransformerRSSM(nn.Module):
 
         # Activation for FFN sublayers
         self._act_fn = act_fn()
+
+        # Downstream feature adapter. This keeps the Transformer width small
+        # while giving heads a balanced nonlinear representation of context
+        # and stochastic state.
+        feat_deter_dim = getattr(config, 'feat_deter_dim', None)
+        feat_stoch_dim = getattr(config, 'feat_stoch_dim', None)
+        if (feat_deter_dim is None) != (feat_stoch_dim is None):
+            raise AssertionError("feat_deter_dim and feat_stoch_dim must be "
+                                 "configured together.")
+        self._use_feat_adapter = feat_deter_dim is not None
+        if self._use_feat_adapter:
+            self._feat_deter_dim = int(feat_deter_dim)
+            self._feat_stoch_dim = int(feat_stoch_dim)
+            if self._feat_deter_dim < 1 or self._feat_stoch_dim < 1:
+                raise AssertionError(
+                    "feat_deter_dim and feat_stoch_dim must be positive.")
+            self._deter_feat = nn.Sequential(
+                nn.Linear(D, self._feat_deter_dim, bias=True),
+                nn.RMSNorm(self._feat_deter_dim, eps=1e-04,
+                           dtype=torch.float32),
+                act_fn(),
+            )
+            self._stoch_feat = nn.Sequential(
+                nn.Linear(self.flat_stoch, self._feat_stoch_dim, bias=True),
+                nn.RMSNorm(self._feat_stoch_dim, eps=1e-04,
+                           dtype=torch.float32),
+                act_fn(),
+            )
+            self.feat_size = self._feat_deter_dim + self._feat_stoch_dim
+        else:
+            self.feat_size = self.raw_feat_size
 
         # Input projection: (flat_stoch + action) -> deter
         self._inp_proj = nn.Linear(self.flat_stoch + act_dim, D)
@@ -614,6 +645,10 @@ class TransformerRSSM(nn.Module):
     def get_feat(self, stoch, deter):
         """Flatten stoch and concatenate with deter."""
         stoch = stoch.reshape(*stoch.shape[:-2], self._stoch * self._discrete)
+        if self._use_feat_adapter:
+            deter = self._deter_feat(deter)
+            stoch = self._stoch_feat(stoch)
+            return torch.cat([deter, stoch], -1)
         return torch.cat([stoch, deter], -1)
 
     def get_dist(self, logit):
