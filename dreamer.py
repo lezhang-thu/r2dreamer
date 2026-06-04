@@ -519,18 +519,19 @@ class Dreamer(nn.Module):
                 s_stoch, s_deter, s_carry)
             ac_total = (self._loss_scales["policy"] * ac_losses["policy"] +
                         self._loss_scales["value"] * ac_losses["value"])
-            repval_losses, repval_metrics = self._replay_value_forward(
-                data, imag_source["feat"], replay_boot)
-            repval_total = (self._loss_scales["repval"] *
-                            repval_losses["repval"])
+            #repval_losses, repval_metrics = self._replay_value_forward(
+            #    data, imag_source["feat"], replay_boot)
+            #repval_total = (self._loss_scales["repval"] *
+            #                repval_losses["repval"])
         losses.update(ac_losses)
-        losses.update(repval_losses)
+        #losses.update(repval_losses)
         metrics.update(ac_metrics)
-        metrics.update(repval_metrics)
+        #metrics.update(repval_metrics)
 
         world_model_loss = sum(self._loss_scales[name] * value
                                for name, value in wm_losses.items())
-        opt_loss = ac_total + repval_total + world_model_loss
+        #opt_loss = ac_total + repval_total + world_model_loss
+        opt_loss = ac_total + world_model_loss
         losses.update(wm_losses)
         metrics.update(wm_metrics)
         return opt_loss, losses, metrics, next_carry

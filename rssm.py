@@ -64,6 +64,14 @@ class TransformerRSSM(nn.Module):
 
         # Input projection: (flat_stoch + action) -> deter
         self._inp_proj = nn.Linear(self.flat_stoch + act_dim, D)
+        self._action_resid_scale = float(
+            getattr(config, 'action_resid_scale', 0.1))
+        self._action_resid = nn.Sequential(
+            nn.Linear(act_dim, D, bias=True),
+            nn.RMSNorm(D, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+            nn.Linear(D, D, bias=False),
+        )
 
         # Per-layer transformer components
         self._attn_norms = nn.ModuleList()
@@ -135,6 +143,12 @@ class TransformerRSSM(nn.Module):
 
         self.apply(weight_init_)
 
+    def _input_token(self, stoch_flat, action_norm):
+        x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
+        if self._action_resid_scale:
+            x = x + self._action_resid_scale * self._action_resid(action_norm)
+        return x
+
     # ------------------------------------------------------------------
     # Training path
     # ------------------------------------------------------------------
@@ -182,7 +196,7 @@ class TransformerRSSM(nn.Module):
             stoch = post_dist.base_dist.mode
 
         stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)
-        x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
+        x = self._input_token(stoch_flat, action_norm)
         h, kv, next_carry = self._fwd_segment_with_carry(
             x, carry, positions, reset)
 
@@ -500,7 +514,7 @@ class TransformerRSSM(nn.Module):
 
         # Input projection
         stoch_flat = stoch.reshape(B, self.flat_stoch)
-        x_t = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
+        x_t = self._input_token(stoch_flat, action_norm)
         x_t = x_t.unsqueeze(1)  # (B, 1, D)
 
         kv_cache = carry['kv_cache']  # (B, L, 2, M, D)
