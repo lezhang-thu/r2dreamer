@@ -117,7 +117,7 @@ class Dreamer(nn.Module):
 
         def lr_lambda(step):
             if config.warmup:
-                return min(1.0, (step + 1) / config.warmup)
+                return min(1.0, step / config.warmup)
             return 1.0
 
         self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)

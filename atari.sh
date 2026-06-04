@@ -28,7 +28,7 @@ tasks=(
 	#    "atari_hero"
 	#    "atari_jamesbond"
 	#    "atari_kangaroo"
-	    "atari_krull"
+	#    "atari_krull"
 	#    "atari_kung_fu_master"
 	#    "atari_ms_pacman"
 	#    "atari_pong"

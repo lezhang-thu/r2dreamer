@@ -14,7 +14,7 @@ pmin: 1e-3
 eps: 1e-20
 beta1: 0.9
 beta2: 0.999
-weight_decay: 0.0
+weight_decay: 0.01
 warmup: 1000
 slow_target_update: 1
 slow_target_fraction: 0.02
