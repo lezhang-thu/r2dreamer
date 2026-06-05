@@ -5,8 +5,8 @@ the corresponding implementation choices.
 
 ## 1. Action Conditioning in Transformer RSSM Tokens
 
-The Transformer RSSM builds each transition token from the stochastic state and
-the current action:
+The original Transformer RSSM transition token was built from the stochastic
+state and the current action using one concat projection:
 
 ```python
 x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
@@ -26,36 +26,28 @@ The concern is relative branch strength. With `stoch=32`, the stochastic state
 contains 32 active categorical entries, while the Atari action contributes one
 active one-hot entry. This can make the action path weaker at initialization.
 A separate plain linear action projection would not solve this, because affine
-projections can be merged into the current concat projection.
+projections can be merged into the concat projection.
 
 ### Implemented Solution
 
-Keep the existing concat projection, but add a nonlinear action-only residual:
+Use separate nonlinear stochastic and action input branches:
 
 ```python
-x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
-x = x + action_resid_scale * self._action_resid(action_norm)
+stoch_token = self._stoch_in(stoch_flat)
+action_token = self._action_in(action_norm)
+x = stoch_token + action_token
 ```
 
-where `_action_resid` is:
+Each branch is:
 
 ```python
-Linear(act_dim, deter) -> RMSNorm -> activation -> Linear(deter, deter)
+Linear -> RMSNorm -> activation
 ```
 
-This is intentionally not mergeable into `_inp_proj` because it includes
-normalization and activation. It gives actions a dedicated nonlinear route into
-the Transformer token while preserving the previous tokenization path.
-
-Config knob:
-
-```yaml
-model:
-  transformer:
-    action_resid_scale: 0.1
-```
-
-Set `action_resid_scale: 0.0` to disable the residual ablation.
+This is intentionally not mergeable into a single affine concat projection
+because each branch has its own normalization and activation. It gives actions a
+dedicated nonlinear route into the Transformer token and also normalizes the
+stochastic branch separately before the two branches are summed.
 
 ## 2. Downstream Stochastic vs. Deterministic Feature Balance
 
@@ -141,4 +133,3 @@ adapted_feat_size = 1024 + 512 = 1536
 
 This biases the downstream representation toward deterministic context without
 increasing Transformer width or memory.
-

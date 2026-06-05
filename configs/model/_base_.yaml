@@ -52,7 +52,6 @@ transformer:
   d_ff: 2048
   memory_size: ${batch_length}
   segment_length: ${batch_length}
-  action_resid_scale: 0.1
   feat_deter_dim: null
   feat_stoch_dim: null
   device: ${device}
