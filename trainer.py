@@ -28,72 +28,75 @@ class OnlineTrainer:
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
 
-    def eval(self, agent, train_step):
-        """Run evaluation episodes.
-
-        Environment stepping is executed on CPU to avoid GPU<->CPU synchronizations
-        in the worker processes. Observations are moved back to GPU asynchronously
-        (H2D with non_blocking=True) right before policy inference.
-        """
-        print("Evaluating the policy...")
+    def _eval_episode(self, agent, record_video):
         envs = self.eval_envs
-        agent.eval()
-        # (B,)
-        done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
-        once_done = torch.zeros(envs.env_num,
-                                dtype=torch.bool,
-                                device=agent.device)
-        steps = torch.zeros(envs.env_num,
-                            dtype=torch.int32,
-                            device=agent.device)
-        returns = torch.zeros(envs.env_num,
-                              dtype=torch.float32,
-                              device=agent.device)
+        if envs.env_num != 1:
+            raise AssertionError(
+                "Sequential eval expects exactly one eval environment, got "
+                f"{envs.env_num}.")
+        done = torch.ones(1, dtype=torch.bool, device=agent.device)
+        steps = torch.zeros(1, dtype=torch.int32, device=agent.device)
+        returns = torch.zeros(1, dtype=torch.float32, device=agent.device)
         log_metrics = {}
-        # cache is only used for video logging.
         cache = []
-        agent_state = agent.get_initial_state(envs.env_num)
-        # (B, A)
+        agent_state = agent.get_initial_state(1)
         act = agent_state["prev_action"].clone()
-        while not once_done.all():
-            steps += ~done * ~once_done
-            # Step environments on CPU.
-            # (B, A)
+
+        while True:
+            steps += ~done
             act_cpu = act.detach().to("cpu")
-            # (B,)
             done_cpu = done.detach().to("cpu")
             trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
-            # Move observations back to GPU asynchronously for the agent.
-            # dict of (B, 1, *)
             trans = trans_cpu.to(agent.device, non_blocking=True)
-            # (B,)
             done = done_cpu.to(agent.device)
 
-            # Store transition.
-            # Attach the action sent to env.step at this loop step.
-            # For envs that were done, trans may be reset output, so this is
-            # for logging/cache consistency rather than strict causality.
             trans["action"] = act
-            if len(cache) < self.batch_length:
+            if record_video and len(cache) < self.batch_length:
                 cache.append(trans.clone())
-            # (B, A)
             act, agent_state = agent.act(trans, agent_state, eval=True)
-            returns += trans["reward"][:, 0] * ~once_done
+            returns += trans["reward"][:, 0]
             for key, value in trans.items():
                 if key.startswith("log_"):
                     if key not in log_metrics:
                         log_metrics[key] = torch.zeros_like(returns)
-                    log_metrics[key] += value[:, 0] * ~once_done
-            once_done |= done
-        # dict of (B, T, *)
-        cache = torch.stack(cache, dim=1) if len(cache) else None
+                    log_metrics[key] += value[:, 0]
+            if done.all():
+                break
+
+        cache = torch.stack(cache, dim=1) if cache else None
+        return returns.squeeze(0), steps.squeeze(0), log_metrics, cache
+
+    def eval(self, agent, train_step):
+        """Run evaluation episodes sequentially on one environment.
+
+        Keeping the evaluation batch size at one avoids scaling GPU inference
+        memory with config.eval_episode_num while preserving the number of
+        evaluation episodes used for metrics.
+        """
+        print("Evaluating the policy...")
+        agent.eval()
+        returns = []
+        lengths = []
+        log_metrics = {}
+        cache = None
+        for episode in range(self.eval_episode_num):
+            ep_return, ep_length, ep_logs, ep_cache = self._eval_episode(
+                agent, record_video=(episode == 0))
+            returns.append(ep_return)
+            lengths.append(ep_length)
+            if cache is None and ep_cache is not None:
+                cache = ep_cache
+            for key, value in ep_logs.items():
+                log_metrics.setdefault(key, []).append(value.squeeze(0))
+
+        returns = torch.stack(returns)
+        lengths = torch.stack(lengths).to(torch.float32)
         self.logger.scalar("episode/eval_score", returns.mean())
-        self.logger.scalar("episode/eval_length",
-                           steps.to(torch.float32).mean())
-        for key, value in log_metrics.items():
+        self.logger.scalar("episode/eval_length", lengths.mean())
+        for key, values in log_metrics.items():
+            value = torch.stack(values)
             if key == "log_success":
-                value = torch.clip(value,
-                                   max=1.0)  # make sure 1.0 for success episode
+                value = torch.clip(value, max=1.0)
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
