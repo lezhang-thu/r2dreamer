@@ -133,3 +133,49 @@ adapted_feat_size = 1024 + 512 = 1536
 
 This biases the downstream representation toward deterministic context without
 increasing Transformer width or memory.
+
+## 3. Two-Pass Posterior Refinement
+
+Official DreamerV3 conditions the posterior stochastic state on both the current
+encoder token and deterministic context:
+
+```text
+q(stoch_t | obs_t, deter_t)
+```
+
+The original Transformer RSSM path inferred posterior stochastic state from the
+encoder token alone:
+
+```text
+z1_t = q(obs_t)
+```
+
+This keeps segment training parallel, but makes the stochastic state more like a
+per-frame code and less like a belief-state correction informed by temporal
+context.
+
+Exact DreamerV3-style posterior conditioning would make Transformer training
+sequential because `stoch_t` would depend on `h_prev_t`, while `h_prev_t` depends
+on previous posterior stochastic states. The implemented compromise keeps
+parallel training with two full-segment Transformer passes:
+
+```text
+z1_t = post1(obs_t)
+h1_prev_t = proposal_transformer_context(z1, action)
+z2_t = post2(obs_t, h1_prev_t)
+h2_prev_t = final_transformer_context(z2, action)
+```
+
+The first pass is only a proposal path. The final world-model state is
+`(z2, h2_prev)`.
+
+Consequently, prior and downstream heads use the refined state:
+
+```text
+prior_head(h2_prev_t) is trained to match z2_t
+reward/continue/actor/critic/projector use get_feat(z2_t, h2_prev_t)
+imagination samples z from prior_head(h_prev) and feeds z back into dynamics
+```
+
+This avoids the inconsistent variant where the prior learns to predict `z2` but
+the transition model is trained on `z1`.
