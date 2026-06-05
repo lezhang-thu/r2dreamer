@@ -5,8 +5,8 @@ the corresponding implementation choices.
 
 ## 1. Action Conditioning in Transformer RSSM Tokens
 
-The original Transformer RSSM transition token was built from the stochastic
-state and the current action using one concat projection:
+The Transformer RSSM transition token is built from the stochastic state and
+the current action using one concat projection:
 
 ```python
 x = self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
@@ -18,9 +18,9 @@ For Atari, discrete actions are wrapped as one-hot vectors. The normalization:
 action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 ```
 
-therefore leaves actions unchanged. The action part of `_inp_proj` is not a
-single scalar scale; for a one-hot action it is equivalent to selecting one
-learned `deter`-dimensional action embedding column.
+therefore leaves actions unchanged. The action part of `_inp_proj` is still not
+a single scalar scale; for a one-hot action it is equivalent to selecting one
+learned `deter`-dimensional action column inside the full concat projection.
 
 The concern is relative branch strength. With `stoch=32`, the stochastic state
 contains 32 active categorical entries, while the Atari action contributes one
@@ -28,26 +28,12 @@ active one-hot entry. This can make the action path weaker at initialization.
 A separate plain linear action projection would not solve this, because affine
 projections can be merged into the concat projection.
 
-### Implemented Solution
+### Current Setting
 
-Use separate nonlinear stochastic and action input branches:
-
-```python
-stoch_token = self._stoch_in(stoch_flat)
-action_token = self._action_in(action_norm)
-x = stoch_token + action_token
-```
-
-Each branch is:
-
-```python
-Linear -> RMSNorm -> activation
-```
-
-This is intentionally not mergeable into a single affine concat projection
-because each branch has its own normalization and activation. It gives actions a
-dedicated nonlinear route into the Transformer token and also normalizes the
-stochastic branch separately before the two branches are summed.
+The implementation intentionally uses the original concat projection for the
+world-model token path, so action conditioning is handled by `_inp_proj` jointly
+with `stoch_flat`. This keeps the action-input ablation simple and avoids adding
+a dedicated nonlinear action branch.
 
 ## 2. Downstream Stochastic vs. Deterministic Feature Balance
 

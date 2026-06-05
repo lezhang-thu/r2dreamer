@@ -93,19 +93,7 @@ class TransformerRSSM(nn.Module):
         else:
             self.feat_size = self.raw_feat_size
 
-        # Transition token input branches. Separate normalization and
-        # activation make this distinct from a single affine projection over
-        # concatenated stochastic state and action.
-        self._stoch_in = nn.Sequential(
-            nn.Linear(self.flat_stoch, D, bias=True),
-            nn.RMSNorm(D, eps=1e-04, dtype=torch.float32),
-            act_fn(),
-        )
-        self._action_in = nn.Sequential(
-            nn.Linear(act_dim, D, bias=True),
-            nn.RMSNorm(D, eps=1e-04, dtype=torch.float32),
-            act_fn(),
-        )
+        self._inp_proj = nn.Linear(self.flat_stoch + act_dim, D, bias=True)
 
         # Per-layer transformer components
         self._attn_norms = nn.ModuleList()
@@ -188,7 +176,7 @@ class TransformerRSSM(nn.Module):
         return head
 
     def _input_token(self, stoch_flat, action_norm):
-        return self._stoch_in(stoch_flat) + self._action_in(action_norm)
+        return self._inp_proj(torch.cat([stoch_flat, action_norm], -1))
 
     # ------------------------------------------------------------------
     # Training path
@@ -576,7 +564,7 @@ class TransformerRSSM(nn.Module):
         # Normalize action
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
-        # Input token branches
+        # Input token from concatenated stochastic state and normalized action.
         stoch_flat = stoch.reshape(B, self.flat_stoch)
         x_t = self._input_token(stoch_flat, action_norm)
         x_t = x_t.unsqueeze(1)  # (B, 1, D)
