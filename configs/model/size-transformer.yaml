@@ -10,5 +10,5 @@ act: 'SiLU'
 norm: True
 
 transformer:
-  feat_deter_dim: 1024
-  feat_stoch_dim: 512
+  feat_deter_dim: 8192
+  feat_stoch_dim: null

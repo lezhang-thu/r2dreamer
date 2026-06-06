@@ -169,13 +169,3 @@ imagination samples z from prior_head(h_prev) and feeds z back into dynamics
 
 This avoids the inconsistent variant where the prior learns to predict `z2` but
 the transition model is trained on `z1`.
-
-The proposal posterior is also trained with a one-way consistency loss:
-
-```text
-KL(stop_gradient(post_logit) || proposal_logit)
-```
-
-This encourages the proposal state `z1` to stay close to the refined state `z2`,
-reducing the mismatch between training refinement context and online carry
-context, without pulling the refined posterior back toward the weaker proposal.
