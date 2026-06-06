@@ -7,6 +7,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 
+import distributions as dists
 import networks
 import rssm
 import tools
@@ -70,6 +71,7 @@ class Dreamer(nn.Module):
 
         self._loss_scales = dict(config.loss_scales)
         self._loss_scales.setdefault("repval", 0.3)
+        self._loss_scales.setdefault("proposal", 0.3)
         self._log_grads = bool(config.log_grads)
 
         modules = {
@@ -382,10 +384,13 @@ class Dreamer(nn.Module):
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
         prior_logit = feat_dict['prior_logit']
+        proposal_logit = feat_dict["proposal_logit"]
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
                                                self.kl_free)
+        proposal_loss = dists.kl(post_logit.detach(), proposal_logit).sum(-1)
         losses["dyn"] = dyn_loss.mean()
         losses["rep"] = rep_loss.mean()
+        losses["proposal"] = proposal_loss.mean()
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
@@ -406,7 +411,8 @@ class Dreamer(nn.Module):
         metrics["rep_entropy"] = torch.mean(
             self.rssm.get_dist(post_logit).entropy())
         metrics["proposal_entropy"] = torch.mean(
-            self.rssm.get_dist(feat_dict["proposal_logit"]).entropy())
+            self.rssm.get_dist(proposal_logit).entropy())
+        metrics["proposal_kl"] = proposal_loss.mean()
 
         imag_source = {
             "post_stoch": post_stoch.detach(),

@@ -75,25 +75,27 @@ downstream feature representation is adapted after the Transformer.
 
 ### Implemented Solution
 
-Add a nonlinear feature adapter inside `TransformerRSSM.get_feat()`:
+Add an optional nonlinear feature adapter inside `TransformerRSSM.get_feat()`.
+The adapter branches are independent: either branch can be projected, while a
+`null` branch remains raw.
 
 ```python
 deter_feat = self._deter_feat(deter)
-stoch_feat = self._stoch_feat(stoch_flat)
-feat = torch.cat([deter_feat, stoch_feat], -1)
+feat = torch.cat([deter_feat, stoch_flat], -1)
 ```
 
-Each branch is:
+For projected branches, the transform is:
 
 ```python
 Linear -> RMSNorm -> activation
 ```
 
-This is not mergeable into the first layer of the downstream heads because each
-branch has separate normalization and nonlinearity. It keeps the Transformer
-state small while giving downstream modules a more balanced representation.
+This is not mergeable into the first layer of the downstream heads because the
+projected branch has its own normalization and nonlinearity. It keeps the
+Transformer state small while giving downstream modules a stronger deterministic
+context route.
 
-Base config leaves the adapter disabled:
+Base config leaves both branches raw:
 
 ```yaml
 model:
@@ -107,18 +109,20 @@ model:
 ```yaml
 model:
   transformer:
-    feat_deter_dim: 1024
-    feat_stoch_dim: 512
+    feat_deter_dim: 6144
+    feat_stoch_dim: null
 ```
 
 So downstream heads receive:
 
 ```text
-adapted_feat_size = 1024 + 512 = 1536
+adapted_feat_size = 6144 projected deter + 2048 raw stoch = 8192
 ```
 
-This biases the downstream representation toward deterministic context without
-increasing Transformer width or memory.
+This gives deterministic context a size100M-like downstream width without
+increasing Transformer width, attention memory, or KV-cache memory. It is a
+downstream feature-capacity approximation, not a true match to DreamerV3
+size100M's 6144-dimensional RSSM deterministic state.
 
 ## 3. Two-Pass Posterior Refinement
 
@@ -165,3 +169,13 @@ imagination samples z from prior_head(h_prev) and feeds z back into dynamics
 
 This avoids the inconsistent variant where the prior learns to predict `z2` but
 the transition model is trained on `z1`.
+
+The proposal posterior is also trained with a one-way consistency loss:
+
+```text
+KL(stop_gradient(post_logit) || proposal_logit)
+```
+
+This encourages the proposal state `z1` to stay close to the refined state `z2`,
+reducing the mismatch between training refinement context and online carry
+context, without pulling the refined posterior back toward the weaker proposal.

@@ -28,22 +28,31 @@ class OnlineTrainer:
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
 
-    def _eval_episode(self, agent, record_video):
+    def _eval_batch(self, agent, episode_count, record_video):
         envs = self.eval_envs
-        if envs.env_num != 1:
+        if not 1 <= episode_count <= envs.env_num:
             raise AssertionError(
-                "Sequential eval expects exactly one eval environment, got "
-                f"{envs.env_num}.")
-        done = torch.ones(1, dtype=torch.bool, device=agent.device)
-        steps = torch.zeros(1, dtype=torch.int32, device=agent.device)
-        returns = torch.zeros(1, dtype=torch.float32, device=agent.device)
+                "Eval batch episode_count must be in [1, env_num], got "
+                f"{episode_count} for env_num={envs.env_num}.")
+        done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
+        active = torch.arange(envs.env_num, device=agent.device) < episode_count
+        once_done = torch.zeros(envs.env_num,
+                                dtype=torch.bool,
+                                device=agent.device)
+        steps = torch.zeros(envs.env_num,
+                            dtype=torch.int32,
+                            device=agent.device)
+        returns = torch.zeros(envs.env_num,
+                              dtype=torch.float32,
+                              device=agent.device)
         log_metrics = {}
         cache = []
-        agent_state = agent.get_initial_state(1)
+        agent_state = agent.get_initial_state(envs.env_num)
         act = agent_state["prev_action"].clone()
 
-        while True:
-            steps += ~done
+        while not once_done[active].all():
+            valid = active & ~once_done
+            steps += valid & ~done
             act_cpu = act.detach().to("cpu")
             done_cpu = done.detach().to("cpu")
             trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
@@ -52,26 +61,27 @@ class OnlineTrainer:
 
             trans["action"] = act
             if record_video and len(cache) < self.batch_length:
-                cache.append(trans.clone())
+                cache.append(trans[:1].clone())
             act, agent_state = agent.act(trans, agent_state, eval=True)
-            returns += trans["reward"][:, 0]
+            returns += trans["reward"][:, 0] * valid
             for key, value in trans.items():
                 if key.startswith("log_"):
                     if key not in log_metrics:
                         log_metrics[key] = torch.zeros_like(returns)
-                    log_metrics[key] += value[:, 0]
-            if done.all():
-                break
+                    log_metrics[key] += value[:, 0] * valid
+            once_done |= done & active
 
         cache = torch.stack(cache, dim=1) if cache else None
-        return returns.squeeze(0), steps.squeeze(0), log_metrics, cache
+        return (returns[active], steps[active], {
+            key: value[active] for key, value in log_metrics.items()
+        }, cache)
 
     def eval(self, agent, train_step):
-        """Run evaluation episodes sequentially on one environment.
+        """Run evaluation episodes in mini-batches.
 
-        Keeping the evaluation batch size at one avoids scaling GPU inference
-        memory with config.eval_episode_num while preserving the number of
-        evaluation episodes used for metrics.
+        The eval environment count controls peak GPU inference batch size,
+        while config.eval_episode_num controls the number of episodes included
+        in the logged metrics.
         """
         print("Evaluating the policy...")
         agent.eval()
@@ -79,22 +89,29 @@ class OnlineTrainer:
         lengths = []
         log_metrics = {}
         cache = None
-        for episode in range(self.eval_episode_num):
-            ep_return, ep_length, ep_logs, ep_cache = self._eval_episode(
-                agent, record_video=(episode == 0))
+        episodes_done = 0
+        while episodes_done < self.eval_episode_num:
+            episode_count = min(self.eval_envs.env_num,
+                                self.eval_episode_num - episodes_done)
+            ep_return, ep_length, ep_logs, ep_cache = self._eval_batch(
+                agent,
+                episode_count,
+                record_video=(episodes_done == 0),
+            )
             returns.append(ep_return)
             lengths.append(ep_length)
             if cache is None and ep_cache is not None:
                 cache = ep_cache
             for key, value in ep_logs.items():
-                log_metrics.setdefault(key, []).append(value.squeeze(0))
+                log_metrics.setdefault(key, []).append(value)
+            episodes_done += episode_count
 
-        returns = torch.stack(returns)
-        lengths = torch.stack(lengths).to(torch.float32)
+        returns = torch.cat(returns)
+        lengths = torch.cat(lengths).to(torch.float32)
         self.logger.scalar("episode/eval_score", returns.mean())
         self.logger.scalar("episode/eval_length", lengths.mean())
         for key, values in log_metrics.items():
-            value = torch.stack(values)
+            value = torch.cat(values)
             if key == "log_success":
                 value = torch.clip(value, max=1.0)
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())

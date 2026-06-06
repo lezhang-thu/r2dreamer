@@ -2,6 +2,7 @@ task: atari_alien
 steps: 4.1e5
 env_num: 1
 eval_episode_num: 100
+eval_env_num: 10
 action_repeat: 4
 train_ratio: 128
 time_limit: 108000

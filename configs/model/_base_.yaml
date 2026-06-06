@@ -28,6 +28,7 @@ loss_scales:
   policy: 1.0
   value: 1.0
   repval: 0.3
+  proposal: 1.0
 
 r2dreamer:
   lambd: 5e-4
