@@ -75,31 +75,35 @@ downstream feature representation is adapted after the Transformer.
 
 ### Implemented Solution
 
-Add an optional nonlinear feature adapter inside `TransformerRSSM.get_feat()`.
-The adapter branches are independent: either branch can be projected, while a
-`null` branch remains raw.
+Add an optional deterministic feature source inside `TransformerRSSM.get_feat()`.
+The deterministic branch can either be a learned projection of the final
+512-dimensional residual state or the actual FFN hidden activation from the last
+Transformer block.
 
 ```python
-deter_feat = self._deter_feat(deter)
-feat = torch.cat([deter_feat, stoch_flat], -1)
+ffn_hidden = activation(last_block_ff1(ffn_norm(x)))
+feat = torch.cat([ffn_hidden_prev, stoch_flat], -1)
 ```
 
-For projected branches, the transform is:
+For the learned-projection branch, the transform remains:
 
 ```python
 Linear -> RMSNorm -> activation
 ```
 
-This is not mergeable into the first layer of the downstream heads because the
-projected branch has its own normalization and nonlinearity. It keeps the
-Transformer state small while giving downstream modules a stronger deterministic
-context route.
+For the FFN-hidden branch, the feature is not recovered from the final
+512-dimensional output. It is captured directly inside the last Transformer
+block and carried as `ffn_prev` alongside the 512-dimensional `h_prev`. It is
+used only as a downstream readout; attention KV memory, recurrence, and the
+prior still use the 512-dimensional `h_prev`.
 
-Base config leaves both branches raw:
+Base config leaves both branches raw and uses `h_prev` as the deterministic
+feature source:
 
 ```yaml
 model:
   transformer:
+    feat_deter_source: deter
     feat_deter_dim: null
     feat_stoch_dim: null
 ```
@@ -109,20 +113,22 @@ model:
 ```yaml
 model:
   transformer:
-    feat_deter_dim: 6144
+    d_ff: 8192
+    feat_deter_source: ffn_hidden
+    feat_deter_dim: null
     feat_stoch_dim: null
 ```
 
 So downstream heads receive:
 
 ```text
-adapted_feat_size = 6144 projected deter + 2048 raw stoch = 8192
+adapted_feat_size = 8192 last-block FFN hidden + 2048 raw stoch = 10240
 ```
 
-This gives deterministic context a size100M-like downstream width without
-increasing Transformer width, attention memory, or KV-cache memory. It is a
-downstream feature-capacity approximation, not a true match to DreamerV3
-size100M's 6144-dimensional RSSM deterministic state.
+This exposes the actual large intermediate FFN representation to reward,
+continue, actor, critic, and projector heads without increasing attention width
+or KV-cache memory. It is still a downstream readout: the RSSM temporal state
+passed between steps remains 512-dimensional.
 
 ## 3. Two-Pass Posterior Refinement
 

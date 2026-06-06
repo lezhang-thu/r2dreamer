@@ -244,14 +244,15 @@ class Dreamer(nn.Module):
             'kv_cache': state['kv_cache'],
             'pos': state['pos'],
             'h_prev': state['h_prev'],
+            'ffn_prev': state['ffn_prev'],
         }
         # Trainer provides (B, 1, *) tensors; squeeze time dim
         embed_sq = embed.squeeze(1)  # (B, E)
         is_first = obs["is_first"].squeeze(1)  # (B,)
         # Phase 1: posterior from tokens
-        carry, stoch, h_prev = self._frozen_rssm.get_feat_step(
+        carry, stoch, h_prev, deter_feat = self._frozen_rssm.get_feat_step(
             carry, embed_sq, is_first)
-        rl_feat = self._frozen_rssm.get_feat(stoch, h_prev)
+        rl_feat = self._frozen_rssm.get_feat(stoch, h_prev, deter_feat)
         action_dist = self._frozen_actor(rl_feat)
         action = action_dist.mode if eval else action_dist.rsample()
         # Phase 2: update KV-cache with (stoch, action)
@@ -261,6 +262,7 @@ class Dreamer(nn.Module):
                 "kv_cache": carry['kv_cache'],
                 "pos": carry['pos'],
                 "h_prev": carry['h_prev'],
+                "ffn_prev": carry['ffn_prev'],
                 "prev_action": action,
             },
             batch_size=state.batch_size,
@@ -278,6 +280,7 @@ class Dreamer(nn.Module):
                 "kv_cache": carry['kv_cache'],
                 "pos": carry['pos'],
                 "h_prev": carry['h_prev'],
+                "ffn_prev": carry['ffn_prev'],
                 "prev_action": action,
             },
             batch_size=(B,))
@@ -380,6 +383,7 @@ class Dreamer(nn.Module):
                                          memory_carry=memory_carry)
         post_stoch = feat_dict['stoch']  # (B, T, S, K)
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
+        post_deter_feat = feat_dict['deter_feat']
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
         prior_logit = feat_dict['prior_logit']
         proposal_logit = feat_dict["proposal_logit"]
@@ -390,7 +394,7 @@ class Dreamer(nn.Module):
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
-        feat = self.rssm.get_feat(post_stoch, post_deter)
+        feat = self.rssm.get_feat(post_stoch, post_deter, post_deter_feat)
         x1 = self.prj(feat.reshape(B * T, -1))
         x2 = embed.reshape(B * T, -1).detach()
         losses["barlow"] = self._barlow_loss(x1, x2, self.barlow_lambd)
@@ -412,6 +416,7 @@ class Dreamer(nn.Module):
         imag_source = {
             "post_stoch": post_stoch.detach(),
             "post_deter": post_deter.detach(),
+            "post_deter_feat": post_deter_feat.detach(),
             "kv_k": feat_dict["kv_k"].detach(),
             "kv_v": feat_dict["kv_v"].detach(),
             "positions": None if positions is None else positions.detach(),
@@ -516,6 +521,7 @@ class Dreamer(nn.Module):
             imag_source["post_deter"],
             imag_source["kv_k"],
             imag_source["kv_v"],
+            deter_feat_seq=imag_source["post_deter_feat"],
             positions=imag_source["positions"],
         )
         with autocast(device_type=self.device.type, dtype=torch.float16):
@@ -567,7 +573,8 @@ class Dreamer(nn.Module):
         stoch, deter = start
         for _ in range(imag_horizon):
             # (B, F)
-            feat = self._frozen_rssm.get_feat(stoch, deter)
+            deter_feat = self._frozen_rssm.deter_feat_from_carry(imag_carry)
+            feat = self._frozen_rssm.get_feat(stoch, deter, deter_feat)
             # (B, A)
             action = self._frozen_actor(feat).rsample()
             # Append feat and its corresponding sampled action at the same time step.

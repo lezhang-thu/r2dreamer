@@ -65,12 +65,26 @@ class TransformerRSSM(nn.Module):
         # Downstream feature adapter. This keeps the Transformer width small
         # while optionally giving heads a larger nonlinear representation of
         # deterministic context and/or stochastic state.
+        self._feat_deter_source = str(
+            getattr(config, 'feat_deter_source', 'deter'))
+        if self._feat_deter_source not in ('deter', 'ffn_hidden'):
+            raise AssertionError(
+                "feat_deter_source must be 'deter' or "
+                f"'ffn_hidden', got {self._feat_deter_source!r}.")
         feat_deter_dim = getattr(config, 'feat_deter_dim', None)
         feat_stoch_dim = getattr(config, 'feat_stoch_dim', None)
-        self._use_deter_feat = feat_deter_dim is not None
+        self._use_deter_feat = (feat_deter_dim is not None or
+                                self._feat_deter_source == 'ffn_hidden')
         self._use_stoch_feat = feat_stoch_dim is not None
         self._use_feat_adapter = self._use_deter_feat or self._use_stoch_feat
-        if self._use_deter_feat:
+        if self._feat_deter_source == 'ffn_hidden':
+            if feat_deter_dim is not None and int(feat_deter_dim) != self._d_ff:
+                raise AssertionError(
+                    "feat_deter_dim must match d_ff when "
+                    "feat_deter_source='ffn_hidden' "
+                    f"(got {feat_deter_dim}, d_ff={self._d_ff}).")
+            self._feat_deter_dim = self._d_ff
+        elif self._use_deter_feat:
             self._feat_deter_dim = int(feat_deter_dim)
             if self._feat_deter_dim < 1:
                 raise AssertionError("feat_deter_dim must be positive.")
@@ -259,6 +273,9 @@ class TransformerRSSM(nn.Module):
             x, carry, positions, reset)
         h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
         h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
+        ffn_prev = torch.cat(
+            [carry['ffn_prev'].unsqueeze(1), kv['ffn'][:, :-1]], dim=1)
+        ffn_prev = ffn_prev * (1.0 - reset.unsqueeze(-1).float())
         prior_logit = self._prior_head(h_prev)
 
         kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
@@ -266,6 +283,7 @@ class TransformerRSSM(nn.Module):
         entries = {'deter': h_prev, 'stoch': stoch}
         feat = {
             'deter': h_prev,
+            'deter_feat': ffn_prev,
             'stoch': stoch,
             'proposal_logit': proposal_logit,
             'post_logit': post_logit,
@@ -325,6 +343,7 @@ class TransformerRSSM(nn.Module):
         k_layers = []
         v_layers = []
         new_cache_layers = []
+        last_ffn_hidden = None
         for i in range(self._n_layers):
             res = x
             x = self._attn_norms[i](x)
@@ -355,8 +374,11 @@ class TransformerRSSM(nn.Module):
 
             res = x
             x = self._ffn_norms[i](x)
-            x = self._ff2s[i](self._act_fn(self._ff1s[i](x)))
+            ffn_hidden = self._act_fn(self._ff1s[i](x))
+            x = self._ff2s[i](ffn_hidden)
             x = res + x
+            if i == self._n_layers - 1:
+                last_ffn_hidden = ffn_hidden
 
             if M > 0:
                 new_k = k_all[:, -M:]
@@ -375,10 +397,12 @@ class TransformerRSSM(nn.Module):
             'kv_cache': next_kv_cache,
             'pos': next_pos,
             'h_prev': out[:, -1].detach(),
+            'ffn_prev': last_ffn_hidden[:, -1].detach(),
         }
         return out, {
             'k': torch.stack(k_layers, dim=1),
             'v': torch.stack(v_layers, dim=1),
+            'ffn': last_ffn_hidden,
         }, next_carry
 
     # ------------------------------------------------------------------
@@ -401,12 +425,14 @@ class TransformerRSSM(nn.Module):
                           deter_seq,
                           kv_k,
                           kv_v,
+                          deter_feat_seq=None,
                           positions=None):
         """Build one imagination start for every trajectory position.
 
         Args:
             stoch_seq: (B, T, S, Kcat)
             deter_seq: (B, T, D) h_prev sequence
+            deter_feat_seq: Optional (B, T, d_ff) FFN-hidden feature sequence.
             kv_k: (B, L, M+T, D) cached keys with M memory slots followed by
                 current-segment keys.
             kv_v: (B, L, M+T, D) cached values with M memory slots followed by
@@ -461,10 +487,16 @@ class TransformerRSSM(nn.Module):
         kv_cache = torch.stack(cache_list, dim=1)  # (B, T, L, 2, M, D)
         start_stoch = stoch_seq.reshape(B * T, *stoch_seq.shape[2:])
         start_deter = deter_seq.reshape(B * T, deter_seq.shape[-1])
+        if deter_feat_seq is None:
+            start_deter_feat = deter_seq.new_zeros(B * T, self._d_ff)
+        else:
+            assert deter_feat_seq.shape == (B, T, self._d_ff)
+            start_deter_feat = deter_feat_seq.reshape(B * T, self._d_ff)
         carry = {
             'kv_cache': kv_cache.reshape(B * T, L, 2, M, D),
             'pos': start_pos.reshape(B * T).to(torch.int32),
             'h_prev': start_deter,
+            'ffn_prev': start_deter_feat,
         }
         return start_stoch, start_deter, carry
 
@@ -510,6 +542,11 @@ class TransformerRSSM(nn.Module):
                             D,
                             dtype=torch.float32,
                             device=self._device),
+            'ffn_prev':
+                torch.zeros(batch_size,
+                            self._d_ff,
+                            dtype=torch.float32,
+                            device=self._device),
         }
 
     def initial(self, batch_size):
@@ -531,6 +568,8 @@ class TransformerRSSM(nn.Module):
             carry: updated carry (zeroed on reset).
             stoch: (B, S, K) sampled posterior stochastic state.
             h_prev: (B, D) transformer context from previous step.
+            deter_feat: Optional (B, d_ff) FFN-hidden context from previous
+                step when configured as downstream feature source.
         """
         carry = self._mask_carry(carry, reset)
 
@@ -538,15 +577,21 @@ class TransformerRSSM(nn.Module):
         post_logit = self._refine_post_head(post_inp)  # (B, S, K)
         stoch = self.get_dist(post_logit).rsample()  # (B, S, K)
 
-        return carry, stoch, carry['h_prev']
+        return carry, stoch, carry['h_prev'], self.deter_feat_from_carry(carry)
 
     def _mask_carry(self, carry, reset):
         """Zero carry state on episode reset."""
         reset_f = reset.float()
         h_prev = carry['h_prev'] * (1.0 - reset_f.unsqueeze(-1))
         kv_cache = carry['kv_cache'] * (1.0 - reset_f.reshape(-1, 1, 1, 1, 1))
+        ffn_prev = carry['ffn_prev'] * (1.0 - reset_f.unsqueeze(-1))
         pos = carry['pos'] * (~reset).int()
-        return {'kv_cache': kv_cache, 'pos': pos, 'h_prev': h_prev}
+        return {
+            'kv_cache': kv_cache,
+            'pos': pos,
+            'h_prev': h_prev,
+            'ffn_prev': ffn_prev,
+        }
 
     def update_carry(self, carry, stoch, action, reset):
         """Phase 2: KV-cache Transformer step with (stoch, action) -> h_t.
@@ -594,6 +639,7 @@ class TransformerRSSM(nn.Module):
         attn_mask = valid_mask.unsqueeze(1).unsqueeze(2)
 
         new_kv_cache_layers = []
+        last_ffn_hidden = None
         for i in range(self._n_layers):
             res = x_t
             x_t = self._attn_norms[i](x_t)
@@ -641,8 +687,11 @@ class TransformerRSSM(nn.Module):
             # FFN sublayer
             res = x_t
             x_t = self._ffn_norms[i](x_t)
-            x_t = self._ff2s[i](self._act_fn(self._ff1s[i](x_t)))
+            ffn_hidden = self._act_fn(self._ff1s[i](x_t))
+            x_t = self._ff2s[i](ffn_hidden)
             x_t = res + x_t
+            if i == self._n_layers - 1:
+                last_ffn_hidden = ffn_hidden
 
         x_t = self._outnorm(x_t)
         h_t = x_t[:, 0]  # (B, D)
@@ -657,6 +706,7 @@ class TransformerRSSM(nn.Module):
             'kv_cache': new_kv_cache,
             'pos': pos + 1,
             'h_prev': h_t,
+            'ffn_prev': last_ffn_hidden[:, 0],
         }
 
     # ------------------------------------------------------------------
@@ -669,11 +719,21 @@ class TransformerRSSM(nn.Module):
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
-    def get_feat(self, stoch, deter):
+    def deter_feat_from_carry(self, carry):
+        if self._feat_deter_source == 'ffn_hidden':
+            return carry['ffn_prev']
+        return None
+
+    def get_feat(self, stoch, deter, deter_feat=None):
         """Flatten stoch and concatenate with deter."""
         stoch = stoch.reshape(*stoch.shape[:-2], self._stoch * self._discrete)
         if self._use_feat_adapter:
-            if self._use_deter_feat:
+            if self._feat_deter_source == 'ffn_hidden':
+                if deter_feat is None:
+                    raise AssertionError("get_feat requires deter_feat when "
+                                         "feat_deter_source='ffn_hidden'.")
+                deter = deter_feat
+            elif self._use_deter_feat:
                 deter = self._deter_feat(deter)
             if self._use_stoch_feat:
                 stoch = self._stoch_feat(stoch)
