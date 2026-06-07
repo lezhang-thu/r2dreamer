@@ -49,7 +49,7 @@ transformer:
   prior_layers: 2
   n_heads: 8
   n_layers: 6
-  d_ff: 2048
+  d_ff: 8192
   memory_size: ${batch_length}
   segment_length: ${batch_length}
   feat_deter_dim: null
