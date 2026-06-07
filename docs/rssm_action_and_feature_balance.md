@@ -75,13 +75,16 @@ downstream feature representation is adapted after the Transformer.
 
 ### Implemented Solution
 
-Add an optional nonlinear feature adapter inside `TransformerRSSM.get_feat()`.
-The adapter branches are independent: either branch can be projected, while a
-`null` branch remains raw.
+Add an optional nonlinear deterministic context adapter. The deterministic
+branch can be projected once and reused by posterior refinement, prior
+prediction, and downstream heads. The stochastic branch remains independently
+configurable; `null` leaves it raw.
 
 ```python
-deter_feat = self._deter_feat(deter)
-feat = torch.cat([deter_feat, stoch_flat], -1)
+deter_context = self._deter_feat(h_prev)
+post2_input = torch.cat([tokens, deter_context], -1)
+prior_logit = prior_head(deter_context)
+feat = torch.cat([deter_context, stoch_flat], -1)
 ```
 
 For projected branches, the transform is:
@@ -90,10 +93,10 @@ For projected branches, the transform is:
 Linear -> RMSNorm -> activation
 ```
 
-This is not mergeable into the first layer of the downstream heads because the
-projected branch has its own normalization and nonlinearity. It keeps the
-Transformer state small while giving downstream modules a stronger deterministic
-context route.
+This is not mergeable into only the first layer of the downstream heads because
+the projected branch is now shared by posterior, prior, and heads. It keeps the
+Transformer state small while giving the inference and prediction heads a
+stronger deterministic context route.
 
 Base config leaves both branches raw:
 
@@ -109,20 +112,21 @@ model:
 ```yaml
 model:
   transformer:
-    feat_deter_dim: 6144
+    feat_deter_dim: 8192
     feat_stoch_dim: null
 ```
 
-So downstream heads receive:
+So the refined posterior, prior, and downstream heads receive:
 
 ```text
-adapted_feat_size = 6144 projected deter + 2048 raw stoch = 8192
+deterministic context = 8192 projected deter
+downstream feat_size = 8192 projected deter + 2048 raw stoch = 10240
 ```
 
-This gives deterministic context a size100M-like downstream width without
-increasing Transformer width, attention memory, or KV-cache memory. It is a
-downstream feature-capacity approximation, not a true match to DreamerV3
-size100M's 6144-dimensional RSSM deterministic state.
+This gives deterministic context a size200M-like width for posterior/prior/head
+conditioning without increasing Transformer width, attention memory, or KV-cache
+memory. It is still a context expansion of a 512-dimensional Transformer state,
+not a true 8192-dimensional RSSM recurrent state.
 
 ## 3. Two-Pass Posterior Refinement
 
@@ -152,7 +156,7 @@ parallel training with two full-segment Transformer passes:
 ```text
 z1_t = post1(obs_t)
 h1_prev_t = proposal_transformer_context(z1, action)
-z2_t = post2(obs_t, h1_prev_t)
+z2_t = post2(obs_t, context(h1_prev_t))
 h2_prev_t = final_transformer_context(z2, action)
 ```
 
@@ -162,9 +166,9 @@ The first pass is only a proposal path. The final world-model state is
 Consequently, prior and downstream heads use the refined state:
 
 ```text
-prior_head(h2_prev_t) is trained to match z2_t
+prior_head(context(h2_prev_t)) is trained to match z2_t
 reward/continue/actor/critic/projector use get_feat(z2_t, h2_prev_t)
-imagination samples z from prior_head(h_prev) and feeds z back into dynamics
+imagination samples z from prior_head(context(h_prev)) and feeds z back into dynamics
 ```
 
 This avoids the inconsistent variant where the prior learns to predict `z2` but
