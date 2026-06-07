@@ -18,26 +18,17 @@ Key change from earlier versions:
 ```text
 Training (observe path):
 
-  tokens (B,T,E) ─► post_head ─► post_logit ─► sample stoch (B,T,S,K)
-                                                 │
-  action (B,T,A) ────────────────────────────────┤
-                                                 ▼
-                               cat(flat(stoch), action_norm)
-                                                 ▼
-                           inp_proj ─► causal Transformer ─► h (B,T,D)
-                                                 │
-                                 shift-right: h_prev = [0, h[:,:-1]]
-                                                 │
-                                                 ▼
-                                          prior_head(h_prev)
-                                                 ▼
-                                            prior_logit
+  tokens ─► post_head ─► z1 ─► Transformer ─► h1_prev
+  tokens + context(h1_prev) ─► refine_post_head ─► z2 ─► Transformer ─► h2_prev
+  tokens + context(h2_prev) ─► refine_post_head ─► z3 ─► Transformer ─► h3_prev
 
-  State at position t: (stoch_t, h_prev_t)
-  Feature vector:       cat(flat(stoch_t), h_prev_t)
+  prior_logit = prior_head(context(h2_prev))
+
+  KL state at position t:    (z3_t, h2_prev_t)
+  Feature state at position t: (z3_t, h3_prev_t)
 ```
 
-`h_prev_t` is zeroed on reset positions.
+All shifted deterministic contexts are zeroed on reset positions.
 
 ## Three operational modes
 
@@ -45,17 +36,19 @@ Training (observe path):
 
 `TransformerRSSM.observe(tokens, action, reset)`:
 
-1. `post_logit = _post_head(tokens)` and sample posterior `stoch`.
-2. Build transformer inputs from `(stoch, action)`.
-3. Run windowed-causal transformer over the segment, where each step attends
-   to at most `memory_size` previous steps plus itself.
-4. Shift-right to get `h_prev`.
-5. `prior_logit = _prior_head(h_prev)`.
-6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) with `memory_size`
+1. `proposal_logit = _post_head(tokens)` and sample `z1`.
+2. Run the Transformer on `(z1, action)` and shift-right to get `h1_prev`.
+3. `refine_logit = _refine_post_head(tokens, context(h1_prev))` and sample `z2`.
+4. Run the Transformer on `(z2, action)` and shift-right to get `h2_prev`.
+5. `post_logit = _refine_post_head(tokens, context(h2_prev))` and sample `z3`.
+6. `prior_logit = _prior_head(context(h2_prev))`.
+7. Run the final Transformer on `(z3, action)` and shift-right to get `h3_prev`.
+8. Return detached final-pass trajectory KV tensors (`kv_k`, `kv_v`) with `memory_size`
    memory slots followed by current-segment keys for efficient
    imagination-start construction without replaying history.
 
-Posterior is conditioned on `tokens` only. It does **not** take `h_prev`.
+The KL compares `post_logit` and `prior_logit`, both conditioned on `h2_prev`.
+Reward, continuation, actor, critic, and projector features use `(z3, h3_prev)`.
 
 ### 2. Imagination: KV-cache rollout (windowed)
 

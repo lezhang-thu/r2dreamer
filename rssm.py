@@ -190,6 +190,12 @@ class TransformerRSSM(nn.Module):
             return self._deter_feat(deter)
         return deter
 
+    def _sample_stoch(self, logit, sample):
+        dist = self.get_dist(logit)
+        if sample:
+            return dist.rsample()
+        return dist.base_dist.mode
+
     # ------------------------------------------------------------------
     # Training path
     # ------------------------------------------------------------------
@@ -230,53 +236,57 @@ class TransformerRSSM(nn.Module):
         carry = self._mask_carry(memory_carry, reset[:, 0])
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
-        # Pass 1: observation-only posterior proposal, used only to build a
-        # parallel approximate context for the refined posterior.
+        # Pass 1: observation-only proposal used to build the first approximate
+        # deterministic context in parallel over the segment.
         proposal_logit = self._post_head(tokens)
-        proposal_dist = self.get_dist(proposal_logit)
-        if sample:
-            proposal_stoch = proposal_dist.rsample()
-        else:
-            proposal_stoch = proposal_dist.base_dist.mode
-
+        proposal_stoch = self._sample_stoch(proposal_logit, sample)
         proposal_flat = proposal_stoch.reshape(*proposal_stoch.shape[:-2],
                                                self.flat_stoch)
         proposal_x = self._input_token(proposal_flat, action_norm)
-        proposal_h, _, _ = self._fwd_segment_with_carry(proposal_x, carry,
-                                                        positions, reset)
-        proposal_h_prev = torch.cat(
-            [carry['h_prev'].unsqueeze(1), proposal_h[:, :-1]], dim=1)
-        proposal_h_prev = proposal_h_prev * (1.0 - reset.unsqueeze(-1).float())
+        h1, _, _ = self._fwd_segment_with_carry(proposal_x, carry, positions,
+                                                reset)
+        h1_prev = torch.cat([carry['h_prev'].unsqueeze(1), h1[:, :-1]], dim=1)
+        h1_prev = h1_prev * (1.0 - reset.unsqueeze(-1).float())
 
-        # Pass 2: final posterior conditioned on observation and proposal
-        # context. The prior uses the same proposal context for a coherent KL
-        # comparison, while heads and imagination starts use the final state.
-        proposal_context = self._deter_context(proposal_h_prev)
-        post_inp = torch.cat([tokens, proposal_context], dim=-1)
-        post_logit = self._refine_post_head(post_inp)
-        post_dist = self.get_dist(post_logit)
-        if sample:
-            stoch = post_dist.rsample()
-        else:
-            stoch = post_dist.base_dist.mode
+        # Pass 2: intermediate posterior conditioned on the proposal context.
+        # This creates the deterministic context that will be shared by the
+        # final posterior and prior for the KL comparison.
+        h1_context = self._deter_context(h1_prev)
+        refine_logit = self._refine_post_head(
+            torch.cat([tokens, h1_context], dim=-1))
+        refine_stoch = self._sample_stoch(refine_logit, sample)
+        refine_flat = refine_stoch.reshape(*refine_stoch.shape[:-2],
+                                           self.flat_stoch)
+        refine_x = self._input_token(refine_flat, action_norm)
+        h2, _, _ = self._fwd_segment_with_carry(refine_x, carry, positions,
+                                                reset)
+        h2_prev = torch.cat([carry['h_prev'].unsqueeze(1), h2[:, :-1]], dim=1)
+        h2_prev = h2_prev * (1.0 - reset.unsqueeze(-1).float())
+        h2_context = self._deter_context(h2_prev)
 
+        # Pass 3: final posterior and final dynamics. The KL compares posterior
+        # and prior under h2_context; heads and imagination starts use h3.
+        post_logit = self._refine_post_head(
+            torch.cat([tokens, h2_context], dim=-1))
+        stoch = self._sample_stoch(post_logit, sample)
         stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)
         x = self._input_token(stoch_flat, action_norm)
-        h, kv, next_carry = self._fwd_segment_with_carry(
+        h3, kv, next_carry = self._fwd_segment_with_carry(
             x, carry, positions, reset)
-        h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
-        h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
-        final_context = self._deter_context(h_prev)
-        prior_logit = self._prior_head(proposal_context)
+        h3_prev = torch.cat([carry['h_prev'].unsqueeze(1), h3[:, :-1]], dim=1)
+        h3_prev = h3_prev * (1.0 - reset.unsqueeze(-1).float())
+        final_context = self._deter_context(h3_prev)
+        prior_logit = self._prior_head(h2_context)
 
         kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
         kv_v = torch.cat([carry['kv_cache'][:, :, 1].detach(), kv['v']], dim=2)
-        entries = {'deter': h_prev, 'stoch': stoch}
+        entries = {'deter': h3_prev, 'stoch': stoch}
         feat = {
-            'deter': h_prev,
+            'deter': h3_prev,
             'deter_context': final_context,
             'stoch': stoch,
             'proposal_logit': proposal_logit,
+            'refine_logit': refine_logit,
             'post_logit': post_logit,
             'prior_logit': prior_logit,
             'kv_k': kv_k.detach(),
