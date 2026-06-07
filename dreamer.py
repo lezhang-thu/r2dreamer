@@ -390,7 +390,9 @@ class Dreamer(nn.Module):
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
-        feat = self.rssm.get_feat(post_stoch, post_deter)
+        feat = self.rssm.get_feat(post_stoch,
+                                  post_deter,
+                                  deter_context=feat_dict["deter_context"])
         x1 = self.prj(feat.reshape(B * T, -1))
         x2 = embed.reshape(B * T, -1).detach()
         losses["barlow"] = self._barlow_loss(x1, x2, self.barlow_lambd)

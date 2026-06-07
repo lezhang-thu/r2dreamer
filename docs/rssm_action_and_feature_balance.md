@@ -76,15 +76,16 @@ downstream feature representation is adapted after the Transformer.
 ### Implemented Solution
 
 Add an optional nonlinear deterministic context adapter. The deterministic
-branch can be projected once and reused by posterior refinement, prior
-prediction, and downstream heads. The stochastic branch remains independently
-configurable; `null` leaves it raw.
+branch can be projected and reused by posterior refinement, prior prediction,
+and downstream heads. The stochastic branch remains independently configurable;
+`null` leaves it raw.
 
 ```python
-deter_context = self._deter_feat(h_prev)
-post2_input = torch.cat([tokens, deter_context], -1)
-prior_logit = prior_head(deter_context)
-feat = torch.cat([deter_context, stoch_flat], -1)
+proposal_context = self._deter_feat(proposal_h_prev)
+post2_input = torch.cat([tokens, proposal_context], -1)
+prior_logit = prior_head(proposal_context)
+final_context = self._deter_feat(h_prev)
+feat = torch.cat([final_context, stoch_flat], -1)
 ```
 
 For projected branches, the transform is:
@@ -94,7 +95,7 @@ Linear -> RMSNorm -> activation
 ```
 
 This is not mergeable into only the first layer of the downstream heads because
-the projected branch is now shared by posterior, prior, and heads. It keeps the
+the projected branch is shared by posterior, prior, and heads. It keeps the
 Transformer state small while giving the inference and prediction heads a
 stronger deterministic context route.
 
@@ -116,7 +117,7 @@ model:
     feat_stoch_dim: null
 ```
 
-So the refined posterior, prior, and downstream heads receive:
+So posterior/prior conditioning and downstream heads receive:
 
 ```text
 deterministic context = 8192 projected deter
@@ -163,10 +164,11 @@ h2_prev_t = final_transformer_context(z2, action)
 The first pass is only a proposal path. The final world-model state is
 `(z2, h2_prev)`.
 
-Consequently, prior and downstream heads use the refined state:
+Consequently, posterior and prior KL use the same proposal context, while
+downstream heads use the final refined state:
 
 ```text
-prior_head(context(h2_prev_t)) is trained to match z2_t
+post2(obs_t, context(h1_prev_t)) is compared against prior_head(context(h1_prev_t))
 reward/continue/actor/critic/projector use get_feat(z2_t, h2_prev_t)
 imagination samples z from prior_head(context(h_prev)) and feeds z back into dynamics
 ```

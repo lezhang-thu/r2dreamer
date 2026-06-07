@@ -249,8 +249,8 @@ class TransformerRSSM(nn.Module):
         proposal_h_prev = proposal_h_prev * (1.0 - reset.unsqueeze(-1).float())
 
         # Pass 2: final posterior conditioned on observation and proposal
-        # context. The final dynamics, prior, heads, and imagination starts all
-        # use this refined stochastic state.
+        # context. The prior uses the same proposal context for a coherent KL
+        # comparison, while heads and imagination starts use the final state.
         proposal_context = self._deter_context(proposal_h_prev)
         post_inp = torch.cat([tokens, proposal_context], dim=-1)
         post_logit = self._refine_post_head(post_inp)
@@ -266,13 +266,15 @@ class TransformerRSSM(nn.Module):
             x, carry, positions, reset)
         h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
         h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
-        prior_logit = self._prior_head(self._deter_context(h_prev))
+        final_context = self._deter_context(h_prev)
+        prior_logit = self._prior_head(proposal_context)
 
         kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
         kv_v = torch.cat([carry['kv_cache'][:, :, 1].detach(), kv['v']], dim=2)
         entries = {'deter': h_prev, 'stoch': stoch}
         feat = {
             'deter': h_prev,
+            'deter_context': final_context,
             'stoch': stoch,
             'proposal_logit': proposal_logit,
             'post_logit': post_logit,
@@ -677,12 +679,13 @@ class TransformerRSSM(nn.Module):
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
-    def get_feat(self, stoch, deter):
+    def get_feat(self, stoch, deter, deter_context=None):
         """Flatten stoch and concatenate with deter."""
         stoch = stoch.reshape(*stoch.shape[:-2], self._stoch * self._discrete)
         if self._use_feat_adapter:
             if self._use_deter_feat:
-                deter = self._deter_feat(deter)
+                deter = (self._deter_feat(deter)
+                         if deter_context is None else deter_context)
             if self._use_stoch_feat:
                 stoch = self._stoch_feat(stoch)
             return torch.cat([deter, stoch], -1)
