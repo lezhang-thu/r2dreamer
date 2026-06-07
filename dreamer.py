@@ -370,8 +370,8 @@ class Dreamer(nn.Module):
         # (B, T, E)
         embed = self.encoder(data)
 
-        # Transformer path: proposal posterior -> refined posterior, final
-        # transition on (refined stoch, a_t).
+        # Transformer path: posterior from tokens, transition on (stoch, a_t),
+        # and prior prediction from Transformer context.
         action = data["action"]  # (B, T, A) — current action a_t
         _, feat_dict = self.rssm.observe(embed,
                                          action,
@@ -382,11 +382,8 @@ class Dreamer(nn.Module):
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
         prior_logit = feat_dict['prior_logit']
-        proposal_logit = feat_dict["proposal_logit"]
-        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
-                                               self.kl_free)
+        dyn_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = dyn_loss.mean()
-        losses["rep"] = rep_loss.mean()
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
@@ -408,8 +405,6 @@ class Dreamer(nn.Module):
             self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(
             self.rssm.get_dist(post_logit).entropy())
-        metrics["proposal_entropy"] = torch.mean(
-            self.rssm.get_dist(proposal_logit).entropy())
 
         imag_source = {
             "post_stoch": post_stoch.detach(),

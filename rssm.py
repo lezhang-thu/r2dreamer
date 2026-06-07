@@ -132,14 +132,8 @@ class TransformerRSSM(nn.Module):
         self._prior_layers = int(getattr(config, 'prior_layers', 2))
         self._context_dim = self._feat_deter_dim if self._use_deter_feat else D
 
-        self._post_head = self._make_logit_head("post", embed_size,
-                                                self._post_layers, act_fn)
-        self._refine_post_head = self._make_logit_head(
-            "refine_post",
-            embed_size + self._context_dim,
-            self._post_layers,
-            act_fn,
-        )
+        self._posterior_head = self._make_logit_head("posterior", embed_size,
+                                                     self._post_layers, act_fn)
 
         self._prior_head = nn.Sequential()
         inp_dim = self._context_dim
@@ -230,30 +224,9 @@ class TransformerRSSM(nn.Module):
         carry = self._mask_carry(memory_carry, reset[:, 0])
         action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
 
-        # Pass 1: observation-only posterior proposal, used only to build a
-        # parallel approximate context for the refined posterior.
-        proposal_logit = self._post_head(tokens)
-        proposal_dist = self.get_dist(proposal_logit)
-        if sample:
-            proposal_stoch = proposal_dist.rsample()
-        else:
-            proposal_stoch = proposal_dist.base_dist.mode
-
-        proposal_flat = proposal_stoch.reshape(*proposal_stoch.shape[:-2],
-                                               self.flat_stoch)
-        proposal_x = self._input_token(proposal_flat, action_norm)
-        proposal_h, _, _ = self._fwd_segment_with_carry(proposal_x, carry,
-                                                        positions, reset)
-        proposal_h_prev = torch.cat(
-            [carry['h_prev'].unsqueeze(1), proposal_h[:, :-1]], dim=1)
-        proposal_h_prev = proposal_h_prev * (1.0 - reset.unsqueeze(-1).float())
-
-        # Pass 2: final posterior conditioned on observation and proposal
-        # context. The prior uses the same proposal context for a coherent KL
-        # comparison, while heads and imagination starts use the final state.
-        proposal_context = self._deter_context(proposal_h_prev)
-        post_inp = torch.cat([tokens, proposal_context], dim=-1)
-        post_logit = self._refine_post_head(post_inp)
+        # Posterior uses only the current observation tokens. The prior is
+        # trained to predict this stochastic code from Transformer context.
+        post_logit = self._posterior_head(tokens)
         post_dist = self.get_dist(post_logit)
         if sample:
             stoch = post_dist.rsample()
@@ -267,7 +240,7 @@ class TransformerRSSM(nn.Module):
         h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
         h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
         final_context = self._deter_context(h_prev)
-        prior_logit = self._prior_head(proposal_context)
+        prior_logit = self._prior_head(final_context)
 
         kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
         kv_v = torch.cat([carry['kv_cache'][:, :, 1].detach(), kv['v']], dim=2)
@@ -276,7 +249,6 @@ class TransformerRSSM(nn.Module):
             'deter': h_prev,
             'deter_context': final_context,
             'stoch': stoch,
-            'proposal_logit': proposal_logit,
             'post_logit': post_logit,
             'prior_logit': prior_logit,
             'kv_k': kv_k.detach(),
@@ -530,7 +502,7 @@ class TransformerRSSM(nn.Module):
         return self._initial_carry(batch_size, self._memory_size)
 
     def get_feat_step(self, carry, tokens, reset):
-        """Phase 1: refined posterior from tokens and carry context.
+        """Sample posterior stoch from tokens and return previous context.
 
         Args:
             carry: dict with kv_cache, pos, h_prev.
@@ -543,9 +515,7 @@ class TransformerRSSM(nn.Module):
         """
         carry = self._mask_carry(carry, reset)
 
-        post_inp = torch.cat(
-            [tokens, self._deter_context(carry['h_prev'])], dim=-1)
-        post_logit = self._refine_post_head(post_inp)  # (B, S, K)
+        post_logit = self._posterior_head(tokens)  # (B, S, K)
         stoch = self.get_dist(post_logit).rsample()  # (B, S, K)
 
         return carry, stoch, carry['h_prev']
@@ -697,8 +667,6 @@ class TransformerRSSM(nn.Module):
 
     def kl_loss(self, post_logit, prior_logit, free):
         kld = dists.kl
-        rep_loss = kld(post_logit, prior_logit.detach()).sum(-1)
         dyn_loss = kld(post_logit.detach(), prior_logit).sum(-1)
-        rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
-        return dyn_loss, rep_loss
+        return dyn_loss

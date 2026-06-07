@@ -76,16 +76,15 @@ downstream feature representation is adapted after the Transformer.
 ### Implemented Solution
 
 Add an optional nonlinear deterministic context adapter. The deterministic
-branch can be projected and reused by posterior refinement, prior prediction,
-and downstream heads. The stochastic branch remains independently configurable;
-`null` leaves it raw.
+branch can be projected and reused by prior prediction and downstream heads.
+The stochastic branch remains independently configurable; `null` leaves it raw.
 
 ```python
-proposal_context = self._deter_feat(proposal_h_prev)
-post2_input = torch.cat([tokens, proposal_context], -1)
-prior_logit = prior_head(proposal_context)
-final_context = self._deter_feat(h_prev)
-feat = torch.cat([final_context, stoch_flat], -1)
+stoch = posterior_head(tokens)
+h_prev = transformer_context(stoch, action)
+deter_context = self._deter_feat(h_prev)
+prior_logit = prior_head(deter_context)
+feat = torch.cat([deter_context, stoch_flat], -1)
 ```
 
 For projected branches, the transform is:
@@ -95,9 +94,9 @@ Linear -> RMSNorm -> activation
 ```
 
 This is not mergeable into only the first layer of the downstream heads because
-the projected branch is shared by posterior, prior, and heads. It keeps the
-Transformer state small while giving the inference and prediction heads a
-stronger deterministic context route.
+the projected branch is shared by prior and downstream heads. It keeps the
+Transformer state small while giving prediction heads a stronger deterministic
+context route.
 
 Base config leaves both branches raw:
 
@@ -117,61 +116,47 @@ model:
     feat_stoch_dim: null
 ```
 
-So posterior/prior conditioning and downstream heads receive:
+So prior conditioning and downstream heads receive:
 
 ```text
 deterministic context = 8192 projected deter
 downstream feat_size = 8192 projected deter + 2048 raw stoch = 10240
 ```
 
-This gives deterministic context a size200M-like width for posterior/prior/head
+This gives deterministic context a size200M-like width for prior/head
 conditioning without increasing Transformer width, attention memory, or KV-cache
 memory. It is still a context expansion of a 512-dimensional Transformer state,
 not a true 8192-dimensional RSSM recurrent state.
 
-## 3. Two-Pass Posterior Refinement
+## 3. Single-Pass Posterior
 
-Official DreamerV3 conditions the posterior stochastic state on both the current
-encoder token and deterministic context:
+The current Transformer RSSM keeps posterior inference observation-only:
 
 ```text
-q(stoch_t | obs_t, deter_t)
+z_t = posterior_head(obs_t)
 ```
 
-The original Transformer RSSM path inferred posterior stochastic state from the
-encoder token alone:
+The prior predicts this stochastic code from deterministic Transformer context:
 
 ```text
-z1_t = q(obs_t)
+prior_head(context(h_prev_t)) -> z_t
 ```
 
-This keeps segment training parallel, but makes the stochastic state more like a
-per-frame code and less like a belief-state correction informed by temporal
-context.
-
-Exact DreamerV3-style posterior conditioning would make Transformer training
-sequential because `stoch_t` would depend on `h_prev_t`, while `h_prev_t` depends
-on previous posterior stochastic states. The implemented compromise keeps
-parallel training with two full-segment Transformer passes:
+The full training path is:
 
 ```text
-z1_t = post1(obs_t)
-h1_prev_t = proposal_transformer_context(z1, action)
-z2_t = post2(obs_t, context(h1_prev_t))
-h2_prev_t = final_transformer_context(z2, action)
+z_t = posterior_head(obs_t)
+h_prev_t = transformer_context(z, action)
+prior_logit_t = prior_head(context(h_prev_t))
 ```
 
-The first pass is only a proposal path. The final world-model state is
-`(z2, h2_prev)`.
-
-Consequently, posterior and prior KL use the same proposal context, while
-downstream heads use the final refined state:
+World-model heads use the same final state:
 
 ```text
-post2(obs_t, context(h1_prev_t)) is compared against prior_head(context(h1_prev_t))
-reward/continue/actor/critic/projector use get_feat(z2_t, h2_prev_t)
+reward/continue/actor/critic/projector use get_feat(z_t, h_prev_t)
 imagination samples z from prior_head(context(h_prev)) and feeds z back into dynamics
 ```
 
-This avoids the inconsistent variant where the prior learns to predict `z2` but
-the transition model is trained on `z1`.
+The KL loss is now one-sided: `KL(stopgrad(posterior) || prior)`. This trains the
+prior to predict observation-derived stochastic codes for imagination rollout
+without the reverse representation KL.

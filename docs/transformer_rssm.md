@@ -18,7 +18,7 @@ Key change from earlier versions:
 ```text
 Training (observe path):
 
-  tokens (B,T,E) ─► post_head ─► post_logit ─► sample stoch (B,T,S,K)
+  tokens (B,T,E) ─► posterior_head ─► post_logit ─► sample stoch (B,T,S,K)
                                                  │
   action (B,T,A) ────────────────────────────────┤
                                                  ▼
@@ -29,7 +29,7 @@ Training (observe path):
                                  shift-right: h_prev = [0, h[:,:-1]]
                                                  │
                                                  ▼
-                                          prior_head(h_prev)
+                                      context adapter + prior_head(h_prev)
                                                  ▼
                                             prior_logit
 
@@ -45,12 +45,12 @@ Training (observe path):
 
 `TransformerRSSM.observe(tokens, action, reset)`:
 
-1. `post_logit = _post_head(tokens)` and sample posterior `stoch`.
+1. `post_logit = _posterior_head(tokens)` and sample posterior `stoch`.
 2. Build transformer inputs from `(stoch, action)`.
 3. Run windowed-causal transformer over the segment, where each step attends
    to at most `memory_size` previous steps plus itself.
 4. Shift-right to get `h_prev`.
-5. `prior_logit = _prior_head(h_prev)`.
+5. `prior_logit = _prior_head(_deter_context(h_prev))`.
 6. Return detached trajectory KV tensors (`kv_k`, `kv_v`) with `memory_size`
    memory slots followed by current-segment keys for efficient
    imagination-start construction without replaying history.
@@ -135,5 +135,5 @@ python3 train.py model.compile=False batch_length=500
   inside a sampled segment; `is_first` and `position` define the boundaries.
 - RoPE uses a modern cached implementation with dynamic cache growth if
   positions exceed `rope_max_seq_len`.
-- `post_head` and `prior_head` are now multi-layer MLP heads (Linear + RMSNorm
+- `posterior_head` and `prior_head` are multi-layer MLP heads (Linear + RMSNorm
   + activation blocks), not single linear projections.
