@@ -39,6 +39,10 @@ Training (observe path):
 
 `h_prev_t` is zeroed on reset positions.
 
+The KL objective contains the prediction term
+`KL(stopgrad(post) || prior)` plus a small representation regularizer
+`KL(post || stopgrad(prior))`.
+
 ## Three operational modes
 
 ### 1. Training: segment sliding-window attention

@@ -69,6 +69,7 @@ class Dreamer(nn.Module):
         self._train_carry = None
 
         self._loss_scales = dict(config.loss_scales)
+        self._loss_scales.setdefault("rep", 0.1)
         self._loss_scales.setdefault("repval", 0.3)
         self._log_grads = bool(config.log_grads)
 
@@ -382,8 +383,10 @@ class Dreamer(nn.Module):
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
         prior_logit = feat_dict['prior_logit']
-        dyn_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit,
+                                               self.kl_free)
         losses["dyn"] = dyn_loss.mean()
+        losses["rep"] = rep_loss.mean()
 
         # === Representation / auxiliary losses ===
         # (B, T, F)

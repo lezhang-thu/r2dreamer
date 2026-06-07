@@ -667,6 +667,8 @@ class TransformerRSSM(nn.Module):
 
     def kl_loss(self, post_logit, prior_logit, free):
         kld = dists.kl
+        rep_loss = kld(post_logit, prior_logit.detach()).sum(-1)
         dyn_loss = kld(post_logit.detach(), prior_logit).sum(-1)
+        rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
-        return dyn_loss
+        return dyn_loss, rep_loss

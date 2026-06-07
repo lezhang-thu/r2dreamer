@@ -157,6 +157,12 @@ reward/continue/actor/critic/projector use get_feat(z_t, h_prev_t)
 imagination samples z from prior_head(context(h_prev)) and feeds z back into dynamics
 ```
 
-The KL loss is now one-sided: `KL(stopgrad(posterior) || prior)`. This trains the
-prior to predict observation-derived stochastic codes for imagination rollout
-without the reverse representation KL.
+The KL loss keeps the prediction term plus a small representation regularizer:
+
+```text
+dyn = KL(stopgrad(posterior) || prior)
+rep = KL(posterior || stopgrad(prior))
+```
+
+`rep` is intentionally scaled much smaller than `dyn`. This restores weak
+posterior regularization without making the prior dominate the observation code.
