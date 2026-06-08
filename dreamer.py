@@ -371,8 +371,8 @@ class Dreamer(nn.Module):
         embed = self.encoder(data)
 
         # Transformer path: proposal posterior -> intermediate context ->
-        # final posterior. KL compares final posterior and prior under the same
-        # intermediate deterministic context.
+        # final posterior. The posterior uses the intermediate context; prior
+        # and heads use the final deterministic context.
         action = data["action"]  # (B, T, A) — current action a_t
         _, feat_dict = self.rssm.observe(embed,
                                          action,

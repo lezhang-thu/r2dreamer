@@ -249,8 +249,7 @@ class TransformerRSSM(nn.Module):
         h1_prev = h1_prev * (1.0 - reset.unsqueeze(-1).float())
 
         # Pass 2: intermediate posterior conditioned on the proposal context.
-        # This creates the deterministic context that will be shared by the
-        # final posterior and prior for the KL comparison.
+        # This creates a better approximate context for the final posterior.
         h1_context = self._deter_context(h1_prev)
         refine_logit = self._refine_post_head(
             torch.cat([tokens, h1_context], dim=-1))
@@ -264,8 +263,9 @@ class TransformerRSSM(nn.Module):
         h2_prev = h2_prev * (1.0 - reset.unsqueeze(-1).float())
         h2_context = self._deter_context(h2_prev)
 
-        # Pass 3: final posterior and final dynamics. The KL compares posterior
-        # and prior under h2_context; heads and imagination starts use h3.
+        # Pass 3: final posterior and final dynamics. The posterior uses
+        # h2_context as its best available approximation; prior, heads, and
+        # imagination starts use the final h3 context.
         post_logit = self._refine_post_head(
             torch.cat([tokens, h2_context], dim=-1))
         stoch = self._sample_stoch(post_logit, sample)
@@ -276,7 +276,7 @@ class TransformerRSSM(nn.Module):
         h3_prev = torch.cat([carry['h_prev'].unsqueeze(1), h3[:, :-1]], dim=1)
         h3_prev = h3_prev * (1.0 - reset.unsqueeze(-1).float())
         final_context = self._deter_context(h3_prev)
-        prior_logit = self._prior_head(h2_context)
+        prior_logit = self._prior_head(final_context)
 
         kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
         kv_v = torch.cat([carry['kv_cache'][:, :, 1].detach(), kv['v']], dim=2)

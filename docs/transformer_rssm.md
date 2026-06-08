@@ -22,9 +22,10 @@ Training (observe path):
   tokens + context(h1_prev) ─► refine_post_head ─► z2 ─► Transformer ─► h2_prev
   tokens + context(h2_prev) ─► refine_post_head ─► z3 ─► Transformer ─► h3_prev
 
-  prior_logit = prior_head(context(h2_prev))
+  prior_logit = prior_head(context(h3_prev))
 
-  KL state at position t:    (z3_t, h2_prev_t)
+  Posterior conditioning at position t: (obs_t, h2_prev_t)
+  Prior conditioning at position t:     h3_prev_t
   Feature state at position t: (z3_t, h3_prev_t)
 ```
 
@@ -41,14 +42,17 @@ All shifted deterministic contexts are zeroed on reset positions.
 3. `refine_logit = _refine_post_head(tokens, context(h1_prev))` and sample `z2`.
 4. Run the Transformer on `(z2, action)` and shift-right to get `h2_prev`.
 5. `post_logit = _refine_post_head(tokens, context(h2_prev))` and sample `z3`.
-6. `prior_logit = _prior_head(context(h2_prev))`.
-7. Run the final Transformer on `(z3, action)` and shift-right to get `h3_prev`.
+6. Run the final Transformer on `(z3, action)` and shift-right to get `h3_prev`.
+7. `prior_logit = _prior_head(context(h3_prev))`.
 8. Return detached final-pass trajectory KV tensors (`kv_k`, `kv_v`) with `memory_size`
    memory slots followed by current-segment keys for efficient
    imagination-start construction without replaying history.
 
-The KL compares `post_logit` and `prior_logit`, both conditioned on `h2_prev`.
-Reward, continuation, actor, critic, and projector features use `(z3, h3_prev)`.
+The KL compares `post_logit`, conditioned on `h2_prev`, against `prior_logit`,
+conditioned on `h3_prev`. This keeps prior training aligned with rollout
+contexts while using `h2_prev` as the final posterior's available approximation.
+Reward, continuation, actor, critic, and projector features also use
+`(z3, h3_prev)`.
 
 ### 2. Imagination: KV-cache rollout (windowed)
 

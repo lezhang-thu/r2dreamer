@@ -85,8 +85,8 @@ h1_context = self._deter_feat(h1_prev)
 q2 = refine_post_head(torch.cat([tokens, h1_context], -1))
 h2_context = self._deter_feat(h2_prev)
 q3 = refine_post_head(torch.cat([tokens, h2_context], -1))
-prior_logit = prior_head(h2_context)
 h3_context = self._deter_feat(h3_prev)
+prior_logit = prior_head(h3_context)
 feat = torch.cat([h3_context, stoch3_flat], -1)
 ```
 
@@ -168,15 +168,15 @@ h3_prev_t = final_transformer_context(z3, action)
 The first and second passes are only refinement paths. The final world-model
 state is `(z3, h3_prev)`.
 
-Consequently, final posterior and prior KL use the same intermediate context,
-while downstream heads use the final refined state:
+Consequently, final posterior uses the best available approximate context, while
+the prior and downstream heads use the final refined state:
 
 ```text
-post2(obs_t, context(h2_prev_t)) is compared against prior_head(context(h2_prev_t))
+post2(obs_t, context(h2_prev_t)) is compared against prior_head(context(h3_prev_t))
 reward/continue/actor/critic/projector use get_feat(z3_t, h3_prev_t)
 imagination samples z from prior_head(context(h_prev)) and feeds z back into dynamics
 ```
 
-This avoids the inconsistent variant where the prior and posterior are compared
-under different deterministic contexts, while still keeping segment training
-parallel.
+This keeps prior training aligned with the context distribution used by
+imagination rollout. The remaining mismatch is that `h2_prev_t` approximates the
+unavailable posterior-conditioning context that would require another pass.
