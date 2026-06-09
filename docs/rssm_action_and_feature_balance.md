@@ -84,10 +84,8 @@ and downstream heads. The stochastic branch remains independently configurable;
 h1_context = self._deter_feat(h1_prev)
 q2 = refine_post_head(torch.cat([tokens, h1_context], -1))
 h2_context = self._deter_feat(h2_prev)
-q3 = refine_post_head(torch.cat([tokens, h2_context], -1))
-h3_context = self._deter_feat(h3_prev)
-prior_logit = prior_head(h3_context)
-feat = torch.cat([h3_context, stoch3_flat], -1)
+prior_logit = prior_head(h2_context)
+feat = torch.cat([h2_context, stoch2_flat], -1)
 ```
 
 For projected branches, the transform is:
@@ -131,7 +129,7 @@ conditioning without increasing Transformer width, attention memory, or KV-cache
 memory. It is still a context expansion of a 512-dimensional Transformer state,
 not a true 8192-dimensional RSSM recurrent state.
 
-## 3. Three-Pass Posterior Refinement
+## 3. Two-Pass Posterior Refinement
 
 Official DreamerV3 conditions the posterior stochastic state on both the current
 encoder token and deterministic context:
@@ -154,29 +152,28 @@ context.
 Exact DreamerV3-style posterior conditioning would make Transformer training
 sequential because `stoch_t` would depend on `h_prev_t`, while `h_prev_t` depends
 on previous posterior stochastic states. The implemented compromise keeps
-parallel training with three full-segment Transformer passes:
+parallel training with two full-segment Transformer passes:
 
 ```text
 z1_t = post1(obs_t)
 h1_prev_t = proposal_transformer_context(z1, action)
 z2_t = post2(obs_t, context(h1_prev_t))
-h2_prev_t = intermediate_transformer_context(z2, action)
-z3_t = post2(obs_t, context(h2_prev_t))
-h3_prev_t = final_transformer_context(z3, action)
+h2_prev_t = final_transformer_context(z2, action)
 ```
 
-The first and second passes are only refinement paths. The final world-model
-state is `(z3, h3_prev)`.
+The first pass is only a proposal path. The final world-model state is
+`(z2, h2_prev)`.
 
-Consequently, final posterior uses the best available approximate context, while
-the prior and downstream heads use the final refined state:
+Consequently, final posterior uses the proposal context, while the prior and
+downstream heads use the final refined state:
 
 ```text
-post2(obs_t, context(h2_prev_t)) is compared against prior_head(context(h3_prev_t))
-reward/continue/actor/critic/projector use get_feat(z3_t, h3_prev_t)
+post2(obs_t, context(h1_prev_t)) is compared against prior_head(context(h2_prev_t))
+reward/continue/actor/critic/projector use get_feat(z2_t, h2_prev_t)
 imagination samples z from prior_head(context(h_prev)) and feeds z back into dynamics
 ```
 
 This keeps prior training aligned with the context distribution used by
-imagination rollout. The remaining mismatch is that `h2_prev_t` approximates the
-unavailable posterior-conditioning context that would require another pass.
+imagination rollout. The remaining mismatch is that `h1_prev_t` approximates the
+unavailable posterior-conditioning context that would require sequential training
+or more refinement passes.
