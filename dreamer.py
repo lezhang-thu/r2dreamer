@@ -2,6 +2,7 @@ import copy
 from collections import OrderedDict
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 from torch import nn
 from torch.amp import GradScaler, autocast
@@ -58,8 +59,14 @@ class Dreamer(nn.Module):
 
         # Actor-critic components
         self.rl_feat_size = self.rssm.feat_size
+        self.sac_alpha = float(getattr(config, "sac_alpha", 3e-4))
+        sac_gamma = getattr(config, "sac_gamma", None)
+        self.sac_gamma = None if sac_gamma is None else float(sac_gamma)
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
-        self.value = networks.MLPHead(config.critic, self.rl_feat_size)
+        self.value = networks.DuelingQHead(config.critic,
+                                           self.rl_feat_size,
+                                           self.act_dim,
+                                           alpha=self.sac_alpha)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -70,6 +77,8 @@ class Dreamer(nn.Module):
 
         self._loss_scales = dict(config.loss_scales)
         self._loss_scales.setdefault("repval", 0.3)
+        self._loss_scales.setdefault("sac_pi", 1.0)
+        self._loss_scales.setdefault("sac_offpolicy", 1.0)
         self._log_grads = bool(config.log_grads)
 
         modules = {
@@ -358,6 +367,33 @@ class Dreamer(nn.Module):
             x = x.unsqueeze(-1)
         return x
 
+    @staticmethod
+    def _policy_logits(policy):
+        if not hasattr(policy, "logits"):
+            raise NotImplementedError(
+                "Replay SAC losses currently require a single discrete "
+                "OneHotDist actor.")
+        return policy.logits
+
+    @staticmethod
+    def _sample_action_index(logits):
+        probs = F.softmax(to_f32(logits), dim=-1)
+        flat = probs.reshape(-1, probs.shape[-1])
+        index = torch.multinomial(flat, 1)
+        return index.reshape(*probs.shape[:-1], 1)
+
+    @staticmethod
+    def _masked_mean(value, mask):
+        mask = to_f32(mask)
+        while mask.ndim < value.ndim:
+            mask = mask.unsqueeze(-1)
+        return (value * mask).sum() / mask.sum().clamp_min(1.0)
+
+    def _sac_discount(self):
+        if self.sac_gamma is not None:
+            return self.sac_gamma
+        return 1 - 1 / self.horizon
+
     def _world_model_forward(self, data, memory_carry):
         """World-model losses and detached cache for imagination updates."""
         positions = data["position"] if "position" in data.keys() else None
@@ -430,21 +466,22 @@ class Dreamer(nn.Module):
         imag_cont = self._frozen_cont(imag_feat).mean
         imag_value = self._frozen_value(imag_feat).mode()
         imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+        policy = self.actor(imag_feat)
+        logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
+        entropy = policy.entropy().unsqueeze(-1)
+        soft_reward = imag_reward + self.act_entropy * entropy.detach()
         disc = 1 - 1 / self.horizon
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
-        ret = self._lambda_return(last, term, imag_reward, imag_value,
+        ret = self._lambda_return(last, term, soft_reward, imag_value,
                                   imag_value, disc,
                                   self.lamb)  # (N, T_imag-1, 1)
         ret_offset, ret_scale = self.return_ema(ret)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
-        policy = self.actor(imag_feat)
-        logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
-        entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        policy_loss = weight[:, :-1].detach() * -(logpi * adv.detach() +
-                                                  self.act_entropy * entropy)
+        policy_loss = weight[:, :-1].detach() * -(
+            logpi * adv.detach() + self.act_entropy * entropy[:, :-1])
         losses["policy"] = policy_loss.mean()
 
         imag_value_dist = self.value(imag_feat)
@@ -463,13 +500,108 @@ class Dreamer(nn.Module):
         metrics["adv_std"] = torch.std(adv)
         metrics["con"] = torch.mean(imag_cont)
         metrics["rew"] = torch.mean(imag_reward)
+        metrics["soft_rew"] = torch.mean(soft_reward)
         metrics["val"] = torch.mean(imag_value)
         metrics["tar"] = torch.mean(ret)
         metrics["slowval"] = torch.mean(imag_slow_value)
         metrics["weight"] = torch.mean(weight)
-        metrics["action_entropy"] = torch.mean(entropy)
+        metrics["action_entropy"] = torch.mean(entropy[:, :-1])
+        metrics["ac_entropy_alpha"] = torch.as_tensor(self.act_entropy,
+                                                      device=imag_feat.device)
         metrics.update(tools.tensorstats(imag_action, "action"))
         return losses, metrics, ret[:, 0].detach()
+
+    def _sac_pi_loss(self, feat, valid):
+        policy = self.actor(feat)
+        logits = self._policy_logits(policy)
+        action = self._sample_action_index(logits)
+
+        with torch.no_grad():
+            q1, adv1, _, _ = self.value.q_values(feat, logits, True)
+            q2, adv2, _, _ = self.value.q_values(feat, logits, False)
+            q1_a = torch.gather(q1, -1, action)
+            q2_a = torch.gather(q2, -1, action)
+            adv1_a = torch.gather(adv1, -1, action)
+            adv2_a = torch.gather(adv2, -1, action)
+            adv = torch.where(q1_a > q2_a, adv2_a, adv1_a)
+
+        logp = F.log_softmax(to_f32(logits), dim=-1).gather(-1, action)
+        score = (adv - self.sac_alpha * logp).detach()
+        loss = -self._masked_mean(score * logp, valid)
+        metrics = {
+            "sac/pi_logp": torch.mean(logp.detach()),
+            "sac/pi_adv": torch.mean(adv.detach()),
+        }
+        return loss, metrics
+
+    def _sac_offpolicy_loss(self, data, feat, next_feat, valid):
+        action = data["action"][:, :-1].argmax(dim=-1, keepdim=True)
+        reward = self._scalar_seq(data["reward"])[:, 1:]
+        terminal = self._scalar_seq(data["is_terminal"])[:, 1:]
+
+        with torch.no_grad():
+            policy = self._frozen_actor(feat)
+            logits = self._policy_logits(policy)
+
+        q1, _, v_loss1, _ = self.value.q_values(feat, logits, True)
+        q2, _, v_loss2, _ = self.value.q_values(feat, logits, False)
+
+        with torch.no_grad():
+            next_policy = self._frozen_actor(next_feat)
+            next_logits = self._policy_logits(next_policy)
+            next_action = self._sample_action_index(next_logits)
+            target_q1 = self._frozen_slow_value.q_values(
+                next_feat, next_logits, True)[0]
+            target_q2 = self._frozen_slow_value.q_values(
+                next_feat, next_logits, False)[0]
+            target_q1 = torch.gather(target_q1, -1, next_action)
+            target_q2 = torch.gather(target_q2, -1, next_action)
+            target_q = torch.minimum(target_q1, target_q2)
+            next_logp = F.log_softmax(to_f32(next_logits),
+                                      dim=-1).gather(-1, next_action)
+            backup = reward + self._sac_discount() * (1.0 - terminal) * (
+                target_q - self.sac_alpha * next_logp)
+
+        q1_a = torch.gather(q1, -1, action)
+        q2_a = torch.gather(q2, -1, action)
+        q_loss1 = F.huber_loss(q1_a, backup, reduction="none")
+        q_loss2 = F.huber_loss(q2_a, backup, reduction="none")
+        loss = self._masked_mean(q_loss1 + q_loss2 + v_loss1 + v_loss2, valid)
+        metrics = {
+            "sac/q1": torch.mean(q1_a.detach()),
+            "sac/q2": torch.mean(q2_a.detach()),
+            "sac/backup": torch.mean(backup.detach()),
+            "sac/v_loss1": torch.mean(v_loss1.detach()),
+            "sac/v_loss2": torch.mean(v_loss2.detach()),
+        }
+        return loss, metrics
+
+    def _sac_replay_forward(self, data, feat):
+        """Discrete SAC losses over the real replay segment."""
+        losses = {}
+        metrics = {}
+        if not self.act_discrete or feat.shape[1] < 2:
+            zero = feat.sum() * 0.0
+            return {
+                "sac_pi": zero,
+                "sac_offpolicy": zero,
+            }, {
+                "sac/valid": zero.detach(),
+            }
+
+        current_feat = feat[:, :-1]
+        next_feat = feat[:, 1:].detach()
+        current_last = self._scalar_seq(data["is_last"])[:, :-1]
+        next_first = self._scalar_seq(data["is_first"])[:, 1:]
+        valid = (1.0 - current_last) * (1.0 - next_first)
+
+        losses["sac_pi"], pi_metrics = self._sac_pi_loss(current_feat, valid)
+        losses["sac_offpolicy"], q_metrics = self._sac_offpolicy_loss(
+            data, current_feat, next_feat, valid)
+        metrics.update(pi_metrics)
+        metrics.update(q_metrics)
+        metrics["sac/valid"] = valid.mean()
+        return losses, metrics
 
     def _replay_value_forward(self, data, feat, boot):
         """Replay value loss with gradients kept through replay features."""
@@ -520,19 +652,26 @@ class Dreamer(nn.Module):
                 s_stoch, s_deter, s_carry)
             ac_total = (self._loss_scales["policy"] * ac_losses["policy"] +
                         self._loss_scales["value"] * ac_losses["value"])
+            sac_losses, sac_metrics = self._sac_replay_forward(
+                data, imag_source["feat"])
+            sac_total = (self._loss_scales["sac_pi"] * sac_losses["sac_pi"] +
+                         self._loss_scales["sac_offpolicy"] *
+                         sac_losses["sac_offpolicy"])
             #repval_losses, repval_metrics = self._replay_value_forward(
             #    data, imag_source["feat"], replay_boot)
             #repval_total = (self._loss_scales["repval"] *
             #                repval_losses["repval"])
         losses.update(ac_losses)
+        losses.update(sac_losses)
         #losses.update(repval_losses)
         metrics.update(ac_metrics)
+        metrics.update(sac_metrics)
         #metrics.update(repval_metrics)
 
         world_model_loss = sum(self._loss_scales[name] * value
                                for name, value in wm_losses.items())
         #opt_loss = ac_total + repval_total + world_model_loss
-        opt_loss = ac_total + world_model_loss
+        opt_loss = ac_total + sac_total + world_model_loss
         losses.update(wm_losses)
         metrics.update(wm_metrics)
         return opt_loss, losses, metrics, next_carry

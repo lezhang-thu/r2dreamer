@@ -1,3 +1,4 @@
+import copy
 import re
 from functools import partial
 
@@ -386,6 +387,94 @@ class MLPHead(nn.Module):
         """Produce a distribution head."""
         # (B, T, F)
         return self._dist(self.last(self.mlp(x)))
+
+
+class DuelingValueDist:
+
+    def __init__(self, dists, reduce="min"):
+        self.dists = tuple(dists)
+        self.reduce = str(reduce)
+
+    def mode(self):
+        modes = [dist.mode() for dist in self.dists]
+        if self.reduce == "min":
+            return torch.minimum(modes[0], modes[1])
+        if self.reduce == "mean":
+            return torch.stack(modes, dim=0).mean(dim=0)
+        if self.reduce == "first":
+            return modes[0]
+        raise NotImplementedError(self.reduce)
+
+    def log_prob(self, target):
+        logps = [dist.log_prob(target) for dist in self.dists]
+        return torch.stack(logps, dim=0).mean(dim=0)
+
+
+class DuelingQBranch(nn.Module):
+
+    def __init__(self, config, inp_dim, act_dim, name):
+        super().__init__()
+        base_name = str(getattr(config, "name", "q"))
+
+        value_config = copy.deepcopy(config)
+        value_config.name = f"{base_name}_{name}_value"
+        self.value = MLPHead(value_config, inp_dim)
+
+        adv_config = copy.deepcopy(config)
+        adv_config.shape = [int(act_dim)]
+        adv_config.dist.name = "identity"
+        adv_config.outscale = float(getattr(config, "adv_outscale", 0.01))
+        adv_config.name = f"{base_name}_{name}_adv"
+        self.adv = MLPHead(adv_config, inp_dim)
+
+    def q_values(self, feat, logits, alpha):
+        v = self.value(feat).mode()
+        adv = self.adv(feat)
+
+        logits = logits.to(dtype=torch.float32)
+        logprob = F.log_softmax(logits, dim=-1)
+        prob = logprob.exp()
+        entropy = -(prob * logprob).sum(dim=-1, keepdim=True)
+
+        adv_f = adv.to(dtype=torch.float32)
+        baseline = ((adv_f * prob.detach()).sum(dim=-1, keepdim=True) +
+                    float(alpha) * entropy.detach())
+        centered_adv = adv_f - baseline
+        q = v.to(dtype=torch.float32) + centered_adv
+        v_loss = F.huber_loss(v.to(dtype=torch.float32),
+                              baseline,
+                              reduction="none")
+        return q, centered_adv, v_loss, v
+
+
+class DuelingQHead(nn.Module):
+    """Twin dueling discrete-Q heads with value distributions.
+
+    The module keeps the Dreamer critic interface through ``forward()`` while
+    exposing action-wise Q values for discrete SAC-style replay losses.
+    """
+
+    def __init__(self,
+                 config,
+                 inp_dim,
+                 act_dim,
+                 alpha=3e-4,
+                 value_reduce="min"):
+        super().__init__()
+        self.q1 = DuelingQBranch(config, inp_dim, act_dim, "q1")
+        self.q2 = DuelingQBranch(config, inp_dim, act_dim, "q2")
+        self._alpha = float(alpha)
+        self._value_reduce = str(value_reduce)
+
+    def forward(self, x):
+        return DuelingValueDist(
+            [self.q1.value(x), self.q2.value(x)],
+            reduce=self._value_reduce,
+        )
+
+    def q_values(self, feat, logits, first_flag=True):
+        branch = self.q1 if first_flag else self.q2
+        return branch.q_values(feat, logits, self._alpha)
 
 
 class Projector(nn.Module):
