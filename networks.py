@@ -27,11 +27,7 @@ class BlockLinear(nn.Module):
     calculation used by initializers.
     """
 
-    def __init__(self,
-                 in_ch: int,
-                 out_ch: int,
-                 blocks: int,
-                 outscale: float = 1.0):
+    def __init__(self, in_ch: int, out_ch: int, blocks: int, outscale: float = 1.0):
         super().__init__()
         self.in_ch = int(in_ch)
         self.out_ch = int(out_ch)
@@ -40,9 +36,7 @@ class BlockLinear(nn.Module):
 
         # Store weight in a layout that works with torch's fan calculation.
         # (O/G, I/G, G)
-        self.weight = nn.Parameter(
-            torch.empty(self.out_ch // self.blocks, self.in_ch // self.blocks,
-                        self.blocks))
+        self.weight = nn.Parameter(torch.empty(self.out_ch // self.blocks, self.in_ch // self.blocks, self.blocks))
         self.bias = nn.Parameter(torch.empty(self.out_ch))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -70,18 +64,13 @@ class Conv2dSamePad(nn.Conv2d):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ih, iw = x.size()[-2:]
-        pad_h = self._calc_same_pad(ih, self.kernel_size[0], self.stride[0],
-                                    self.dilation[0])
-        pad_w = self._calc_same_pad(iw, self.kernel_size[1], self.stride[1],
-                                    self.dilation[1])
+        pad_h = self._calc_same_pad(ih, self.kernel_size[0], self.stride[0], self.dilation[0])
+        pad_w = self._calc_same_pad(iw, self.kernel_size[1], self.stride[1], self.dilation[1])
 
         if pad_h > 0 or pad_w > 0:
             x = F.pad(
                 x,
-                [
-                    pad_w // 2, pad_w - pad_w // 2, pad_h // 2,
-                    pad_h - pad_h // 2
-                ],
+                [pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2],
             )
 
         return F.conv2d(
@@ -115,32 +104,16 @@ def _maybe_norm_2d(ch: int, use_norm: bool) -> nn.Module:
 class ResNetBasicBlock(nn.Module):
     """Small-image ResNet basic block with stride-based downsampling."""
 
-    def __init__(self,
-                 in_ch: int,
-                 out_ch: int,
-                 kernel_size: int,
-                 act,
-                 use_norm: bool,
-                 stride: int = 1):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, act, use_norm: bool, stride: int = 1):
         super().__init__()
         bias = not use_norm
-        self.conv1 = Conv2dSamePad(in_ch,
-                                   out_ch,
-                                   kernel_size,
-                                   stride=stride,
-                                   bias=bias)
+        self.conv1 = Conv2dSamePad(in_ch, out_ch, kernel_size, stride=stride, bias=bias)
         self.norm1 = _maybe_norm_2d(out_ch, use_norm)
         self.act1 = act()
-        self.conv2 = Conv2dSamePad(out_ch,
-                                   out_ch,
-                                   kernel_size,
-                                   stride=1,
-                                   bias=bias)
+        self.conv2 = Conv2dSamePad(out_ch, out_ch, kernel_size, stride=1, bias=bias)
         self.norm2 = _maybe_norm_2d(out_ch, use_norm)
         if stride != 1 or in_ch != out_ch:
-            skip_layers = [
-                Conv2dSamePad(in_ch, out_ch, 1, stride=stride, bias=bias)
-            ]
+            skip_layers = [Conv2dSamePad(in_ch, out_ch, 1, stride=stride, bias=bias)]
             if use_norm:
                 skip_layers.append(_maybe_norm_2d(out_ch, use_norm))
             self.skip = nn.Sequential(*skip_layers)
@@ -167,21 +140,9 @@ class MultiEncoder(nn.Module):
     ):
         super().__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
-        shapes = {
-            k: v
-            for k, v in shapes.items()
-            if k not in excluded and not k.startswith("log_")
-        }
-        self.cnn_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) == 3 and re.match(config.cnn_keys, k)
-        }
-        self.mlp_shapes = {
-            k: v
-            for k, v in shapes.items()
-            if len(v) in (1, 2) and re.match(config.mlp_keys, k)
-        }
+        shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith("log_")}
+        self.cnn_shapes = {k: v for k, v in shapes.items() if len(v) == 3 and re.match(config.cnn_keys, k)}
+        self.mlp_shapes = {k: v for k, v in shapes.items() if len(v) in (1, 2) and re.match(config.mlp_keys, k)}
         print("Encoder CNN shapes:", self.cnn_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
 
@@ -192,14 +153,12 @@ class MultiEncoder(nn.Module):
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
             input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
             self.encoders.append(ConvEncoder(config.cnn, input_shape))
-            self.selectors.append(
-                lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
+            self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
         if self.mlp_shapes:
             inp_dim = sum([sum(v) for v in self.mlp_shapes.values()])
             self.encoders.append(MLP(config.mlp, inp_dim))
-            self.selectors.append(
-                lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
+            self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
         self.encoders = nn.ModuleList(self.encoders)
 
@@ -215,8 +174,7 @@ class MultiEncoder(nn.Module):
     def forward(self, obs):
         """Encode a dict of observations."""
         # dict of (B, T, *)
-        return self.fuser(
-            [enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
+        return self.fuser([enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
 
 
 class ConvEncoder(nn.Module):
@@ -226,11 +184,8 @@ class ConvEncoder(nn.Module):
         act = getattr(torch.nn, config.act)
         h, w, input_ch = input_shape
         self._minres = int(config.minres)
-        self.depths = tuple(
-            int(config.depth) * int(mult) for mult in list(config.mults))
-        self.blocks = tuple(
-            int(blocks)
-            for blocks in getattr(config, "blocks", [1] * len(self.depths)))
+        self.depths = tuple(int(config.depth) * int(mult) for mult in list(config.mults))
+        self.blocks = tuple(int(blocks) for blocks in getattr(config, "blocks", [1] * len(self.depths)))
         if len(self.blocks) != len(self.depths):
             raise AssertionError(
                 "ConvEncoder config.blocks must match config.mults length "
@@ -245,37 +200,25 @@ class ConvEncoder(nn.Module):
         use_norm = bool(config.norm)
         bias = not use_norm
         self.stem = nn.Sequential(
-            Conv2dSamePad(input_ch,
-                          self.depths[0],
-                          kernel_size,
-                          stride=stem_stride,
-                          bias=bias),
+            Conv2dSamePad(input_ch, self.depths[0], kernel_size, stride=stem_stride, bias=bias),
             _maybe_norm_2d(self.depths[0], use_norm),
             act(),
         )
         h, w = self._downsample_dims(h, w, stem_stride)
         in_dim = self.depths[0]
         stages = []
-        for stage_idx, (depth,
-                        block_count) in enumerate(zip(self.depths,
-                                                      self.blocks)):
+        for stage_idx, (depth, block_count) in enumerate(zip(self.depths, self.blocks)):
             blocks = []
             for block_idx in range(block_count):
                 stride = 1 if stage_idx == 0 or block_idx > 0 else 2
-                blocks.append(
-                    ResNetBasicBlock(in_dim,
-                                     depth,
-                                     kernel_size,
-                                     act,
-                                     use_norm,
-                                     stride=stride))
+                blocks.append(ResNetBasicBlock(in_dim, depth, kernel_size, act, use_norm, stride=stride))
                 in_dim = depth
                 h, w = self._downsample_dims(h, w, stride)
             stages.append(nn.Sequential(*blocks))
         if h < self._minres or w < self._minres:
             raise AssertionError(
-                "ConvEncoder output resolution fell below config.minres "
-                f"(got {(h, w)}, minres={self._minres}).")
+                f"ConvEncoder output resolution fell below config.minres (got {(h, w)}, minres={self._minres})."
+            )
 
         self.out_dim = self.depths[-1] * h * w
         self.layers = nn.Sequential(*stages)
@@ -316,11 +259,8 @@ class MLP(nn.Module):
         self._device = torch.device(config.device)
         self.layers = nn.Sequential()
         for i in range(config.layers):
-            self.layers.add_module(f"{config.name}_linear{i}",
-                                   nn.Linear(inp_dim, config.units, bias=True))
-            self.layers.add_module(
-                f"{config.name}_norm{i}",
-                nn.RMSNorm(config.units, eps=1e-04, dtype=torch.float32))
+            self.layers.add_module(f"{config.name}_linear{i}", nn.Linear(inp_dim, config.units, bias=True))
+            self.layers.add_module(f"{config.name}_norm{i}", nn.RMSNorm(config.units, eps=1e-04, dtype=torch.float32))
             self.layers.add_module(f"{config.name}_act{i}", act())
             inp_dim = config.units
         self.out_dim = config.units
@@ -343,30 +283,17 @@ class MLPHead(nn.Module):
         self._dist = getattr(dists, str(config.dist.name))
 
         if self._dist_name == "bounded_normal":
-            self.last = nn.Linear(self.mlp.out_dim,
-                                  config.shape[0] * 2,
-                                  bias=True)
-            kwargs = {
-                "min_std": float(config.dist.min_std),
-                "max_std": float(config.dist.max_std)
-            }
+            self.last = nn.Linear(self.mlp.out_dim, config.shape[0] * 2, bias=True)
+            kwargs = {"min_std": float(config.dist.min_std), "max_std": float(config.dist.max_std)}
         elif self._dist_name == "onehot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {"unimix_ratio": float(config.dist.unimix_ratio)}
         elif self._dist_name == "multi_onehot":
-            self.last = nn.Linear(self.mlp.out_dim,
-                                  sum(config.shape),
-                                  bias=True)
-            kwargs = {
-                "unimix_ratio": float(config.dist.unimix_ratio),
-                "shape": tuple(config.shape)
-            }
+            self.last = nn.Linear(self.mlp.out_dim, sum(config.shape), bias=True)
+            kwargs = {"unimix_ratio": float(config.dist.unimix_ratio), "shape": tuple(config.shape)}
         elif self._dist_name == "symexp_twohot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
-            kwargs = {
-                "device": torch.device(config.device),
-                "bin_num": int(config.dist.bin_num)
-            }
+            kwargs = {"device": torch.device(config.device), "bin_num": int(config.dist.bin_num)}
         elif self._dist_name in ("binary", "identity"):
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {}
@@ -388,6 +315,40 @@ class MLPHead(nn.Module):
         return self._dist(self.last(self.mlp(x)))
 
 
+class AdvTwoHotHead(nn.Module):
+    """Per-action symexp_twohot head for dueling advantages."""
+
+    def __init__(self, config, inp_dim, act_dim):
+        super().__init__()
+        self.mlp = MLP(config, inp_dim)
+        self._act_dim = int(act_dim)
+        self.bin_num = int(config.dist.bin_num)
+        self._outscale = float(config.outscale)
+        self.last = nn.Linear(self.mlp.out_dim, self._act_dim * self.bin_num, bias=True)
+
+        self.mlp.apply(weight_init_)
+        self.last.apply(weight_init_)
+        if self._outscale != 1.0:
+            with torch.no_grad():
+                self.last.weight.mul_(self._outscale)
+
+    def forward(self, x):
+        """Produce one TwoHot distribution per action."""
+        # (..., F) -> (..., A, N_bins)
+        out = self.last(self.mlp(x))
+        out = out.reshape(*out.shape[:-1], self._act_dim, self.bin_num)
+        return dists.symexp_twohot(out, bin_num=self.bin_num)
+
+
+class DuelingQHead(nn.Module):
+    """Dueling Q-head: state-value plus per-action advantage (dueling-sac)."""
+
+    def __init__(self, config, inp_dim, act_dim):
+        super().__init__()
+        self.v = MLPHead(config, inp_dim)
+        self.adv = AdvTwoHotHead(config, inp_dim, act_dim)
+
+
 class Projector(nn.Module):
 
     def __init__(self, in_ch1, in_ch2):
@@ -407,14 +368,12 @@ class ReturnEMA(nn.Module):
         self.device = device
         self.alpha = alpha
         self.range = torch.tensor([0.05, 0.95], device=device)
-        self.register_buffer(
-            "ema_vals", torch.zeros(2, dtype=torch.float32, device=self.device))
+        self.register_buffer("ema_vals", torch.zeros(2, dtype=torch.float32, device=self.device))
 
     def __call__(self, x):
         x_quantile = torch.quantile(torch.flatten(x.detach()), self.range)
         # Using out-of-place update for torch.compile compatibility
-        self.ema_vals.copy_(self.alpha * x_quantile.detach() +
-                            (1 - self.alpha) * self.ema_vals)
+        self.ema_vals.copy_(self.alpha * x_quantile.detach() + (1 - self.alpha) * self.ema_vals)
         scale = torch.clip(self.ema_vals[1] - self.ema_vals[0], min=1.0)
         offset = self.ema_vals[0]
         return offset.detach(), scale.detach()

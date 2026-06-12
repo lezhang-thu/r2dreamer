@@ -26,7 +26,11 @@ loss_scales:
   dyn: 1.0
   policy: 1.0
   value: 1.0
-  repval: 0.3
+  sac_pi: 1.0
+  sac_q: 1.0
+
+sac:
+  alpha: 1e-2
 
 r2dreamer:
   lambd: 5e-4
