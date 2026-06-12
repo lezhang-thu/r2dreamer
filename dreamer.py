@@ -576,21 +576,22 @@ class Dreamer(nn.Module):
             positions=imag_source["positions"],
         )
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            ac_losses, ac_metrics = self._actor_critic_forward(s_stoch, s_deter, s_carry)
+            #ac_losses, ac_metrics = self._actor_critic_forward(s_stoch, s_deter, s_carry)
             sac_losses, sac_metrics = self._sac_losses(data, imag_source["feat"])
-            ac_total = (
-                self._loss_scales["policy"] * ac_losses["policy"] + self._loss_scales["value"] * ac_losses["value"]
-            )
+            #ac_total = (
+            #    self._loss_scales["policy"] * ac_losses["policy"] + self._loss_scales["value"] * ac_losses["value"]
+            #)
             sac_total = (
                 self._loss_scales["sac_pi"] * sac_losses["sac_pi"] + self._loss_scales["sac_q"] * sac_losses["sac_q"]
             )
-        losses.update(ac_losses)
+        #losses.update(ac_losses)
         losses.update(sac_losses)
-        metrics.update(ac_metrics)
+        #metrics.update(ac_metrics)
         metrics.update(sac_metrics)
 
         world_model_loss = sum(self._loss_scales[name] * value for name, value in wm_losses.items())
-        opt_loss = ac_total + sac_total + world_model_loss
+        #opt_loss = ac_total + sac_total + world_model_loss
+        opt_loss = sac_total + world_model_loss
         losses.update(wm_losses)
         metrics.update(wm_metrics)
         return opt_loss, losses, metrics, next_carry
