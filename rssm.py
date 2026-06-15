@@ -195,7 +195,8 @@ class TransformerRSSM(nn.Module):
                 *,
                 memory_carry,
                 sample=True,
-                positions=None):
+                positions=None,
+                compute_prior=True):
         """Observe one real segment using detached Transformer-XL memory.
 
         Args:
@@ -208,6 +209,7 @@ class TransformerRSSM(nn.Module):
             positions: Optional absolute episode positions, shape (B, T).
             memory_carry: Detached Transformer-XL carry for segment training
                 without replay-side prefix tokens.
+            compute_prior: Whether to compute prior logits from h_prev.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
             feat: dict with deter, stoch, post_logit, prior_logit, and
@@ -240,7 +242,7 @@ class TransformerRSSM(nn.Module):
         h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
         h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
         final_context = self._deter_context(h_prev)
-        prior_logit = self._prior_head(final_context)
+        prior_logit = self._prior_head(final_context) if compute_prior else None
 
         kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
         kv_v = torch.cat([carry['kv_cache'][:, :, 1].detach(), kv['v']], dim=2)
@@ -256,6 +258,37 @@ class TransformerRSSM(nn.Module):
             'next_carry': next_carry,
         }
         return entries, feat
+
+    def observe_with_stoch(self,
+                           stoch,
+                           action,
+                           reset,
+                           *,
+                           memory_carry,
+                           positions=None):
+        """Observe a segment using an externally supplied stochastic state."""
+        B, T = stoch.shape[:2]
+        if positions is None:
+            positions = torch.arange(T, device=stoch.device,
+                                     dtype=torch.long).unsqueeze(0).expand(
+                                         B, -1)
+        else:
+            positions = positions.to(device=stoch.device, dtype=torch.long)
+
+        carry = self._mask_carry(memory_carry, reset[:, 0])
+        action_norm = action / torch.clip(torch.abs(action), min=1.0).detach()
+        stoch_flat = stoch.reshape(*stoch.shape[:-2], self.flat_stoch)
+        x = self._input_token(stoch_flat, action_norm)
+        h, _, _ = self._fwd_segment_with_carry(x, carry, positions, reset)
+        h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
+        h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
+        return {'deter': h_prev}
+
+    def prior_logits_from_context(self, deter_context):
+        return self._prior_head(deter_context)
+
+    def prior_logits_from_deter(self, deter):
+        return self._prior_head(self._deter_context(deter))
 
     def _apply_rope(self, x, positions=None):
         """Apply RoPE to (B, H, T, D_head) tensor."""

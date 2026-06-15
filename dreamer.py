@@ -4,6 +4,7 @@ from collections import OrderedDict
 import torch
 from tensordict import TensorDict
 from torch import nn
+from torch.nn import functional as F
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -83,7 +84,20 @@ class Dreamer(nn.Module):
 
         # R2-Dreamer redundancy-reduction head.
         self.prj = Projector(self.rssm.feat_size, self.embed_size)
-        modules.update({"projector": self.prj})
+        act_fn = getattr(torch.nn, config.act)
+        deter_size = int(config.transformer.deter)
+        align_hidden = int(config.hidden)
+        self.prior_align_predictor = nn.Sequential(
+            nn.Linear(deter_size, align_hidden, bias=True),
+            nn.RMSNorm(align_hidden, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+            nn.Linear(align_hidden, deter_size, bias=True),
+        )
+        self.prior_align_predictor.apply(tools.weight_init_)
+        modules.update({
+            "projector": self.prj,
+            "prior_align_predictor": self.prior_align_predictor,
+        })
         self.barlow_lambd = float(config.r2dreamer.lambd)
         # count number of parameters in each module
         for key, module in modules.items():
@@ -358,6 +372,13 @@ class Dreamer(nn.Module):
             x = x.unsqueeze(-1)
         return x
 
+    @staticmethod
+    def _negative_cosine_similarity(p, z):
+        z = z.detach()
+        p = F.normalize(p, dim=-1)
+        z = F.normalize(z, dim=-1)
+        return -(p * z).sum(dim=-1).mean()
+
     def _world_model_forward(self, data, memory_carry):
         """World-model losses and detached cache for imagination updates."""
         positions = data["position"] if "position" in data.keys() else None
@@ -377,13 +398,33 @@ class Dreamer(nn.Module):
                                          action,
                                          data["is_first"],
                                          positions=positions,
-                                         memory_carry=memory_carry)
+                                         memory_carry=memory_carry,
+                                         compute_prior=False)
         post_stoch = feat_dict['stoch']  # (B, T, S, K)
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
-        prior_logit = feat_dict['prior_logit']
+        dyn_feat_dict = self.rssm.observe_with_stoch(post_stoch.detach(),
+                                                     action,
+                                                     data["is_first"],
+                                                     positions=positions,
+                                                     memory_carry=memory_carry)
+        prior_logit = self.rssm.prior_logits_from_deter(
+            dyn_feat_dict["deter"])
         dyn_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = dyn_loss.mean()
+
+        prior_logit_x = self.rssm.prior_logits_from_context(
+            feat_dict["deter_context"].detach())
+        stoch_x = self.rssm.get_dist(prior_logit_x).rsample()
+        feat_dict_x = self.rssm.observe_with_stoch(stoch_x,
+                                                   action,
+                                                   data["is_first"],
+                                                   positions=positions,
+                                                   memory_carry=memory_carry)
+        h_prev_y = self.prior_align_predictor(
+            feat_dict_x["deter"].reshape(B * T, -1))
+        losses["prior_align"] = self._negative_cosine_similarity(
+            h_prev_y, post_deter.reshape(B * T, -1))
 
         # === Representation / auxiliary losses ===
         # (B, T, F)
@@ -405,6 +446,7 @@ class Dreamer(nn.Module):
             self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(
             self.rssm.get_dist(post_logit).entropy())
+        metrics["prior_align_cos"] = -losses["prior_align"].detach()
 
         imag_source = {
             "post_stoch": post_stoch.detach(),
