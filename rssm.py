@@ -195,8 +195,7 @@ class TransformerRSSM(nn.Module):
                 *,
                 memory_carry,
                 sample=True,
-                positions=None,
-                compute_prior=True):
+                positions=None):
         """Observe one real segment using detached Transformer-XL memory.
 
         Args:
@@ -209,7 +208,6 @@ class TransformerRSSM(nn.Module):
             positions: Optional absolute episode positions, shape (B, T).
             memory_carry: Detached Transformer-XL carry for segment training
                 without replay-side prefix tokens.
-            compute_prior: Whether to compute prior logits from h_prev.
         Returns:
             entries: dict with 'deter' (B,T,D) and 'stoch' (B,T,S,K).
             feat: dict with deter, stoch, post_logit, prior_logit, and
@@ -242,7 +240,7 @@ class TransformerRSSM(nn.Module):
         h_prev = torch.cat([carry['h_prev'].unsqueeze(1), h[:, :-1]], dim=1)
         h_prev = h_prev * (1.0 - reset.unsqueeze(-1).float())
         final_context = self._deter_context(h_prev)
-        prior_logit = self._prior_head(final_context) if compute_prior else None
+        prior_logit = self._prior_head(final_context)
 
         kv_k = torch.cat([carry['kv_cache'][:, :, 0].detach(), kv['k']], dim=2)
         kv_v = torch.cat([carry['kv_cache'][:, :, 1].detach(), kv['v']], dim=2)
@@ -286,9 +284,6 @@ class TransformerRSSM(nn.Module):
 
     def prior_logits_from_context(self, deter_context):
         return self._prior_head(deter_context)
-
-    def prior_logits_from_deter(self, deter):
-        return self._prior_head(self._deter_context(deter))
 
     def _apply_rope(self, x, positions=None):
         """Apply RoPE to (B, H, T, D_head) tensor."""

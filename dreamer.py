@@ -398,18 +398,11 @@ class Dreamer(nn.Module):
                                          action,
                                          data["is_first"],
                                          positions=positions,
-                                         memory_carry=memory_carry,
-                                         compute_prior=False)
+                                         memory_carry=memory_carry)
         post_stoch = feat_dict['stoch']  # (B, T, S, K)
         post_deter = feat_dict['deter']  # (B, T, D) = h_prev
         post_logit = feat_dict['post_logit']  # (B, T, S, K)
-        dyn_feat_dict = self.rssm.observe_with_stoch(post_stoch.detach(),
-                                                     action,
-                                                     data["is_first"],
-                                                     positions=positions,
-                                                     memory_carry=memory_carry)
-        prior_logit = self.rssm.prior_logits_from_deter(
-            dyn_feat_dict["deter"])
+        prior_logit = feat_dict['prior_logit']
         dyn_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = dyn_loss.mean()
 
