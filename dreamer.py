@@ -165,10 +165,13 @@ class Dreamer(nn.Module):
                                   self.act_dim)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
+        self._slow_actor = copy.deepcopy(self.actor)
         self._slow_value = copy.deepcopy(self.value)
+        for param in self._slow_actor.parameters():
+            param.requires_grad = False
         for param in self._slow_value.parameters():
             param.requires_grad = False
-        self._slow_value_updates = 0
+        self._slow_target_updates = 0
         self._train_carry = None
 
         self._loss_scales = dict(config.loss_scales)
@@ -236,18 +239,24 @@ class Dreamer(nn.Module):
                                                mode="default")
 
     def _update_slow_target(self):
-        """Update slow-moving value target network."""
-        if self._slow_value_updates % self.slow_target_update == 0:
+        """Update slow-moving actor and value target networks."""
+        if self._slow_target_updates % self.slow_target_update == 0:
             with torch.no_grad():
                 mix = self.slow_target_fraction
-                for v, s in zip(self.value.parameters(),
-                                self._slow_value.parameters()):
-                    s.data.copy_(mix * v.data + (1 - mix) * s.data)
-        self._slow_value_updates += 1
+                for source, target in (
+                    (self.actor, self._slow_actor),
+                    (self.value, self._slow_value),
+                ):
+                    for param, slow_param in zip(source.parameters(),
+                                                target.parameters()):
+                        slow_param.data.copy_(mix * param.data +
+                                              (1 - mix) * slow_param.data)
+        self._slow_target_updates += 1
 
     def train(self, mode=True):
         super().train(mode)
-        # slow_value should be always eval mode
+        # Slow targets should always stay in eval mode.
+        self._slow_actor.train(False)
         self._slow_value.train(False)
         return self
 
@@ -314,12 +323,12 @@ class Dreamer(nn.Module):
 
     def clone_and_freeze(self):
         for name in ("encoder", "rssm", "reward", "cont", "actor", "value",
-                     "slow_value"):
+                     "slow_actor", "slow_value"):
             setattr(
                 self, f"_frozen_{name}",
                 self._freeze_copy(
                     getattr(self,
-                            f"_{name}" if name == "slow_value" else name)))
+                            f"_{name}" if name.startswith("slow_") else name)))
 
     @staticmethod
     def _detach_carry(carry):
@@ -589,27 +598,29 @@ class Dreamer(nn.Module):
         with torch.no_grad():
             cur_policy = self.actor(cur_feat)
             next_policy = self.actor(next_feat)
+            next_target_policy = self._frozen_slow_actor(next_feat)
         cur_qvalue = self.value(cur_feat, cur_policy)
         with torch.no_grad():
-            next_qvalue = self.value(next_feat, next_policy)
+            next_target_qvalue = self._frozen_slow_value(
+                next_feat, next_target_policy)
 
         repq_loss, metrics = self._offpolicy_loss(last, term, reward, action,
                                                   cur_qvalue, next_policy,
-                                                  next_qvalue)
+                                                  next_target_qvalue)
         losses = {"repq": repq_loss}
         metrics = {f"reploss/{name}": value for name, value in metrics.items()}
         return losses, metrics
 
     def _offpolicy_loss(self, last, term, reward, action, qvalue, next_policy,
-                        next_qvalue):
+                        next_target_qvalue):
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last[:, :-1]
         denom = torch.clamp(weight.sum(), min=1.0)
 
         with torch.no_grad():
             next_sample = next_policy.rsample()
-            y_q1 = next_qvalue.gather_q(0, next_sample)
-            y_q2 = next_qvalue.gather_q(1, next_sample)
+            y_q1 = next_target_qvalue.gather_q(0, next_sample)
+            y_q2 = next_target_qvalue.gather_q(1, next_sample)
             target_q = torch.minimum(y_q1, y_q2)
             backup = reward[:, 1:] + disc * (1.0 - term[:, 1:]) * target_q
 
