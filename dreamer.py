@@ -592,17 +592,16 @@ class Dreamer(nn.Module):
         cur_qvalue = self.value(cur_feat, cur_policy)
         with torch.no_grad():
             next_qvalue = self.value(next_feat, next_policy)
-            slow_value = self._frozen_slow_value(cur_feat, cur_policy).pred()
 
         repq_loss, metrics = self._offpolicy_loss(last, term, reward, action,
                                                   cur_qvalue, next_policy,
-                                                  next_qvalue, slow_value)
+                                                  next_qvalue)
         losses = {"repq": repq_loss}
         metrics = {f"reploss/{name}": value for name, value in metrics.items()}
         return losses, metrics
 
     def _offpolicy_loss(self, last, term, reward, action, qvalue, next_policy,
-                        next_qvalue, slow_value):
+                        next_qvalue):
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last[:, :-1]
         denom = torch.clamp(weight.sum(), min=1.0)
@@ -617,8 +616,7 @@ class Dreamer(nn.Module):
         v_loss = qvalue.v_loss[0] + qvalue.v_loss[1]
         q_loss = qvalue.q_loss(0, action, backup) + qvalue.q_loss(
             1, action, backup)
-        slow_value_loss = qvalue.loss(slow_value)
-        loss = torch.mean(weight * (q_loss + v_loss + slow_value_loss))
+        loss = torch.mean(weight * (q_loss + v_loss))
 
         q1, q2 = qvalue.q
         x_q1 = qvalue.gather_q(0, action)
@@ -629,7 +627,6 @@ class Dreamer(nn.Module):
             "xq1": (weight * x_q1).sum() / denom,
             "xq2": (weight * x_q2).sum() / denom,
             "backup": (weight * backup).sum() / denom,
-            "slowval": (weight * slow_value).sum() / denom,
             "weight": weight.mean(),
         }
         return loss, metrics
