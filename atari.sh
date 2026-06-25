@@ -3,41 +3,36 @@
 # ==== Settings ====
 GPU_ID=0
 DATE=$(date +%m%d) # auto complete
-#SEED_START=0
-##SEED_END=400
-#SEED_END=0
-#SEED_STEP=100
 METHOD=r2dreamer
 
 # ==== Tasks ====
 tasks=(
-	#"atari_alien"
-	#"atari_amidar"
-	#    "atari_assault"
-	#    "atari_asterix"
-	#    "atari_bank_heist"
-	#    "atari_battle_zone"
-	#    "atari_boxing"
-	#    "atari_breakout"
-	#    "atari_chopper_command"
-	#    "atari_crazy_climber"
-	#    "atari_demon_attack"
-	#    "atari_freeway"
-	#    "atari_frostbite"
+	"atari_alien"
+	"atari_amidar"
+	"atari_assault"
+	"atari_asterix"
+	"atari_bank_heist"
+	#"atari_battle_zone"
+	#"atari_boxing"
+	#"atari_breakout"
+	#"atari_chopper_command"
+	#"atari_crazy_climber"
+	#"atari_demon_attack"
+	#"atari_freeway"
+	#"atari_frostbite"
 	#"atari_gopher"
 	#"atari_hero"
-	#    "atari_jamesbond"
-	"atari_kangaroo"
-	#    "atari_krull"
-	#    "atari_kung_fu_master"
-	#    "atari_ms_pacman"
-	#    "atari_pong"
-	#    "atari_private_eye"
-	#    "atari_qbert"
-	#    "atari_road_runner"
-	#    "atari_seaquest"
-	#    "atari_up_n_down"
-	#"atari_montezuma_revenge"
+	#"atari_jamesbond"
+	#"atari_kangaroo"
+	#"atari_krull"
+	#"atari_kung_fu_master"
+	#"atari_ms_pacman"
+	#"atari_pong"
+	#"atari_private_eye"
+	#"atari_qbert"
+	#"atari_road_runner"
+	#"atari_seaquest"
+	#"atari_up_n_down"
 )
 
 # ==== Loop ====
