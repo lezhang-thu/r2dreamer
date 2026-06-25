@@ -50,17 +50,6 @@ class DuelingQ(nn.Module):
         return DuelingQOutput(value, advantage, policy, self.action_dim)
 
 
-class DuelingQPair(nn.Module):
-
-    def __init__(self, config, inp_dim, act_dim):
-        super().__init__()
-        self.q1 = DuelingQ(config, inp_dim, act_dim)
-        self.q2 = DuelingQ(config, inp_dim, act_dim)
-
-    def forward(self, x, policy):
-        return DuelingQPairOutput(self.q1(x, policy), self.q2(x, policy))
-
-
 class DuelingQOutput:
 
     def __init__(self, value, advantage, policy, action_dim):
@@ -89,32 +78,14 @@ class DuelingQOutput:
     def loss(self, target):
         return -self.value.log_prob(target.detach()).unsqueeze(-1)
 
+    def gather_q(self, action):
+        return _gather_onehot(self.q, action)
+
     def q_loss(self, action, target):
         expanded = target.detach()[..., None, :].expand(
             *target.shape[:-1], self.action_dim, target.shape[-1])
         losses = -self.qdist.log_prob(expanded)
         return _gather_onehot(losses, action)
-
-
-class DuelingQPairOutput:
-
-    def __init__(self, q1, q2):
-        self.qs = (q1, q2)
-        self.q = (q1.q, q2.q)
-        self.adv = (q1.adv, q2.adv)
-        self.v_loss = (q1.v_loss, q2.v_loss)
-
-    def pred(self):
-        return torch.minimum(self.qs[0].pred(), self.qs[1].pred())
-
-    def loss(self, target):
-        return 0.5 * (self.qs[0].loss(target) + self.qs[1].loss(target))
-
-    def gather_q(self, which, action):
-        return _gather_onehot(self.q[which], action)
-
-    def q_loss(self, which, action, target):
-        return self.qs[which].q_loss(action, target)
 
 
 class Dreamer(nn.Module):
@@ -161,8 +132,7 @@ class Dreamer(nn.Module):
         # Actor-critic components
         self.rl_feat_size = self.rssm.feat_size
         self.actor = networks.MLPHead(config.actor, self.rl_feat_size)
-        self.value = DuelingQPair(config.critic, self.rl_feat_size,
-                                  self.act_dim)
+        self.value = DuelingQ(config.critic, self.rl_feat_size, self.act_dim)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -596,37 +566,31 @@ class Dreamer(nn.Module):
 
         repq_loss, metrics = self._offpolicy_loss(last, term, reward, action,
                                                   cur_qvalue, next_policy,
-                                                  next_target_qvalue=next_qvalue)
+                                                  next_qvalue)
         losses = {"repq": repq_loss}
         metrics = {f"reploss/{name}": value for name, value in metrics.items()}
         return losses, metrics
 
     def _offpolicy_loss(self, last, term, reward, action, qvalue, next_policy,
-                        next_target_qvalue):
+                        next_qvalue):
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last[:, :-1]
         denom = torch.clamp(weight.sum(), min=1.0)
 
         with torch.no_grad():
             next_sample = next_policy.rsample()
-            y_q1 = next_target_qvalue.gather_q(0, next_sample)
-            y_q2 = next_target_qvalue.gather_q(1, next_sample)
-            target_q = torch.minimum(y_q1, y_q2)
+            target_q = next_qvalue.gather_q(next_sample)
             backup = reward[:, 1:] + disc * (1.0 - term[:, 1:]) * target_q
 
-        v_loss = qvalue.v_loss[0] + qvalue.v_loss[1]
-        q_loss = qvalue.q_loss(0, action, backup) + qvalue.q_loss(
-            1, action, backup)
+        v_loss = qvalue.v_loss
+        q_loss = qvalue.q_loss(action, backup)
         loss = torch.mean(weight * (q_loss + v_loss))
 
-        q1, q2 = qvalue.q
-        x_q1 = qvalue.gather_q(0, action)
-        x_q2 = qvalue.gather_q(1, action)
+        q = qvalue.q
+        x_q = qvalue.gather_q(action)
         metrics = {
-            "q1": (weight * q1.mean(dim=-1, keepdim=True)).sum() / denom,
-            "q2": (weight * q2.mean(dim=-1, keepdim=True)).sum() / denom,
-            "xq1": (weight * x_q1).sum() / denom,
-            "xq2": (weight * x_q2).sum() / denom,
+            "q": (weight * q.mean(dim=-1, keepdim=True)).sum() / denom,
+            "xq": (weight * x_q).sum() / denom,
             "backup": (weight * backup).sum() / denom,
             "weight": weight.mean(),
         }

@@ -1,9 +1,9 @@
 task: atari_alien
 steps: 4.1e5
 env_num: 1
-eval_episode_num: 10
+eval_episode_num: 100
 action_repeat: 4
-train_ratio: 128
+train_ratio: 256
 time_limit: 108000
 
 seed: ${seed}
