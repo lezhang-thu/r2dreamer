@@ -14,7 +14,6 @@ class OnlineTrainer:
         self.eval_envs = eval_envs
         self.steps = int(config.steps)
         self.pretrain = int(config.pretrain)
-        self.eval_every = int(config.eval_every)
         self.eval_episode_num = int(config.eval_episode_num)
         self.params_hist_log = bool(config.params_hist_log)
         self.batch_size = int(config.batch_size)
@@ -25,21 +24,16 @@ class OnlineTrainer:
                                            config.action_repeat)
         self._should_pretrain = tools.Once()
         self._should_log = tools.Every(config.update_log_every)
-        self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
 
-    def eval(self, agent, train_step):
-        """Run evaluation episodes.
-
-        Environment stepping is executed on CPU to avoid GPU<->CPU synchronizations
-        in the worker processes. Observations are moved back to GPU asynchronously
-        (H2D with non_blocking=True) right before policy inference.
-        """
-        print("Evaluating the policy...")
+    def _eval_batch(self, agent, episode_count, record_video):
         envs = self.eval_envs
-        agent.eval()
-        # (B,)
+        if not 1 <= episode_count <= envs.env_num:
+            raise AssertionError(
+                "Eval batch episode_count must be in [1, env_num], got "
+                f"{episode_count} for env_num={envs.env_num}.")
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
+        active = torch.arange(envs.env_num, device=agent.device) < episode_count
         once_done = torch.zeros(envs.env_num,
                                 dtype=torch.bool,
                                 device=agent.device)
@@ -50,50 +44,74 @@ class OnlineTrainer:
                               dtype=torch.float32,
                               device=agent.device)
         log_metrics = {}
-        # cache is only used for video logging.
         cache = []
         agent_state = agent.get_initial_state(envs.env_num)
-        # (B, A)
         act = agent_state["prev_action"].clone()
-        while not once_done.all():
-            steps += ~done * ~once_done
-            # Step environments on CPU.
-            # (B, A)
+
+        while not once_done[active].all():
+            valid = active & ~once_done
+            steps += valid & ~done
             act_cpu = act.detach().to("cpu")
-            # (B,)
             done_cpu = done.detach().to("cpu")
             trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
-            # Move observations back to GPU asynchronously for the agent.
-            # dict of (B, 1, *)
             trans = trans_cpu.to(agent.device, non_blocking=True)
-            # (B,)
             done = done_cpu.to(agent.device)
 
-            # Store transition.
-            # Attach the action sent to env.step at this loop step.
-            # For envs that were done, trans may be reset output, so this is
-            # for logging/cache consistency rather than strict causality.
             trans["action"] = act
-            if len(cache) < self.batch_length:
-                cache.append(trans.clone())
-            # (B, A)
+            if record_video and len(cache) < self.batch_length:
+                cache.append(trans[:1].clone())
             act, agent_state = agent.act(trans, agent_state, eval=True)
-            returns += trans["reward"][:, 0] * ~once_done
+            returns += trans["reward"][:, 0] * valid
             for key, value in trans.items():
                 if key.startswith("log_"):
                     if key not in log_metrics:
                         log_metrics[key] = torch.zeros_like(returns)
-                    log_metrics[key] += value[:, 0] * ~once_done
-            once_done |= done
-        # dict of (B, T, *)
-        cache = torch.stack(cache, dim=1) if len(cache) else None
+                    log_metrics[key] += value[:, 0] * valid
+            once_done |= done & active
+
+        cache = torch.stack(cache, dim=1) if cache else None
+        return (returns[active], steps[active], {
+            key: value[active] for key, value in log_metrics.items()
+        }, cache)
+
+    def eval(self, agent, train_step):
+        """Run evaluation episodes in mini-batches.
+
+        The eval environment count controls peak GPU inference batch size,
+        while config.eval_episode_num controls the number of episodes included
+        in the logged metrics.
+        """
+        print("Evaluating the policy...")
+        agent.eval()
+        returns = []
+        lengths = []
+        log_metrics = {}
+        cache = None
+        episodes_done = 0
+        while episodes_done < self.eval_episode_num:
+            episode_count = min(self.eval_envs.env_num,
+                                self.eval_episode_num - episodes_done)
+            ep_return, ep_length, ep_logs, ep_cache = self._eval_batch(
+                agent,
+                episode_count,
+                record_video=(episodes_done == 0),
+            )
+            returns.append(ep_return)
+            lengths.append(ep_length)
+            if cache is None and ep_cache is not None:
+                cache = ep_cache
+            for key, value in ep_logs.items():
+                log_metrics.setdefault(key, []).append(value)
+            episodes_done += episode_count
+
+        returns = torch.cat(returns)
+        lengths = torch.cat(lengths).to(torch.float32)
         self.logger.scalar("episode/eval_score", returns.mean())
-        self.logger.scalar("episode/eval_length",
-                           steps.to(torch.float32).mean())
-        for key, value in log_metrics.items():
+        self.logger.scalar("episode/eval_length", lengths.mean())
+        for key, values in log_metrics.items():
+            value = torch.cat(values)
             if key == "log_success":
-                value = torch.clip(value,
-                                   max=1.0)  # make sure 1.0 for success episode
+                value = torch.clip(value, max=1.0)
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
@@ -125,10 +143,6 @@ class OnlineTrainer:
         act = agent_state["prev_action"].clone()
 
         while step < self.steps:
-            # Evaluation
-            #if self._should_eval(step) and self.eval_episode_num > 0:
-            if False:
-                self.eval(agent, step)
             # Save metrics
             if done.any():
                 for i, d in enumerate(done):
@@ -209,3 +223,6 @@ class OnlineTrainer:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
                     self.logger.write(step, fps=True)
+
+        if self.eval_episode_num > 0:
+            self.eval(agent, step)

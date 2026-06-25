@@ -8,7 +8,10 @@ def make_envs(config):
 
     train_envs = parallel.ParallelEnv(env_constructor, config.env_num,
                                       config.device)
-    eval_envs = parallel.ParallelEnv(env_constructor, config.eval_episode_num,
+    eval_env_num = min(int(getattr(config, "eval_env_num", 10)),
+                       int(config.eval_episode_num))
+    eval_env_num = max(1, eval_env_num)
+    eval_envs = parallel.ParallelEnv(env_constructor, eval_env_num,
                                      config.device)
     obs_space = train_envs.observation_space
     act_space = train_envs.action_space
