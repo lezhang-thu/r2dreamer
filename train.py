@@ -126,7 +126,7 @@ def main(config):
         policy_trainer.begin(agent)
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received during training.")
-        save_agent_state_dict(agent, interrupted_agent_path)
+        #save_agent_state_dict(agent, interrupted_agent_path)
         #save_replay_state_dict(replay_buffer, interrupted_replay_path)
         raise
 

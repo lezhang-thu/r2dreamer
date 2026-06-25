@@ -11,8 +11,8 @@ METHOD=r2dreamer
 
 # ==== Tasks ====
 tasks=(
-	#    "atari_alien"
-	#    "atari_amidar"
+	#"atari_alien"
+	#"atari_amidar"
 	#    "atari_assault"
 	#    "atari_asterix"
 	#    "atari_bank_heist"
@@ -24,8 +24,8 @@ tasks=(
 	#    "atari_demon_attack"
 	#    "atari_freeway"
 	#    "atari_frostbite"
-	#    "atari_gopher"
-	#    "atari_hero"
+	#"atari_gopher"
+	#"atari_hero"
 	#    "atari_jamesbond"
 	    "atari_kangaroo"
 	#    "atari_krull"
@@ -43,11 +43,11 @@ tasks=(
 # ==== Loop ====
 for task in "${tasks[@]}"; do
 	#for seed in $(seq $SEED_START $SEED_STEP $SEED_END); do
-	for seed in 100; do
+	for seed in 0; do
 		CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \
 			env=atari100k \
 			env.task=$task \
-			logdir=logdir/txl-${DATE}_${METHOD}_${task#atari_}_$seed \
+			logdir=logdir/detach-q-learning-${DATE}_${METHOD}_${task#atari_}_$seed \
 			model.compile=True \
 			device=cuda:0 \
 			buffer.storage_device=cpu \

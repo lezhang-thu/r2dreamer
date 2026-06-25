@@ -579,10 +579,11 @@ class Dreamer(nn.Module):
         return losses, metrics, ret[:, 0].detach()
 
     def _replay_q_forward(self, data, feat):
-        """Replay off-policy Q loss with gradients kept through replay features."""
+        """Replay off-policy Q loss without gradients into the world model."""
         last = self._scalar_seq(data["is_last"])
         term = self._scalar_seq(data["is_terminal"])
         reward = self._scalar_seq(data["reward"])
+        feat = feat.detach()
         cur_feat, next_feat = feat[:, :-1], feat[:, 1:]
         action = data["action"][:, :-1]
 
@@ -595,21 +596,21 @@ class Dreamer(nn.Module):
 
         repq_loss, metrics = self._offpolicy_loss(last, term, reward, action,
                                                   cur_qvalue, next_policy,
-                                                  next_qvalue)
+                                                  next_target_qvalue=next_qvalue)
         losses = {"repq": repq_loss}
         metrics = {f"reploss/{name}": value for name, value in metrics.items()}
         return losses, metrics
 
     def _offpolicy_loss(self, last, term, reward, action, qvalue, next_policy,
-                        next_qvalue):
+                        next_target_qvalue):
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last[:, :-1]
         denom = torch.clamp(weight.sum(), min=1.0)
 
         with torch.no_grad():
             next_sample = next_policy.rsample()
-            y_q1 = next_qvalue.gather_q(0, next_sample)
-            y_q2 = next_qvalue.gather_q(1, next_sample)
+            y_q1 = next_target_qvalue.gather_q(0, next_sample)
+            y_q2 = next_target_qvalue.gather_q(1, next_sample)
             target_q = torch.minimum(y_q1, y_q2)
             backup = reward[:, 1:] + disc * (1.0 - term[:, 1:]) * target_q
 
